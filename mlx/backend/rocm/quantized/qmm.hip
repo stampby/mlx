@@ -52,13 +52,52 @@ inline array ensure_row_contiguous_matrix(
 
 namespace rocm {
 
+template <int BITS>
+__device__ inline uint8_t unpack_packed_value(
+    const uint8_t* packed_row,
+    int k,
+    int row_bytes) {
+  constexpr uint8_t mask = (1u << BITS) - 1u;
+  if constexpr (BITS == 2 || BITS == 4 || BITS == 8) {
+    constexpr int pack_factor = 8 / BITS;
+    int pack_idx = k / pack_factor;
+    int bit_offset = (k % pack_factor) * BITS;
+    return (packed_row[pack_idx] >> bit_offset) & mask;
+  } else {
+    int bit_index = k * BITS;
+    int byte_idx = bit_index >> 3;
+    int bit_offset = bit_index & 0x7;
+
+    uint32_t window = static_cast<uint32_t>(packed_row[byte_idx]);
+    if (byte_idx + 1 < row_bytes) {
+      window |= static_cast<uint32_t>(packed_row[byte_idx + 1]) << 8;
+    }
+    return static_cast<uint8_t>((window >> bit_offset) & mask);
+  }
+}
+
+template <int BITS, bool AFFINE>
+__device__ inline float dequantize_value(uint8_t quant_val, float scale, float bias) {
+  if constexpr (AFFINE) {
+    return static_cast<float>(quant_val) * scale + bias;
+  } else {
+    constexpr uint8_t mask = (1u << BITS) - 1u;
+    constexpr uint8_t sign_bit = 1u << (BITS - 1);
+    int8_t signed_val = static_cast<int8_t>(quant_val);
+    if (quant_val & sign_bit) {
+      signed_val = static_cast<int8_t>(quant_val | ~mask);
+    }
+    return static_cast<float>(signed_val) * scale + bias;
+  }
+}
+
 // Quantized matrix-vector multiply kernel
 // Performs: out = x @ dequantize(w, scales, biases)
 // where w is quantized weights, scales and biases are per-group parameters
 template <typename T, typename ScaleT, int BITS, int GROUP_SIZE, bool AFFINE>
 __global__ void qmv_kernel(
     const T* __restrict__ x,           // [M, K]
-    const uint8_t* __restrict__ w,     // [N, K/pack_factor] packed
+    const uint8_t* __restrict__ w,     // [N, K * BITS / 8] packed
     const ScaleT* __restrict__ scales, // [N, K/GROUP_SIZE]
     const ScaleT* __restrict__ biases, // [N, K/GROUP_SIZE] or nullptr
     T* __restrict__ out,               // [M, N]
@@ -67,7 +106,6 @@ __global__ void qmv_kernel(
     int K,
     bool has_bias) {
   
-  constexpr int pack_factor = 8 / BITS;
   const int row = blockIdx.x;  // output row (M dimension)
   const int col = blockIdx.y * blockDim.x + threadIdx.x;  // output col (N dimension)
   
@@ -77,6 +115,9 @@ __global__ void qmv_kernel(
   
   int num_groups = (K + GROUP_SIZE - 1) / GROUP_SIZE;
   
+  const int row_bytes = (K * BITS) / 8;
+  const uint8_t* w_row = w + col * row_bytes;
+
   for (int g = 0; g < num_groups; ++g) {
     float scale = static_cast<float>(scales[col * num_groups + g]);
     float bias = has_bias ? static_cast<float>(biases[col * num_groups + g]) : 0.0f;
@@ -85,23 +126,8 @@ __global__ void qmv_kernel(
     int k_end = min(k_start + GROUP_SIZE, K);
     
     for (int k = k_start; k < k_end; ++k) {
-      // Get packed weight
-      int pack_idx = k / pack_factor;
-      int bit_offset = (k % pack_factor) * BITS;
-      uint8_t packed = w[col * (K / pack_factor) + pack_idx];
-      uint8_t mask = (1 << BITS) - 1;
-      uint8_t quant_val = (packed >> bit_offset) & mask;
-
-      float w_val;
-      if constexpr (AFFINE) {
-        w_val = static_cast<float>(quant_val) * scale + bias;
-      } else {
-        int8_t signed_val = static_cast<int8_t>(quant_val);
-        if (signed_val & (1 << (BITS - 1))) {
-          signed_val |= ~mask;
-        }
-        w_val = static_cast<float>(signed_val) * scale + bias;
-      }
+      uint8_t quant_val = unpack_packed_value<BITS>(w_row, k, row_bytes);
+      float w_val = dequantize_value<BITS, AFFINE>(quant_val, scale, bias);
       
       // Accumulate
       acc += static_cast<float>(x[row * K + k]) * w_val;
@@ -116,7 +142,7 @@ __global__ void qmv_kernel(
 template <typename T, typename ScaleT, int BITS, int GROUP_SIZE, bool AFFINE>
 __global__ void qmv_t_kernel(
     const T* __restrict__ x,           // [M, K]
-    const uint8_t* __restrict__ w,     // [K, N/pack_factor] packed (stored as [N, K/pack_factor] but accessed transposed)
+    const uint8_t* __restrict__ w,     // [N, K * BITS / 8] packed
     const ScaleT* __restrict__ scales, // [N, K/GROUP_SIZE]
     const ScaleT* __restrict__ biases, // [N, K/GROUP_SIZE] or nullptr
     T* __restrict__ out,               // [M, N]
@@ -125,7 +151,6 @@ __global__ void qmv_t_kernel(
     int K,
     bool has_bias) {
   
-  constexpr int pack_factor = 8 / BITS;
   const int row = blockIdx.x;  // output row (M dimension)
   const int col = blockIdx.y * blockDim.x + threadIdx.x;  // output col (N dimension)
   
@@ -135,6 +160,9 @@ __global__ void qmv_t_kernel(
   
   int num_groups = (K + GROUP_SIZE - 1) / GROUP_SIZE;
   
+  const int row_bytes = (K * BITS) / 8;
+  const uint8_t* w_row = w + col * row_bytes;
+
   for (int g = 0; g < num_groups; ++g) {
     float scale = static_cast<float>(scales[col * num_groups + g]);
     float bias = has_bias ? static_cast<float>(biases[col * num_groups + g]) : 0.0f;
@@ -143,23 +171,8 @@ __global__ void qmv_t_kernel(
     int k_end = min(k_start + GROUP_SIZE, K);
     
     for (int k = k_start; k < k_end; ++k) {
-      // Get packed weight - note the transposed access pattern
-      int pack_idx = k / pack_factor;
-      int bit_offset = (k % pack_factor) * BITS;
-      uint8_t packed = w[col * (K / pack_factor) + pack_idx];
-      uint8_t mask = (1 << BITS) - 1;
-      uint8_t quant_val = (packed >> bit_offset) & mask;
-
-      float w_val;
-      if constexpr (AFFINE) {
-        w_val = static_cast<float>(quant_val) * scale + bias;
-      } else {
-        int8_t signed_val = static_cast<int8_t>(quant_val);
-        if (signed_val & (1 << (BITS - 1))) {
-          signed_val |= ~mask;
-        }
-        w_val = static_cast<float>(signed_val) * scale + bias;
-      }
+      uint8_t quant_val = unpack_packed_value<BITS>(w_row, k, row_bytes);
+      float w_val = dequantize_value<BITS, AFFINE>(quant_val, scale, bias);
       
       // Accumulate
       acc += static_cast<float>(x[row * K + k]) * w_val;
@@ -257,7 +270,10 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     #define DISPATCH_BITS(T, ScaleT) \
       switch (bits_) { \
         case 2: DISPATCH_GROUP_SIZE(T, ScaleT, 2); break; \
+        case 3: DISPATCH_GROUP_SIZE(T, ScaleT, 3); break; \
         case 4: DISPATCH_GROUP_SIZE(T, ScaleT, 4); break; \
+        case 5: DISPATCH_GROUP_SIZE(T, ScaleT, 5); break; \
+        case 6: DISPATCH_GROUP_SIZE(T, ScaleT, 6); break; \
         case 8: DISPATCH_GROUP_SIZE(T, ScaleT, 8); break; \
         default: throw std::runtime_error("Unsupported bits for QuantizedMatmul: " + std::to_string(bits_)); \
       }
@@ -288,7 +304,7 @@ namespace rocm {
 template <typename T, typename ScaleT, int BITS, int GROUP_SIZE, bool AFFINE>
 __global__ void gather_qmv_kernel(
     const T* __restrict__ x,           // [B, M, K]
-    const uint8_t* __restrict__ w,     // [E, N, K/pack_factor] packed
+    const uint8_t* __restrict__ w,     // [E, N, K * BITS / 8] packed
     const ScaleT* __restrict__ scales, // [E, N, K/GROUP_SIZE]
     const ScaleT* __restrict__ biases, // [E, N, K/GROUP_SIZE] or nullptr
     const uint32_t* __restrict__ lhs_indices, // [B]
@@ -301,8 +317,6 @@ __global__ void gather_qmv_kernel(
     int E,
     bool has_bias) {
   
-  constexpr int pack_factor = 8 / BITS;
-  
   int batch = blockIdx.z;
   int row = blockIdx.x;  // output row (M dimension)
   int col = blockIdx.y * blockDim.x + threadIdx.x;  // output col (N dimension)
@@ -312,14 +326,16 @@ __global__ void gather_qmv_kernel(
   uint32_t lhs_idx = lhs_indices[batch];
   uint32_t rhs_idx = rhs_indices[batch];
   
-  const T* x_ptr = x + lhs_idx * M * K + row * K;
-  const uint8_t* w_ptr = w + rhs_idx * N * (K / pack_factor) + col * (K / pack_factor);
-  const ScaleT* scales_ptr = scales + rhs_idx * N * ((K + GROUP_SIZE - 1) / GROUP_SIZE) + col * ((K + GROUP_SIZE - 1) / GROUP_SIZE);
-  const ScaleT* biases_ptr = has_bias ? biases + rhs_idx * N * ((K + GROUP_SIZE - 1) / GROUP_SIZE) + col * ((K + GROUP_SIZE - 1) / GROUP_SIZE) : nullptr;
-  
-  float acc = 0.0f;
-  
   int num_groups = (K + GROUP_SIZE - 1) / GROUP_SIZE;
+  int row_bytes = (K * BITS) / 8;
+
+  const T* x_ptr = x + lhs_idx * M * K + row * K;
+  const uint8_t* w_ptr = w + rhs_idx * N * row_bytes + col * row_bytes;
+  const ScaleT* scales_ptr = scales + rhs_idx * N * num_groups + col * num_groups;
+  const ScaleT* biases_ptr =
+      has_bias ? biases + rhs_idx * N * num_groups + col * num_groups : nullptr;
+
+  float acc = 0.0f;
   
   for (int g = 0; g < num_groups; ++g) {
     float scale = static_cast<float>(scales_ptr[g]);
@@ -329,23 +345,8 @@ __global__ void gather_qmv_kernel(
     int k_end = min(k_start + GROUP_SIZE, K);
     
     for (int k = k_start; k < k_end; ++k) {
-      // Get packed weight
-      int pack_idx = k / pack_factor;
-      int bit_offset = (k % pack_factor) * BITS;
-      uint8_t packed = w_ptr[pack_idx];
-      uint8_t mask = (1 << BITS) - 1;
-      uint8_t quant_val = (packed >> bit_offset) & mask;
-
-      float w_val;
-      if constexpr (AFFINE) {
-        w_val = static_cast<float>(quant_val) * scale + bias;
-      } else {
-        int8_t signed_val = static_cast<int8_t>(quant_val);
-        if (signed_val & (1 << (BITS - 1))) {
-          signed_val |= ~mask;
-        }
-        w_val = static_cast<float>(signed_val) * scale + bias;
-      }
+      uint8_t quant_val = unpack_packed_value<BITS>(w_ptr, k, row_bytes);
+      float w_val = dequantize_value<BITS, AFFINE>(quant_val, scale, bias);
       
       // Accumulate
       acc += static_cast<float>(x_ptr[k]) * w_val;
@@ -429,7 +430,10 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     #define DISPATCH_BITS_GATHER(T, ScaleT) \
       switch (bits_) { \
         case 2: DISPATCH_GROUP_SIZE_GATHER(T, ScaleT, 2); break; \
+        case 3: DISPATCH_GROUP_SIZE_GATHER(T, ScaleT, 3); break; \
         case 4: DISPATCH_GROUP_SIZE_GATHER(T, ScaleT, 4); break; \
+        case 5: DISPATCH_GROUP_SIZE_GATHER(T, ScaleT, 5); break; \
+        case 6: DISPATCH_GROUP_SIZE_GATHER(T, ScaleT, 6); break; \
         case 8: DISPATCH_GROUP_SIZE_GATHER(T, ScaleT, 8); break; \
         default: throw std::runtime_error("Unsupported bits for GatherQMM: " + std::to_string(bits_)); \
       }

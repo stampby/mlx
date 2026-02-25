@@ -50,26 +50,29 @@ __global__ void affine_quantize_kernel(
   
   // Quantize values
   int output_idx = group_idx * (group_size * BITS / 8);
-  uint8_t packed = 0;
-  int bit_offset = 0;
-  
+  int group_bytes = group_size * BITS / 8;
+  constexpr uint8_t mask = static_cast<uint8_t>((1u << BITS) - 1u);
+
+  for (int i = 0; i < group_bytes; ++i) {
+    output[output_idx + i] = 0;
+  }
+
   for (int i = 0; i < group_size; ++i) {
     float val = static_cast<float>(group_input[i]);
     int quant_val = static_cast<int>((val - bias) / scale + 0.5f);
     quant_val = max(0, min(static_cast<int>(max_quant), quant_val));
-    
-    packed |= (quant_val << bit_offset);
-    bit_offset += BITS;
-    
-    if (bit_offset >= 8) {
-      output[output_idx++] = packed;
-      packed = 0;
-      bit_offset = 0;
+
+    int bit_index = i * BITS;
+    int byte_idx = output_idx + (bit_index >> 3);
+    int bit_offset = bit_index & 0x7;
+    uint32_t shifted =
+        static_cast<uint32_t>(static_cast<uint8_t>(quant_val) & mask)
+        << bit_offset;
+
+    output[byte_idx] |= static_cast<uint8_t>(shifted & 0xFF);
+    if (bit_offset + BITS > 8) {
+      output[byte_idx + 1] |= static_cast<uint8_t>((shifted >> 8) & 0xFF);
     }
-  }
-  
-  if (bit_offset > 0) {
-    output[output_idx] = packed;
   }
 }
 
@@ -87,23 +90,23 @@ __global__ void affine_dequantize_kernel(
   float scale = static_cast<float>(scales[group_idx]);
   float bias = static_cast<float>(biases[group_idx]);
   
-  int input_idx = group_idx * (group_size * BITS / 8);
+  int input_base = group_idx * (group_size * BITS / 8);
   T* group_output = output + group_idx * group_size;
-  
-  uint8_t mask = (1 << BITS) - 1;
-  int bit_offset = 0;
-  uint8_t packed = input[input_idx];
-  
+  constexpr uint8_t mask = static_cast<uint8_t>((1u << BITS) - 1u);
+
   for (int i = 0; i < group_size; ++i) {
-    int quant_val = (packed >> bit_offset) & mask;
+    int bit_index = i * BITS;
+    int byte_idx = input_base + (bit_index >> 3);
+    int bit_offset = bit_index & 0x7;
+
+    uint32_t packed = static_cast<uint32_t>(input[byte_idx]);
+    if (bit_offset + BITS > 8) {
+      packed |= static_cast<uint32_t>(input[byte_idx + 1]) << 8;
+    }
+
+    int quant_val = static_cast<int>((packed >> bit_offset) & mask);
     float dequant_val = static_cast<float>(quant_val) * scale + bias;
     group_output[i] = static_cast<T>(dequant_val);
-    
-    bit_offset += BITS;
-    if (bit_offset >= 8) {
-      bit_offset = 0;
-      packed = input[++input_idx];
-    }
   }
 }
 
@@ -179,7 +182,10 @@ void affine_quantize(
     #define DISPATCH_BITS(T, ScaleT) \
       switch (bits) { \
         case 2: LAUNCH_QUANTIZE(T, ScaleT, 2); break; \
+        case 3: LAUNCH_QUANTIZE(T, ScaleT, 3); break; \
         case 4: LAUNCH_QUANTIZE(T, ScaleT, 4); break; \
+        case 5: LAUNCH_QUANTIZE(T, ScaleT, 5); break; \
+        case 6: LAUNCH_QUANTIZE(T, ScaleT, 6); break; \
         case 8: LAUNCH_QUANTIZE(T, ScaleT, 8); break; \
         default: throw std::runtime_error("Unsupported bits for affine_quantize"); \
       }
