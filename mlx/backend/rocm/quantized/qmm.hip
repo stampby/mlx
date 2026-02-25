@@ -55,7 +55,7 @@ namespace rocm {
 // Quantized matrix-vector multiply kernel
 // Performs: out = x @ dequantize(w, scales, biases)
 // where w is quantized weights, scales and biases are per-group parameters
-template <typename T, typename ScaleT, int BITS, int GROUP_SIZE>
+template <typename T, typename ScaleT, int BITS, int GROUP_SIZE, bool AFFINE>
 __global__ void qmv_kernel(
     const T* __restrict__ x,           // [M, K]
     const uint8_t* __restrict__ w,     // [N, K/pack_factor] packed
@@ -90,15 +90,18 @@ __global__ void qmv_kernel(
       int bit_offset = (k % pack_factor) * BITS;
       uint8_t packed = w[col * (K / pack_factor) + pack_idx];
       uint8_t mask = (1 << BITS) - 1;
-      int8_t quant_val = static_cast<int8_t>((packed >> bit_offset) & mask);
-      
-      // Sign extend if needed
-      if (quant_val & (1 << (BITS - 1))) {
-        quant_val |= ~mask;
+      uint8_t quant_val = (packed >> bit_offset) & mask;
+
+      float w_val;
+      if constexpr (AFFINE) {
+        w_val = static_cast<float>(quant_val) * scale + bias;
+      } else {
+        int8_t signed_val = static_cast<int8_t>(quant_val);
+        if (signed_val & (1 << (BITS - 1))) {
+          signed_val |= ~mask;
+        }
+        w_val = static_cast<float>(signed_val) * scale + bias;
       }
-      
-      // Dequantize
-      float w_val = static_cast<float>(quant_val) * scale + bias;
       
       // Accumulate
       acc += static_cast<float>(x[row * K + k]) * w_val;
@@ -110,7 +113,7 @@ __global__ void qmv_kernel(
 
 // Transposed quantized matrix-vector multiply kernel
 // Performs: out = x @ dequantize(w, scales, biases).T
-template <typename T, typename ScaleT, int BITS, int GROUP_SIZE>
+template <typename T, typename ScaleT, int BITS, int GROUP_SIZE, bool AFFINE>
 __global__ void qmv_t_kernel(
     const T* __restrict__ x,           // [M, K]
     const uint8_t* __restrict__ w,     // [K, N/pack_factor] packed (stored as [N, K/pack_factor] but accessed transposed)
@@ -145,15 +148,18 @@ __global__ void qmv_t_kernel(
       int bit_offset = (k % pack_factor) * BITS;
       uint8_t packed = w[col * (K / pack_factor) + pack_idx];
       uint8_t mask = (1 << BITS) - 1;
-      int8_t quant_val = static_cast<int8_t>((packed >> bit_offset) & mask);
-      
-      // Sign extend if needed
-      if (quant_val & (1 << (BITS - 1))) {
-        quant_val |= ~mask;
+      uint8_t quant_val = (packed >> bit_offset) & mask;
+
+      float w_val;
+      if constexpr (AFFINE) {
+        w_val = static_cast<float>(quant_val) * scale + bias;
+      } else {
+        int8_t signed_val = static_cast<int8_t>(quant_val);
+        if (signed_val & (1 << (BITS - 1))) {
+          signed_val |= ~mask;
+        }
+        w_val = static_cast<float>(signed_val) * scale + bias;
       }
-      
-      // Dequantize
-      float w_val = static_cast<float>(quant_val) * scale + bias;
       
       // Accumulate
       acc += static_cast<float>(x[row * K + k]) * w_val;
@@ -202,22 +208,42 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   
   enc.launch_kernel([&](hipStream_t stream) {
     #define LAUNCH_QMV(T, ScaleT, BITS, GROUP_SIZE) \
-      if (transpose_) { \
-        hipLaunchKernelGGL( \
-            (rocm::qmv_t_kernel<T, ScaleT, BITS, GROUP_SIZE>), \
-            grid, dim3(block_size), 0, stream, \
-            x.data<T>(), w.data<uint8_t>(), \
-            scales.data<ScaleT>(), \
-            has_bias ? biases->data<ScaleT>() : nullptr, \
-            out.data<T>(), M, N, K, has_bias); \
+      if (mode_ == QuantizationMode::Affine) { \
+        if (transpose_) { \
+          hipLaunchKernelGGL( \
+              (rocm::qmv_t_kernel<T, ScaleT, BITS, GROUP_SIZE, true>), \
+              grid, dim3(block_size), 0, stream, \
+              x.data<T>(), w.data<uint8_t>(), \
+              scales.data<ScaleT>(), \
+              has_bias ? biases->data<ScaleT>() : nullptr, \
+              out.data<T>(), M, N, K, has_bias); \
+        } else { \
+          hipLaunchKernelGGL( \
+              (rocm::qmv_kernel<T, ScaleT, BITS, GROUP_SIZE, true>), \
+              grid, dim3(block_size), 0, stream, \
+              x.data<T>(), w.data<uint8_t>(), \
+              scales.data<ScaleT>(), \
+              has_bias ? biases->data<ScaleT>() : nullptr, \
+              out.data<T>(), M, N, K, has_bias); \
+        } \
       } else { \
-        hipLaunchKernelGGL( \
-            (rocm::qmv_kernel<T, ScaleT, BITS, GROUP_SIZE>), \
-            grid, dim3(block_size), 0, stream, \
-            x.data<T>(), w.data<uint8_t>(), \
-            scales.data<ScaleT>(), \
-            has_bias ? biases->data<ScaleT>() : nullptr, \
-            out.data<T>(), M, N, K, has_bias); \
+        if (transpose_) { \
+          hipLaunchKernelGGL( \
+              (rocm::qmv_t_kernel<T, ScaleT, BITS, GROUP_SIZE, false>), \
+              grid, dim3(block_size), 0, stream, \
+              x.data<T>(), w.data<uint8_t>(), \
+              scales.data<ScaleT>(), \
+              has_bias ? biases->data<ScaleT>() : nullptr, \
+              out.data<T>(), M, N, K, has_bias); \
+        } else { \
+          hipLaunchKernelGGL( \
+              (rocm::qmv_kernel<T, ScaleT, BITS, GROUP_SIZE, false>), \
+              grid, dim3(block_size), 0, stream, \
+              x.data<T>(), w.data<uint8_t>(), \
+              scales.data<ScaleT>(), \
+              has_bias ? biases->data<ScaleT>() : nullptr, \
+              out.data<T>(), M, N, K, has_bias); \
+        } \
       }
     
     #define DISPATCH_GROUP_SIZE(T, ScaleT, BITS) \
@@ -259,7 +285,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 // GatherQMM kernel - gather-based quantized matrix multiply
 namespace rocm {
 
-template <typename T, typename ScaleT, int BITS, int GROUP_SIZE>
+template <typename T, typename ScaleT, int BITS, int GROUP_SIZE, bool AFFINE>
 __global__ void gather_qmv_kernel(
     const T* __restrict__ x,           // [B, M, K]
     const uint8_t* __restrict__ w,     // [E, N, K/pack_factor] packed
@@ -308,15 +334,18 @@ __global__ void gather_qmv_kernel(
       int bit_offset = (k % pack_factor) * BITS;
       uint8_t packed = w_ptr[pack_idx];
       uint8_t mask = (1 << BITS) - 1;
-      int8_t quant_val = static_cast<int8_t>((packed >> bit_offset) & mask);
-      
-      // Sign extend if needed
-      if (quant_val & (1 << (BITS - 1))) {
-        quant_val |= ~mask;
+      uint8_t quant_val = (packed >> bit_offset) & mask;
+
+      float w_val;
+      if constexpr (AFFINE) {
+        w_val = static_cast<float>(quant_val) * scale + bias;
+      } else {
+        int8_t signed_val = static_cast<int8_t>(quant_val);
+        if (signed_val & (1 << (BITS - 1))) {
+          signed_val |= ~mask;
+        }
+        w_val = static_cast<float>(signed_val) * scale + bias;
       }
-      
-      // Dequantize
-      float w_val = static_cast<float>(quant_val) * scale + bias;
       
       // Accumulate
       acc += static_cast<float>(x_ptr[k]) * w_val;
@@ -369,14 +398,25 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   
   enc.launch_kernel([&](hipStream_t stream) {
     #define LAUNCH_GATHER_QMV(T, ScaleT, BITS, GROUP_SIZE) \
-      hipLaunchKernelGGL( \
-          (rocm::gather_qmv_kernel<T, ScaleT, BITS, GROUP_SIZE>), \
-          grid, dim3(block_size), 0, stream, \
-          x.data<T>(), w.data<uint8_t>(), \
-          scales.data<ScaleT>(), \
-          has_bias ? biases->data<ScaleT>() : nullptr, \
-          lhs_indices.data<uint32_t>(), rhs_indices.data<uint32_t>(), \
-          out.data<T>(), B, M, N, K, E, has_bias)
+      if (mode_ == QuantizationMode::Affine) { \
+        hipLaunchKernelGGL( \
+            (rocm::gather_qmv_kernel<T, ScaleT, BITS, GROUP_SIZE, true>), \
+            grid, dim3(block_size), 0, stream, \
+            x.data<T>(), w.data<uint8_t>(), \
+            scales.data<ScaleT>(), \
+            has_bias ? biases->data<ScaleT>() : nullptr, \
+            lhs_indices.data<uint32_t>(), rhs_indices.data<uint32_t>(), \
+            out.data<T>(), B, M, N, K, E, has_bias); \
+      } else { \
+        hipLaunchKernelGGL( \
+            (rocm::gather_qmv_kernel<T, ScaleT, BITS, GROUP_SIZE, false>), \
+            grid, dim3(block_size), 0, stream, \
+            x.data<T>(), w.data<uint8_t>(), \
+            scales.data<ScaleT>(), \
+            has_bias ? biases->data<ScaleT>() : nullptr, \
+            lhs_indices.data<uint32_t>(), rhs_indices.data<uint32_t>(), \
+            out.data<T>(), B, M, N, K, E, has_bias); \
+      }
     
     #define DISPATCH_GROUP_SIZE_GATHER(T, ScaleT, BITS) \
       switch (group_size_) { \
