@@ -374,8 +374,10 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (has_bias) {
     biases = ensure_row_contiguous_matrix(inputs[3], enc, s);
   }
-  const array& lhs_indices = inputs[inputs.size() - 2];
-  const array& rhs_indices = inputs[inputs.size() - 1];
+  // Gather kernels index these arrays with flat pointer arithmetic, so make
+  // sure broadcasted / strided index tensors are materialized contiguously.
+  array lhs_indices = ensure_row_contiguous(inputs[inputs.size() - 2], enc, s);
+  array rhs_indices = ensure_row_contiguous(inputs[inputs.size() - 1], enc, s);
 
   enc.set_input_array(x);
   enc.set_input_array(w);
