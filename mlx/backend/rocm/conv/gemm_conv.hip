@@ -12,6 +12,111 @@ namespace mlx::core {
 
 namespace {
 
+template <typename T>
+__global__ void depthwise_conv1d_kernel(
+    const T* __restrict__ in,
+    const T* __restrict__ wt,
+    T* __restrict__ out,
+    ConvParams<1> params) {
+  int out_channel = blockIdx.x * blockDim.x + threadIdx.x;
+  int out_pos = blockIdx.y;
+  int batch = blockIdx.z;
+
+  if (
+      out_channel >= params.O || out_pos >= params.out_spatial_dims[0] ||
+      batch >= params.N) {
+    return;
+  }
+
+  float acc = 0.0f;
+  int kernel_size = params.wt_spatial_dims[0];
+  int index_max =
+      1 + params.input_dilation[0] * (params.in_spatial_dims[0] - 1);
+
+  for (int k = 0; k < kernel_size; ++k) {
+    int k_input = params.flip ? (kernel_size - 1 - k) : k;
+    int in_index = out_pos * params.strides[0] - params.padding[0] +
+        k_input * params.kernel_dilation[0];
+    if (
+        in_index >= 0 && in_index < index_max &&
+        (in_index % params.input_dilation[0] == 0)) {
+      int in_pos = in_index / params.input_dilation[0];
+      int64_t in_offset = static_cast<int64_t>(batch) * params.in_strides[0] +
+          static_cast<int64_t>(in_pos) * params.in_strides[1] +
+          static_cast<int64_t>(out_channel) * params.in_strides[2];
+      int64_t wt_offset = static_cast<int64_t>(out_channel) * kernel_size + k;
+      acc += static_cast<float>(in[in_offset]) * static_cast<float>(wt[wt_offset]);
+    }
+  }
+
+  int64_t out_offset =
+      (static_cast<int64_t>(batch) * params.out_spatial_dims[0] + out_pos) *
+          params.O +
+      out_channel;
+  out[out_offset] = static_cast<T>(acc);
+}
+
+void depthwise_conv1d(
+    rocm::CommandEncoder& encoder,
+    const array& in,
+    const array& wt,
+    array& out,
+    const std::vector<int>& strides,
+    const std::vector<int>& padding,
+    const std::vector<int>& kernel_dilation,
+    const std::vector<int>& input_dilation,
+    int groups,
+    bool flip,
+    Stream s) {
+  (void)s;
+  ConvParams<1> params(
+      in,
+      wt,
+      out,
+      strides,
+      padding,
+      kernel_dilation,
+      input_dilation,
+      groups,
+      flip);
+
+  int block_size = 256;
+  dim3 block_dims(block_size);
+  dim3 num_blocks(
+      (params.O + block_size - 1) / block_size,
+      params.out_spatial_dims[0],
+      params.N);
+
+  encoder.set_input_array(in);
+  encoder.set_input_array(wt);
+  encoder.set_output_array(out);
+
+  encoder.launch_kernel([&](hipStream_t stream) {
+    switch (in.dtype()) {
+      case float32:
+        depthwise_conv1d_kernel<float>
+            <<<num_blocks, block_dims, 0, stream>>>(
+                in.data<float>(), wt.data<float>(), out.data<float>(), params);
+        break;
+      case float16:
+        depthwise_conv1d_kernel<__half>
+            <<<num_blocks, block_dims, 0, stream>>>(
+                in.data<__half>(), wt.data<__half>(), out.data<__half>(), params);
+        break;
+      case bfloat16:
+        depthwise_conv1d_kernel<hip_bfloat16>
+            <<<num_blocks, block_dims, 0, stream>>>(
+                in.data<hip_bfloat16>(),
+                wt.data<hip_bfloat16>(),
+                out.data<hip_bfloat16>(),
+                params);
+        break;
+      default:
+        throw std::runtime_error("Unsupported dtype for depthwise conv1d");
+    }
+  });
+}
+
 // N-dimensional grouped unfold kernel
 template <typename T, int NDIM>
 __global__ void naive_grouped_unfold_transpose_nd(
@@ -303,6 +408,28 @@ void gemm_grouped_conv(
     Stream s) {
   
   int conv_ndim = in.ndim() - 2;
+
+  // Depthwise 1D convolution with channel multiplier 1 (C == O == groups)
+  // is a common decode-time pattern (e.g. Qwen3-Next linear attention).
+  // Running it through unfold + per-group GEMMs is very launch-heavy.
+  // Use a direct kernel in this configuration.
+  if (
+      conv_ndim == 1 && in.shape(-1) == groups && wt.shape(0) == groups &&
+      out.shape(-1) == groups && wt.shape(-1) == 1) {
+    depthwise_conv1d(
+        encoder,
+        in,
+        wt,
+        out,
+        strides,
+        padding,
+        kernel_dilation,
+        input_dilation,
+        groups,
+        flip,
+        s);
+    return;
+  }
   
   switch (conv_ndim) {
     case 1:
