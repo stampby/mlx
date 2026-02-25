@@ -252,6 +252,23 @@ void ArgReduce::eval_gpu(const std::vector<array>& inputs, array& out) {
               ndim, axis_stride, axis_size);
         }
         break;
+      case bfloat16:
+        if (reduce_type_ == ArgReduce::ArgMax) {
+          hipLaunchKernelGGL(
+              (rocm::arg_reduce_general<hip_bfloat16, rocm::ArgMax<hip_bfloat16>, BLOCK_DIM, 4>),
+              num_blocks, dim3(BLOCK_DIM), 0, stream,
+              in.data<hip_bfloat16>(), out.data<uint32_t>(), out.size(),
+              shape_param, in_strides_param, out_strides_param,
+              ndim, axis_stride, axis_size);
+        } else {
+          hipLaunchKernelGGL(
+              (rocm::arg_reduce_general<hip_bfloat16, rocm::ArgMin<hip_bfloat16>, BLOCK_DIM, 4>),
+              num_blocks, dim3(BLOCK_DIM), 0, stream,
+              in.data<hip_bfloat16>(), out.data<uint32_t>(), out.size(),
+              shape_param, in_strides_param, out_strides_param,
+              ndim, axis_stride, axis_size);
+        }
+        break;
       default:
         throw std::runtime_error("Unsupported type for ArgReduce");
     }

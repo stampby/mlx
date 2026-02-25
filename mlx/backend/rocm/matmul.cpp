@@ -75,9 +75,14 @@ void gemm_rocblas(
   // B)^T But since we want row-major output, we compute C = A * B by doing C^T
   // = B^T * A^T
   rocblas_operation trans_a =
-      b_transposed ? rocblas_operation_none : rocblas_operation_transpose;
+      b_transposed ? rocblas_operation_transpose : rocblas_operation_none;
   rocblas_operation trans_b =
-      a_transposed ? rocblas_operation_none : rocblas_operation_transpose;
+      a_transposed ? rocblas_operation_transpose : rocblas_operation_none;
+
+  // We pass B then A (swapped) to compute C^T = B^T * A^T. The leading
+  // dimensions come directly from check_transpose() for each operand.
+  const int64_t ld_b = ldb;
+  const int64_t ld_a = lda;
 
   encoder.launch_kernel([&](hipStream_t stream) {
     rocblas_set_stream(handle, stream);
@@ -95,9 +100,9 @@ void gemm_rocblas(
             K, // k
             &alpha_f,
             b.data<float>(),
-            b_transposed ? K : N, // lda for B
+            ld_b,
             a.data<float>(),
-            a_transposed ? M : K, // ldb for A
+            ld_a,
             &beta_f,
             out.data<float>(),
             N); // ldc
@@ -115,9 +120,9 @@ void gemm_rocblas(
             K,
             &alpha_d,
             b.data<double>(),
-            b_transposed ? K : N,
+            ld_b,
             a.data<double>(),
-            a_transposed ? M : K,
+            ld_a,
             &beta_d,
             out.data<double>(),
             N);
@@ -139,9 +144,9 @@ void gemm_rocblas(
             K,
             &alpha_h,
             reinterpret_cast<const rocblas_half*>(b.data<float16_t>()),
-            b_transposed ? K : N,
+            ld_b,
             reinterpret_cast<const rocblas_half*>(a.data<float16_t>()),
-            a_transposed ? M : K,
+            ld_a,
             &beta_h,
             reinterpret_cast<rocblas_half*>(out.data<float16_t>()),
             N);
@@ -161,10 +166,10 @@ void gemm_rocblas(
             &alpha_f,
             b.data<bfloat16_t>(),
             rocblas_datatype_bf16_r,
-            b_transposed ? K : N,
+            ld_b,
             a.data<bfloat16_t>(),
             rocblas_datatype_bf16_r,
-            a_transposed ? M : K,
+            ld_a,
             &beta_f,
             out.data<bfloat16_t>(),
             rocblas_datatype_bf16_r,
@@ -206,9 +211,12 @@ void gemm_strided_batched_rocblas(
   rocblas_handle handle = device.get_rocblas_handle();
 
   rocblas_operation trans_a =
-      b_transposed ? rocblas_operation_none : rocblas_operation_transpose;
+      b_transposed ? rocblas_operation_transpose : rocblas_operation_none;
   rocblas_operation trans_b =
-      a_transposed ? rocblas_operation_none : rocblas_operation_transpose;
+      a_transposed ? rocblas_operation_transpose : rocblas_operation_none;
+
+  const int64_t ld_b = ldb;
+  const int64_t ld_a = lda;
 
   encoder.launch_kernel([&](hipStream_t stream) {
     rocblas_set_stream(handle, stream);
@@ -226,10 +234,10 @@ void gemm_strided_batched_rocblas(
             K,
             &alpha_f,
             b.data<float>(),
-            b_transposed ? K : N,
+            ld_b,
             stride_b,
             a.data<float>(),
-            a_transposed ? M : K,
+            ld_a,
             stride_a,
             &beta_f,
             out.data<float>(),
@@ -250,10 +258,10 @@ void gemm_strided_batched_rocblas(
             K,
             &alpha_d,
             b.data<double>(),
-            b_transposed ? K : N,
+            ld_b,
             stride_b,
             a.data<double>(),
-            a_transposed ? M : K,
+            ld_a,
             stride_a,
             &beta_d,
             out.data<double>(),
@@ -277,10 +285,10 @@ void gemm_strided_batched_rocblas(
             K,
             &alpha_h,
             reinterpret_cast<const rocblas_half*>(b.data<float16_t>()),
-            b_transposed ? K : N,
+            ld_b,
             stride_b,
             reinterpret_cast<const rocblas_half*>(a.data<float16_t>()),
-            a_transposed ? M : K,
+            ld_a,
             stride_a,
             &beta_h,
             reinterpret_cast<rocblas_half*>(out.data<float16_t>()),
@@ -302,11 +310,11 @@ void gemm_strided_batched_rocblas(
             &alpha_f,
             b.data<bfloat16_t>(),
             rocblas_datatype_bf16_r,
-            b_transposed ? K : N,
+            ld_b,
             stride_b,
             a.data<bfloat16_t>(),
             rocblas_datatype_bf16_r,
-            a_transposed ? M : K,
+            ld_a,
             stride_a,
             &beta_f,
             out.data<bfloat16_t>(),
@@ -473,57 +481,58 @@ void gemm_and_bias(
           b_offset += idx * b_batch_strides[i];
         }
 
-        encoder.launch_kernel(
-            [&, a_offset, b_offset, batch](hipStream_t stream) {
-              auto& device = encoder.device();
-              rocblas_handle handle = device.get_rocblas_handle();
-              rocblas_set_stream(handle, stream);
+        encoder.launch_kernel([&, a_offset, b_offset, batch](
+                                  hipStream_t stream) {
+          auto& device = encoder.device();
+          rocblas_handle handle = device.get_rocblas_handle();
+          rocblas_set_stream(handle, stream);
 
-              rocblas_operation trans_a = b_transposed
-                  ? rocblas_operation_none
-                  : rocblas_operation_transpose;
-              rocblas_operation trans_b = a_transposed
-                  ? rocblas_operation_none
-                  : rocblas_operation_transpose;
+          rocblas_operation trans_a = b_transposed ? rocblas_operation_transpose
+                                                   : rocblas_operation_none;
+          rocblas_operation trans_b = a_transposed ? rocblas_operation_transpose
+                                                   : rocblas_operation_none;
 
-              float alpha_f = alpha, beta_f = beta;
+          const int64_t ld_b = ldb;
+          const int64_t ld_a = lda;
 
-              if (a.dtype() == float32) {
-                rocblas_sgemm(
-                    handle,
-                    trans_a,
-                    trans_b,
-                    N,
-                    M,
-                    K,
-                    &alpha_f,
-                    b.data<float>() + b_offset,
-                    b_transposed ? K : N,
-                    a.data<float>() + a_offset,
-                    a_transposed ? M : K,
-                    &beta_f,
-                    out.data<float>() + batch * M * N,
-                    N);
-              } else if (a.dtype() == float64) {
-                double alpha_d = static_cast<double>(alpha);
-                double beta_d = static_cast<double>(beta);
-                rocblas_dgemm(
-                    handle,
-                    trans_a,
-                    trans_b,
-                    N,
-                    M,
-                    K,
-                    &alpha_d,
-                    b.data<double>() + b_offset,
-                    b_transposed ? K : N,
-                    a.data<double>() + a_offset,
-                    a_transposed ? M : K,
-                    &beta_d,
-                    out.data<double>() + batch * M * N,
-                    N);
-              }
-            });
+          float alpha_f = alpha, beta_f = beta;
+
+          if (a.dtype() == float32) {
+            rocblas_sgemm(
+                handle,
+                trans_a,
+                trans_b,
+                N,
+                M,
+                K,
+                &alpha_f,
+                b.data<float>() + b_offset,
+                ld_b,
+                a.data<float>() + a_offset,
+                ld_a,
+                &beta_f,
+                out.data<float>() + batch * M * N,
+                N);
+          } else if (a.dtype() == float64) {
+            double alpha_d = static_cast<double>(alpha);
+            double beta_d = static_cast<double>(beta);
+            rocblas_dgemm(
+                handle,
+                trans_a,
+                trans_b,
+                N,
+                M,
+                K,
+                &alpha_d,
+                b.data<double>() + b_offset,
+                ld_b,
+                a.data<double>() + a_offset,
+                ld_a,
+                &beta_d,
+                out.data<double>() + batch * M * N,
+                N);
+          }
+        });
       }
     } else {
       // Use naive GEMM for each batch when rocBLAS is not available

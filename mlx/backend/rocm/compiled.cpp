@@ -385,10 +385,22 @@ struct Square {
 };
 
 struct Sigmoid {
+  __device__ hip_bfloat16 operator()(hip_bfloat16 x) {
+    float fx = static_cast<float>(x);
+    float y = 1.0f / (1.0f + expf(-fabsf(fx)));
+    return hip_bfloat16((fx < 0.0f) ? 1.0f - y : y);
+  }
+
+  __device__ __half operator()(__half x) {
+    float fx = __half2float(x);
+    float y = 1.0f / (1.0f + expf(-fabsf(fx)));
+    return __float2half((fx < 0.0f) ? 1.0f - y : y);
+  }
+
   template <typename T>
   __device__ T operator()(T x) {
-    T y = 1 / (1 + exp(-abs(x)));
-    return (x < 0) ? 1 - y : y;
+    T y = T(1) / (T(1) + exp(-abs(x)));
+    return (x < T(0)) ? (T(1) - y) : y;
   }
 };
 
@@ -474,7 +486,7 @@ struct Rsqrt {
 
 struct Sign {
   template <typename T>
-  __device__ T operator()(T x) { return (x > T(0)) - (x < T(0)); }
+  __device__ T operator()(T x) { return T((x > T(0)) - (x < T(0))); }
 };
 
 struct Asin {
