@@ -320,11 +320,27 @@ struct FloorDivide {
 };
 
 struct LogAddExp {
+  __device__ hip_bfloat16 operator()(hip_bfloat16 x, hip_bfloat16 y) {
+    float fx = static_cast<float>(x);
+    float fy = static_cast<float>(y);
+    float maxval = fx > fy ? fx : fy;
+    float minval = fx > fy ? fy : fx;
+    return hip_bfloat16(maxval + log1pf(expf(minval - maxval)));
+  }
+
+  __device__ __half operator()(__half x, __half y) {
+    float fx = __half2float(x);
+    float fy = __half2float(y);
+    float maxval = fx > fy ? fx : fy;
+    float minval = fx > fy ? fy : fx;
+    return __float2half(maxval + log1pf(expf(minval - maxval)));
+  }
+
   template <typename T>
   __device__ T operator()(T x, T y) {
     T maxval = x > y ? x : y;
     T minval = x > y ? y : x;
-    return maxval + log1pf(expf(minval - maxval));
+    return static_cast<T>(maxval + log1pf(expf(minval - maxval)));
   }
 };
 

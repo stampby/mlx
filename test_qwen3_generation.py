@@ -1,4 +1,4 @@
-"""Pytest-based generation checks for Qwen3 0.6B variants.
+"""Pytest-based generation checks for Qwen3, LFM2.5, and Qwen3-Coder-Next variants.
 
 Run with:
   source venv/bin/activate
@@ -20,6 +20,7 @@ import os
 import re
 import warnings
 from pathlib import Path
+from typing import Any, cast
 
 # Suppress known third-party SWIG deprecation noise seen during model/tokenizer imports.
 warnings.filterwarnings(
@@ -50,16 +51,22 @@ except Exception as exc:  # pragma: no cover
     )
 
 
-BASE_MODEL_ID = "mlx-community/Qwen3-0.6B"
+MODEL_FAMILIES = [
+    "mlx-community/Qwen3-0.6B",
+    "mlx-community/LFM2.5-1.2B-Instruct",
+    "mlx-community/LFM2.5-1.2B-Thinking",
+]
+MODEL_VARIANTS = ["bf16", "3bit", "4bit", "6bit", "8bit"]
+EXPLICIT_MODELS = [
+    "mlx-community/Qwen3-Coder-Next-4bit",
+]
 
 # Fixed model list used as pytest cases.
 MODELS = [
-    f"{BASE_MODEL_ID}-bf16",
-    f"{BASE_MODEL_ID}-3bit",
-    f"{BASE_MODEL_ID}-4bit",
-    f"{BASE_MODEL_ID}-6bit",
-    f"{BASE_MODEL_ID}-8bit",
-]
+    f"{model_family}-{variant}"
+    for model_family in MODEL_FAMILIES
+    for variant in MODEL_VARIANTS
+] + EXPLICIT_MODELS
 
 DEFAULT_PROMPT = "Write exactly one short friendly greeting."
 DEFAULT_SEED = 42
@@ -110,11 +117,56 @@ def _text_stats(text: str) -> dict[str, float | int]:
     }
 
 
+def _exception_chain(exc: BaseException) -> tuple[BaseException, ...]:
+    chain: list[BaseException] = []
+    stack = [exc]
+    seen: set[int] = set()
+    while stack:
+        current = stack.pop()
+        current_id = id(current)
+        if current_id in seen:
+            continue
+        seen.add(current_id)
+        chain.append(current)
+        if current.__cause__ is not None:
+            stack.append(current.__cause__)
+        if current.__context__ is not None:
+            stack.append(current.__context__)
+    return tuple(chain)
+
+
+def _is_404_error(exc: Exception) -> bool:
+    for current in _exception_chain(exc):
+        response = getattr(current, "response", None)
+        if getattr(response, "status_code", None) == 404:
+            return True
+        if getattr(current, "status_code", None) == 404:
+            return True
+        message = str(current).lower()
+        if "404" in message and any(
+            token in message
+            for token in (
+                "not found",
+                "does not exist",
+                "could not find",
+                "couldn't find",
+            )
+        ):
+            return True
+    return False
+
+
 def _generate(model_id: str) -> str:
-    mx.set_default_device(DEVICE)
+    mx.set_default_device(cast(Any, DEVICE))
     mx.random.seed(SEED)
 
-    model, tokenizer = load(model_id)
+    try:
+        model, tokenizer, *_ = load(model_id)
+    except Exception as exc:
+        if _is_404_error(exc):
+            pytest.skip(f"{model_id} is unavailable on the hub (404): {exc}")
+        raise
+
     text = generate(
         model,
         tokenizer,
@@ -136,7 +188,7 @@ def output_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
         path = Path(OUTPUT_DIR_OVERRIDE)
         path.mkdir(parents=True, exist_ok=True)
         return path
-    return tmp_path_factory.mktemp("qwen3_generation_outputs")
+    return tmp_path_factory.mktemp("generation_outputs")
 
 
 @pytest.mark.parametrize("model_id", MODELS, ids=_case_id)
