@@ -780,103 +780,24 @@ void GatherMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     return;
   }
 
-  // Check if rocBLAS is available
-  bool use_rocblas = encoder.device().is_rocblas_available();
-
-  // Fallback: loop over batches with individual GEMMs
-  int batch_size = lhs_indices.size();
-
-  // Get indices on CPU (this is not optimal but provides correctness)
-  std::vector<uint32_t> lhs_idx(batch_size);
-  std::vector<uint32_t> rhs_idx(batch_size);
-
-  // Synchronize to get indices
-  hipDeviceSynchronize();
-
-  if (lhs_indices.dtype() == uint32) {
-    std::memcpy(
-        lhs_idx.data(),
-        lhs_indices.data<uint32_t>(),
-        batch_size * sizeof(uint32_t));
-  }
-  if (rhs_indices.dtype() == uint32) {
-    std::memcpy(
-        rhs_idx.data(),
-        rhs_indices.data<uint32_t>(),
-        batch_size * sizeof(uint32_t));
-  }
-
-  if (use_rocblas) {
-    const void* a_ptr = gpu_ptr<void>(a_);
-    const void* b_ptr = gpu_ptr<void>(b_);
-    void* out_ptr = gpu_ptr<void>(out);
-    for (int i = 0; i < batch_size; ++i) {
-      int64_t a_offset = lhs_idx[i] * M * K;
-      int64_t b_offset = rhs_idx[i] * K * N;
-      int64_t out_offset = i * M * N;
-
-      encoder.launch_kernel(
-          [&, a_offset, b_offset, out_offset, a_ptr, b_ptr, out_ptr](
-              hipStream_t stream) {
-            auto& device = encoder.device();
-            rocblas_handle handle = device.get_rocblas_handle();
-            rocblas_set_stream(handle, stream);
-
-            rocblas_operation trans_a = transposed_b
-                ? rocblas_operation_none
-                : rocblas_operation_transpose;
-            rocblas_operation trans_b = transposed_a
-                ? rocblas_operation_none
-                : rocblas_operation_transpose;
-
-            float alpha = 1.0f, beta = 0.0f;
-
-            if (a.dtype() == float32) {
-              rocblas_sgemm(
-                  handle,
-                  trans_a,
-                  trans_b,
-                  N,
-                  M,
-                  K,
-                  &alpha,
-                  static_cast<const float*>(b_ptr) + b_offset,
-                  transposed_b ? K : N,
-                  static_cast<const float*>(a_ptr) + a_offset,
-                  transposed_a ? M : K,
-                  &beta,
-                  static_cast<float*>(out_ptr) + out_offset,
-                  N);
-            }
-          });
-    }
-  } else {
-    // Use naive GEMM for each batch
-    for (int i = 0; i < batch_size; ++i) {
-      int64_t a_offset = lhs_idx[i] * M * K;
-      int64_t b_offset = rhs_idx[i] * K * N;
-      int64_t out_offset = i * M * N;
-
-      // Use naive GEMM with explicit offsets
-      rocm::naive_gemm_with_offset(
-          encoder,
-          a_,
-          b_,
-          out,
-          M,
-          N,
-          K,
-          transposed_a,
-          lda,
-          a_offset,
-          transposed_b,
-          ldb,
-          b_offset,
-          out_offset,
-          1.0f,
-          0.0f);
-    }
-  }
+  // Keep gather indices on device and resolve per-batch matrix offsets inside
+  // the kernel to avoid host synchronization.
+  rocm::naive_gemm_gather(
+      encoder,
+      a_,
+      b_,
+      lhs_indices,
+      rhs_indices,
+      out,
+      M,
+      N,
+      K,
+      transposed_a,
+      lda,
+      transposed_b,
+      ldb,
+      1.0f,
+      0.0f);
 }
 
 } // namespace mlx::core

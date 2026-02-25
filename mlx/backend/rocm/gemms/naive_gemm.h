@@ -45,6 +45,24 @@ void naive_gemm_batched(
     float alpha = 1.0f,
     float beta = 0.0f);
 
+// Batched gather GEMM where matrix selection is driven by index arrays.
+void naive_gemm_gather(
+    CommandEncoder& encoder,
+    const array& a,
+    const array& b,
+    const array& lhs_indices,
+    const array& rhs_indices,
+    array& out,
+    int M,
+    int N,
+    int K,
+    bool a_transposed,
+    int64_t lda,
+    bool b_transposed,
+    int64_t ldb,
+    float alpha = 1.0f,
+    float beta = 0.0f);
+
 // Naive GEMM with explicit offsets (for non-uniform batch strides)
 void naive_gemm_with_offset(
     CommandEncoder& encoder,
