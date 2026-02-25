@@ -495,42 +495,106 @@ void gemm_and_bias(
           const int64_t ld_b = ldb;
           const int64_t ld_a = lda;
 
-          float alpha_f = alpha, beta_f = beta;
-
-          if (a.dtype() == float32) {
-            rocblas_sgemm(
-                handle,
-                trans_a,
-                trans_b,
-                N,
-                M,
-                K,
-                &alpha_f,
-                b.data<float>() + b_offset,
-                ld_b,
-                a.data<float>() + a_offset,
-                ld_a,
-                &beta_f,
-                out.data<float>() + batch * M * N,
-                N);
-          } else if (a.dtype() == float64) {
-            double alpha_d = static_cast<double>(alpha);
-            double beta_d = static_cast<double>(beta);
-            rocblas_dgemm(
-                handle,
-                trans_a,
-                trans_b,
-                N,
-                M,
-                K,
-                &alpha_d,
-                b.data<double>() + b_offset,
-                ld_b,
-                a.data<double>() + a_offset,
-                ld_a,
-                &beta_d,
-                out.data<double>() + batch * M * N,
-                N);
+          switch (a.dtype()) {
+            case float32: {
+              float alpha_f = alpha, beta_f = beta;
+              rocblas_sgemm(
+                  handle,
+                  trans_a,
+                  trans_b,
+                  N,
+                  M,
+                  K,
+                  &alpha_f,
+                  b.data<float>() + b_offset,
+                  ld_b,
+                  a.data<float>() + a_offset,
+                  ld_a,
+                  &beta_f,
+                  out.data<float>() + batch * M * N,
+                  N);
+              break;
+            }
+            case float64: {
+              double alpha_d = static_cast<double>(alpha);
+              double beta_d = static_cast<double>(beta);
+              rocblas_dgemm(
+                  handle,
+                  trans_a,
+                  trans_b,
+                  N,
+                  M,
+                  K,
+                  &alpha_d,
+                  b.data<double>() + b_offset,
+                  ld_b,
+                  a.data<double>() + a_offset,
+                  ld_a,
+                  &beta_d,
+                  out.data<double>() + batch * M * N,
+                  N);
+              break;
+            }
+            case float16: {
+              rocblas_half alpha_h, beta_h;
+              float16_t alpha_f16 = static_cast<float16_t>(alpha);
+              float16_t beta_f16 = static_cast<float16_t>(beta);
+              std::memcpy(&alpha_h, &alpha_f16, sizeof(rocblas_half));
+              std::memcpy(&beta_h, &beta_f16, sizeof(rocblas_half));
+              rocblas_hgemm(
+                  handle,
+                  trans_a,
+                  trans_b,
+                  N,
+                  M,
+                  K,
+                  &alpha_h,
+                  reinterpret_cast<const rocblas_half*>(
+                      b.data<float16_t>() + b_offset),
+                  ld_b,
+                  reinterpret_cast<const rocblas_half*>(
+                      a.data<float16_t>() + a_offset),
+                  ld_a,
+                  &beta_h,
+                  reinterpret_cast<rocblas_half*>(
+                      out.data<float16_t>() + batch * M * N),
+                  N);
+              break;
+            }
+            case bfloat16: {
+              float alpha_f = alpha;
+              float beta_f = beta;
+              auto* out_ptr = out.data<bfloat16_t>() + batch * M * N;
+              rocblas_gemm_ex(
+                  handle,
+                  trans_a,
+                  trans_b,
+                  N,
+                  M,
+                  K,
+                  &alpha_f,
+                  b.data<bfloat16_t>() + b_offset,
+                  rocblas_datatype_bf16_r,
+                  ld_b,
+                  a.data<bfloat16_t>() + a_offset,
+                  rocblas_datatype_bf16_r,
+                  ld_a,
+                  &beta_f,
+                  out_ptr,
+                  rocblas_datatype_bf16_r,
+                  N,
+                  out_ptr,
+                  rocblas_datatype_bf16_r,
+                  N,
+                  rocblas_datatype_f32_r,
+                  rocblas_gemm_algo_standard,
+                  0,
+                  0);
+              break;
+            }
+            default:
+              throw std::runtime_error(
+                  "Unsupported dtype for non-uniform batched matmul on ROCm");
           }
         });
       }
