@@ -15,19 +15,6 @@ namespace mlx::core {
 
 namespace {
 
-inline array ensure_row_contiguous(
-    const array& x,
-    rocm::CommandEncoder& enc,
-    const Stream& s) {
-  if (!x.flags().row_contiguous) {
-    array x_copy = contiguous_copy_gpu(x, s);
-    enc.add_temporary(x_copy);
-    return x_copy;
-  } else {
-    return x;
-  }
-}
-
 inline array ensure_row_contiguous_matrix(
     const array& x,
     rocm::CommandEncoder& enc,
@@ -309,6 +296,10 @@ __global__ void gather_qmv_kernel(
     const ScaleT* __restrict__ biases, // [E, N, K/GROUP_SIZE] or nullptr
     const uint32_t* __restrict__ lhs_indices, // [B]
     const uint32_t* __restrict__ rhs_indices, // [B]
+    const Shape batch_shape,
+    const Strides lhs_idx_strides,
+    const Strides rhs_idx_strides,
+    int batch_ndim,
     T* __restrict__ out,               // [B, M, N]
     int B,
     int M,
@@ -322,9 +313,25 @@ __global__ void gather_qmv_kernel(
   int col = blockIdx.y * blockDim.x + threadIdx.x;  // output col (N dimension)
   
   if (batch >= B || row >= M || col >= N) return;
-  
-  uint32_t lhs_idx = lhs_indices[batch];
-  uint32_t rhs_idx = rhs_indices[batch];
+
+  int64_t lhs_idx_loc = 0;
+  int64_t rhs_idx_loc = 0;
+  if (batch_ndim == 1) {
+    lhs_idx_loc = static_cast<int64_t>(batch) * lhs_idx_strides[0];
+    rhs_idx_loc = static_cast<int64_t>(batch) * rhs_idx_strides[0];
+  } else if (batch_ndim > 1) {
+    elem_to_loc<int64_t>(
+        static_cast<int64_t>(batch),
+        batch_shape.data_,
+        lhs_idx_strides.data_,
+        rhs_idx_strides.data_,
+        batch_ndim,
+        lhs_idx_loc,
+        rhs_idx_loc);
+  }
+
+  uint32_t lhs_idx = lhs_indices[lhs_idx_loc];
+  uint32_t rhs_idx = rhs_indices[rhs_idx_loc];
   
   int num_groups = (K + GROUP_SIZE - 1) / GROUP_SIZE;
   int row_bytes = (K * BITS) / 8;
@@ -374,10 +381,15 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (has_bias) {
     biases = ensure_row_contiguous_matrix(inputs[3], enc, s);
   }
-  // Gather kernels index these arrays with flat pointer arithmetic, so make
-  // sure broadcasted / strided index tensors are materialized contiguously.
-  array lhs_indices = ensure_row_contiguous(inputs[inputs.size() - 2], enc, s);
-  array rhs_indices = ensure_row_contiguous(inputs[inputs.size() - 1], enc, s);
+  const array& lhs_indices = inputs[inputs.size() - 2];
+  const array& rhs_indices = inputs[inputs.size() - 1];
+
+  auto [batch_shape, batch_strides] = collapse_contiguous_dims(
+      lhs_indices.shape(), {lhs_indices.strides(), rhs_indices.strides()});
+  auto batch_shape_param = const_param(batch_shape);
+  auto lhs_idx_strides_param = const_param<MAX_NDIM, int64_t>(batch_strides[0]);
+  auto rhs_idx_strides_param = const_param<MAX_NDIM, int64_t>(batch_strides[1]);
+  int batch_ndim = batch_shape.size();
 
   enc.set_input_array(x);
   enc.set_input_array(w);
@@ -409,7 +421,8 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
             scales.data<ScaleT>(), \
             has_bias ? biases->data<ScaleT>() : nullptr, \
             lhs_indices.data<uint32_t>(), rhs_indices.data<uint32_t>(), \
-            out.data<T>(), B, M, N, K, E, has_bias); \
+            batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, \
+            batch_ndim, out.data<T>(), B, M, N, K, E, has_bias); \
       } else { \
         hipLaunchKernelGGL( \
             (rocm::gather_qmv_kernel<T, ScaleT, BITS, GROUP_SIZE, false>), \
@@ -418,7 +431,8 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
             scales.data<ScaleT>(), \
             has_bias ? biases->data<ScaleT>() : nullptr, \
             lhs_indices.data<uint32_t>(), rhs_indices.data<uint32_t>(), \
-            out.data<T>(), B, M, N, K, E, has_bias); \
+            batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, \
+            batch_ndim, out.data<T>(), B, M, N, K, E, has_bias); \
       }
     
     #define DISPATCH_GROUP_SIZE_GATHER(T, ScaleT, BITS) \
