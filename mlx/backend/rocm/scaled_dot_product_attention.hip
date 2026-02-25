@@ -282,7 +282,19 @@ void sdpa_vector(
   params.O_strides[1] = o.strides(1);
   params.O_strides[2] = o.strides(2);
 
-  encoder.launch_kernel([&](hipStream_t stream) {
+  const void* q_ptr = gpu_ptr<void>(q);
+  const void* k_ptr = gpu_ptr<void>(k);
+  const void* v_ptr = gpu_ptr<void>(v);
+  void* o_ptr = gpu_ptr<void>(o);
+  const void* sinks_ptr = sinks ? gpu_ptr<void>(*sinks) : nullptr;
+
+  encoder.launch_kernel([
+                           &,
+                           q_ptr,
+                           k_ptr,
+                           v_ptr,
+                           o_ptr,
+                           sinks_ptr](hipStream_t stream) {
     dim3 grid_dim(H, qL, B);
     dim3 block_dim(1024, 1, 1);  // 32 tiles * 32 threads = 1024
 
@@ -294,11 +306,11 @@ void sdpa_vector(
       hipLaunchKernelGGL(
           (rocm::kernel_sdpav_1pass<DataType, causal, headdim>),
           grid_dim, block_dim, 0, stream,
-          q.data<DataType>(),
-          k.data<DataType>(),
-          v.data<DataType>(),
-          o.data<DataType>(),
-          sinks ? sinks->data<DataType>() : nullptr,
+          static_cast<const DataType*>(q_ptr),
+          static_cast<const DataType*>(k_ptr),
+          static_cast<const DataType*>(v_ptr),
+          static_cast<DataType*>(o_ptr),
+          sinks ? static_cast<const DataType*>(sinks_ptr) : nullptr,
           params);
     };
 

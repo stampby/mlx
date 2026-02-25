@@ -199,18 +199,19 @@ void gemv(
   const mlx::core::Strides* vec_strides_ptr;
   
   if (M == 1) {
-    mat_ptr = b.data<void>();
-    vec_ptr = a.data<void>();
+    mat_ptr = gpu_ptr<void>(b);
+    vec_ptr = gpu_ptr<void>(a);
     rows = N;
     mat_strides_ptr = &b_batch_strides;
     vec_strides_ptr = &a_batch_strides;
   } else {
-    mat_ptr = a.data<void>();
-    vec_ptr = b.data<void>();
+    mat_ptr = gpu_ptr<void>(a);
+    vec_ptr = gpu_ptr<void>(b);
     rows = M;
     mat_strides_ptr = &a_batch_strides;
     vec_strides_ptr = &b_batch_strides;
   }
+  void* out_base_ptr = gpu_ptr<void>(out);
   
   uint32_t num_blocks_x = (rows + rows_per_block - 1) / rows_per_block;
   
@@ -238,12 +239,19 @@ void gemv(
     (void)hipMemcpy(d_vec_strides, vec_strides_ptr->data(), batch_ndim * sizeof(int64_t), hipMemcpyHostToDevice);
   }
   
-  encoder.launch_kernel([&](hipStream_t stream) {
+  encoder.launch_kernel([
+                           &,
+                           mat_ptr,
+                           vec_ptr,
+                           out_base_ptr,
+                           d_batch_shape,
+                           d_mat_strides,
+                           d_vec_strides](hipStream_t stream) {
     auto launch_kernel = [&](auto type_tag, auto n_per_thread) {
       using T = typename decltype(type_tag)::type;
       const T* mat = static_cast<const T*>(mat_ptr);
       const T* vec = static_cast<const T*>(vec_ptr);
-      T* out_ptr = out.data<T>();
+      T* out_ptr = static_cast<T*>(out_base_ptr);
       
       if (batch_count == 1) {
         hipLaunchKernelGGL(
@@ -280,14 +288,13 @@ void gemv(
           break;
       }
     });
+
+    if (batch_count > 1) {
+      (void)hipFreeAsync(d_batch_shape, stream);
+      (void)hipFreeAsync(d_mat_strides, stream);
+      (void)hipFreeAsync(d_vec_strides, stream);
+    }
   });
-  
-  // Free device memory after kernel completes
-  if (batch_count > 1) {
-    (void)hipFree(d_batch_shape);
-    (void)hipFree(d_mat_strides);
-    (void)hipFree(d_vec_strides);
-  }
 }
 
 void gather_mv(
@@ -322,16 +329,31 @@ void gather_mv(
   // Compute batch strides for simple case
   int64_t mat_batch_stride = N * K;
   int64_t vec_batch_stride = K;
+
+  const void* mat_ptr = gpu_ptr<void>(mat_);
+  const void* vec_ptr = gpu_ptr<void>(vec_);
+  void* out_ptr = gpu_ptr<void>(out);
+  const uint32_t* mat_indices_ptr = gpu_ptr<const uint32_t>(mat_indices);
+  const uint32_t* vec_indices_ptr = gpu_ptr<const uint32_t>(vec_indices);
   
-  encoder.launch_kernel([&](hipStream_t stream) {
+  encoder.launch_kernel([
+                           &,
+                           mat_ptr,
+                           vec_ptr,
+                           out_ptr,
+                           mat_indices_ptr,
+                           vec_indices_ptr](hipStream_t stream) {
     auto launch_kernel = [&](auto type_tag, auto n_per_thread) {
       using T = typename decltype(type_tag)::type;
       
       hipLaunchKernelGGL(
           (gemv_gather<T, rows_per_block, n_per_thread()>),
           dim3(num_blocks_x, batch_size), block_dims, 0, stream,
-          mat_.data<T>(), vec_.data<T>(), out.data<T>(),
-          mat_indices.data<uint32_t>(), vec_indices.data<uint32_t>(),
+          static_cast<const T*>(mat_ptr),
+          static_cast<const T*>(vec_ptr),
+          static_cast<T*>(out_ptr),
+          mat_indices_ptr,
+          vec_indices_ptr,
           rows, cols,
           mat_batch_stride,
           vec_batch_stride);

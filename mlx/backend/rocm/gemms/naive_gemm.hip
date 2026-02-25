@@ -340,34 +340,45 @@ void naive_gemm(
   encoder.set_output_array(out);
   
   int ldc = N;
+  const void* a_ptr = gpu_ptr<void>(a);
+  const void* b_ptr = gpu_ptr<void>(b);
+  void* out_ptr = gpu_ptr<void>(out);
   
-  encoder.launch_kernel([&](hipStream_t stream) {
+  encoder.launch_kernel([&, a_ptr, b_ptr, out_ptr](hipStream_t stream) {
     switch (a.dtype()) {
       case float32:
         launch_naive_gemm<float>(
             stream,
-            a.data<float>(), b.data<float>(), out.data<float>(),
+            static_cast<const float*>(a_ptr),
+            static_cast<const float*>(b_ptr),
+            static_cast<float*>(out_ptr),
             M, N, K, lda, ldb, ldc,
             a_transposed, b_transposed, alpha, beta);
         break;
       case float64:
         launch_naive_gemm<double>(
             stream,
-            a.data<double>(), b.data<double>(), out.data<double>(),
+            static_cast<const double*>(a_ptr),
+            static_cast<const double*>(b_ptr),
+            static_cast<double*>(out_ptr),
             M, N, K, lda, ldb, ldc,
             a_transposed, b_transposed, alpha, beta);
         break;
       case float16:
         launch_naive_gemm<__half>(
             stream,
-            a.data<__half>(), b.data<__half>(), out.data<__half>(),
+            static_cast<const __half*>(a_ptr),
+            static_cast<const __half*>(b_ptr),
+            static_cast<__half*>(out_ptr),
             M, N, K, lda, ldb, ldc,
             a_transposed, b_transposed, alpha, beta);
         break;
       case bfloat16:
         launch_naive_gemm<hip_bfloat16>(
             stream,
-            a.data<hip_bfloat16>(), b.data<hip_bfloat16>(), out.data<hip_bfloat16>(),
+            static_cast<const hip_bfloat16*>(a_ptr),
+            static_cast<const hip_bfloat16*>(b_ptr),
+            static_cast<hip_bfloat16*>(out_ptr),
             M, N, K, lda, ldb, ldc,
             a_transposed, b_transposed, alpha, beta);
         break;
@@ -400,13 +411,18 @@ void naive_gemm_batched(
   encoder.set_output_array(out);
   
   int ldc = N;
+  const void* a_ptr = gpu_ptr<void>(a);
+  const void* b_ptr = gpu_ptr<void>(b);
+  void* out_ptr = gpu_ptr<void>(out);
   
-  encoder.launch_kernel([&](hipStream_t stream) {
+  encoder.launch_kernel([&, a_ptr, b_ptr, out_ptr](hipStream_t stream) {
     switch (a.dtype()) {
       case float32:
         launch_batched_gemm<float>(
             stream,
-            a.data<float>(), b.data<float>(), out.data<float>(),
+            static_cast<const float*>(a_ptr),
+            static_cast<const float*>(b_ptr),
+            static_cast<float*>(out_ptr),
             M, N, K, lda, ldb, ldc,
             stride_a, stride_b, stride_c, batch_count,
             a_transposed, b_transposed, alpha, beta);
@@ -414,7 +430,9 @@ void naive_gemm_batched(
       case float64:
         launch_batched_gemm<double>(
             stream,
-            a.data<double>(), b.data<double>(), out.data<double>(),
+            static_cast<const double*>(a_ptr),
+            static_cast<const double*>(b_ptr),
+            static_cast<double*>(out_ptr),
             M, N, K, lda, ldb, ldc,
             stride_a, stride_b, stride_c, batch_count,
             a_transposed, b_transposed, alpha, beta);
@@ -422,7 +440,9 @@ void naive_gemm_batched(
       case float16:
         launch_batched_gemm<__half>(
             stream,
-            a.data<__half>(), b.data<__half>(), out.data<__half>(),
+            static_cast<const __half*>(a_ptr),
+            static_cast<const __half*>(b_ptr),
+            static_cast<__half*>(out_ptr),
             M, N, K, lda, ldb, ldc,
             stride_a, stride_b, stride_c, batch_count,
             a_transposed, b_transposed, alpha, beta);
@@ -430,7 +450,9 @@ void naive_gemm_batched(
       case bfloat16:
         launch_batched_gemm<hip_bfloat16>(
             stream,
-            a.data<hip_bfloat16>(), b.data<hip_bfloat16>(), out.data<hip_bfloat16>(),
+            static_cast<const hip_bfloat16*>(a_ptr),
+            static_cast<const hip_bfloat16*>(b_ptr),
+            static_cast<hip_bfloat16*>(out_ptr),
             M, N, K, lda, ldb, ldc,
             stride_a, stride_b, stride_c, batch_count,
             a_transposed, b_transposed, alpha, beta);
@@ -487,42 +509,45 @@ void naive_gemm_with_offset_ldc(
   encoder.set_input_array(a);
   encoder.set_input_array(b);
   encoder.set_output_array(out);
+  const void* a_ptr = gpu_ptr<void>(a);
+  const void* b_ptr = gpu_ptr<void>(b);
+  void* out_ptr = gpu_ptr<void>(out);
   
-  encoder.launch_kernel([&](hipStream_t stream) {
+  encoder.launch_kernel([&, a_ptr, b_ptr, out_ptr](hipStream_t stream) {
     switch (a.dtype()) {
       case float32:
         launch_naive_gemm<float>(
             stream,
-            a.data<float>() + a_offset, 
-            b.data<float>() + b_offset, 
-            out.data<float>() + out_offset,
+            static_cast<const float*>(a_ptr) + a_offset,
+            static_cast<const float*>(b_ptr) + b_offset,
+            static_cast<float*>(out_ptr) + out_offset,
             M, N, K, lda, ldb, ldc,
             a_transposed, b_transposed, alpha, beta);
         break;
       case float64:
         launch_naive_gemm<double>(
             stream,
-            a.data<double>() + a_offset, 
-            b.data<double>() + b_offset, 
-            out.data<double>() + out_offset,
+            static_cast<const double*>(a_ptr) + a_offset,
+            static_cast<const double*>(b_ptr) + b_offset,
+            static_cast<double*>(out_ptr) + out_offset,
             M, N, K, lda, ldb, ldc,
             a_transposed, b_transposed, alpha, beta);
         break;
       case float16:
         launch_naive_gemm<__half>(
             stream,
-            a.data<__half>() + a_offset, 
-            b.data<__half>() + b_offset, 
-            out.data<__half>() + out_offset,
+            static_cast<const __half*>(a_ptr) + a_offset,
+            static_cast<const __half*>(b_ptr) + b_offset,
+            static_cast<__half*>(out_ptr) + out_offset,
             M, N, K, lda, ldb, ldc,
             a_transposed, b_transposed, alpha, beta);
         break;
       case bfloat16:
         launch_naive_gemm<hip_bfloat16>(
             stream,
-            a.data<hip_bfloat16>() + a_offset, 
-            b.data<hip_bfloat16>() + b_offset, 
-            out.data<hip_bfloat16>() + out_offset,
+            static_cast<const hip_bfloat16*>(a_ptr) + a_offset,
+            static_cast<const hip_bfloat16*>(b_ptr) + b_offset,
+            static_cast<hip_bfloat16*>(out_ptr) + out_offset,
             M, N, K, lda, ldb, ldc,
             a_transposed, b_transposed, alpha, beta);
         break;

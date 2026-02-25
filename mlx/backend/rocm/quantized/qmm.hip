@@ -205,44 +205,50 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   int block_size = 256;
   dim3 grid((M + 0) / 1, (N + block_size - 1) / block_size);
   grid.x = M;
+
+  const void* x_ptr = gpu_ptr<void>(x);
+  const uint8_t* w_ptr = gpu_ptr<const uint8_t>(w);
+  const void* scales_ptr = gpu_ptr<void>(scales);
+  const void* biases_ptr = has_bias ? gpu_ptr<void>(*biases) : nullptr;
+  void* out_ptr = gpu_ptr<void>(out);
   
-  enc.launch_kernel([&](hipStream_t stream) {
+  enc.launch_kernel([&, x_ptr, w_ptr, scales_ptr, biases_ptr, out_ptr](hipStream_t stream) {
     #define LAUNCH_QMV(T, ScaleT, BITS, GROUP_SIZE) \
       if (mode_ == QuantizationMode::Affine) { \
         if (transpose_) { \
           hipLaunchKernelGGL( \
               (rocm::qmv_t_kernel<T, ScaleT, BITS, GROUP_SIZE, true>), \
               grid, dim3(block_size), 0, stream, \
-              x.data<T>(), w.data<uint8_t>(), \
-              scales.data<ScaleT>(), \
-              has_bias ? biases->data<ScaleT>() : nullptr, \
-              out.data<T>(), M, N, K, has_bias); \
+              static_cast<const T*>(x_ptr), w_ptr, \
+              static_cast<const ScaleT*>(scales_ptr), \
+              has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr, \
+              static_cast<T*>(out_ptr), M, N, K, has_bias); \
         } else { \
           hipLaunchKernelGGL( \
               (rocm::qmv_kernel<T, ScaleT, BITS, GROUP_SIZE, true>), \
               grid, dim3(block_size), 0, stream, \
-              x.data<T>(), w.data<uint8_t>(), \
-              scales.data<ScaleT>(), \
-              has_bias ? biases->data<ScaleT>() : nullptr, \
-              out.data<T>(), M, N, K, has_bias); \
+              static_cast<const T*>(x_ptr), w_ptr, \
+              static_cast<const ScaleT*>(scales_ptr), \
+              has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr, \
+              static_cast<T*>(out_ptr), M, N, K, has_bias); \
         } \
       } else { \
         if (transpose_) { \
           hipLaunchKernelGGL( \
               (rocm::qmv_t_kernel<T, ScaleT, BITS, GROUP_SIZE, false>), \
               grid, dim3(block_size), 0, stream, \
-              x.data<T>(), w.data<uint8_t>(), \
-              scales.data<ScaleT>(), \
-              has_bias ? biases->data<ScaleT>() : nullptr, \
-              out.data<T>(), M, N, K, has_bias); \
+              static_cast<const T*>(x_ptr), w_ptr, \
+              static_cast<const ScaleT*>(scales_ptr), \
+              has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr, \
+              static_cast<T*>(out_ptr), M, N, K, has_bias); \
         } else { \
           hipLaunchKernelGGL( \
               (rocm::qmv_kernel<T, ScaleT, BITS, GROUP_SIZE, false>), \
               grid, dim3(block_size), 0, stream, \
-              x.data<T>(), w.data<uint8_t>(), \
-              scales.data<ScaleT>(), \
-              has_bias ? biases->data<ScaleT>() : nullptr, \
-              out.data<T>(), M, N, K, has_bias); \
+              static_cast<const T*>(x_ptr), w_ptr, \
+              static_cast<const ScaleT*>(scales_ptr), \
+              has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr, \
+              static_cast<T*>(out_ptr), M, N, K, has_bias); \
         } \
       }
     
@@ -410,29 +416,45 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   int block_size = 256;
   dim3 grid(M, (N + block_size - 1) / block_size, B);
+
+  const void* x_ptr = gpu_ptr<void>(x);
+  const uint8_t* w_ptr = gpu_ptr<const uint8_t>(w);
+  const void* scales_ptr = gpu_ptr<void>(scales);
+  const void* biases_ptr = has_bias ? gpu_ptr<void>(*biases) : nullptr;
+  const uint32_t* lhs_indices_ptr = gpu_ptr<const uint32_t>(lhs_indices);
+  const uint32_t* rhs_indices_ptr = gpu_ptr<const uint32_t>(rhs_indices);
+  void* out_ptr = gpu_ptr<void>(out);
   
-  enc.launch_kernel([&](hipStream_t stream) {
+  enc.launch_kernel([
+                        &,
+                        x_ptr,
+                        w_ptr,
+                        scales_ptr,
+                        biases_ptr,
+                        lhs_indices_ptr,
+                        rhs_indices_ptr,
+                        out_ptr](hipStream_t stream) {
     #define LAUNCH_GATHER_QMV(T, ScaleT, BITS, GROUP_SIZE) \
       if (mode_ == QuantizationMode::Affine) { \
         hipLaunchKernelGGL( \
             (rocm::gather_qmv_kernel<T, ScaleT, BITS, GROUP_SIZE, true>), \
             grid, dim3(block_size), 0, stream, \
-            x.data<T>(), w.data<uint8_t>(), \
-            scales.data<ScaleT>(), \
-            has_bias ? biases->data<ScaleT>() : nullptr, \
-            lhs_indices.data<uint32_t>(), rhs_indices.data<uint32_t>(), \
+            static_cast<const T*>(x_ptr), w_ptr, \
+            static_cast<const ScaleT*>(scales_ptr), \
+            has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr, \
+            lhs_indices_ptr, rhs_indices_ptr, \
             batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, \
-            batch_ndim, out.data<T>(), B, M, N, K, E, has_bias); \
+            batch_ndim, static_cast<T*>(out_ptr), B, M, N, K, E, has_bias); \
       } else { \
         hipLaunchKernelGGL( \
             (rocm::gather_qmv_kernel<T, ScaleT, BITS, GROUP_SIZE, false>), \
             grid, dim3(block_size), 0, stream, \
-            x.data<T>(), w.data<uint8_t>(), \
-            scales.data<ScaleT>(), \
-            has_bias ? biases->data<ScaleT>() : nullptr, \
-            lhs_indices.data<uint32_t>(), rhs_indices.data<uint32_t>(), \
+            static_cast<const T*>(x_ptr), w_ptr, \
+            static_cast<const ScaleT*>(scales_ptr), \
+            has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr, \
+            lhs_indices_ptr, rhs_indices_ptr, \
             batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, \
-            batch_ndim, out.data<T>(), B, M, N, K, E, has_bias); \
+            batch_ndim, static_cast<T*>(out_ptr), B, M, N, K, E, has_bias); \
       }
     
     #define DISPATCH_GROUP_SIZE_GATHER(T, ScaleT, BITS) \

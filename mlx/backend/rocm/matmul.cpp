@@ -5,6 +5,7 @@
 #include "mlx/backend/rocm/device.h"
 #include "mlx/backend/rocm/gemms/gemv.h"
 #include "mlx/backend/rocm/gemms/naive_gemm.h"
+#include "mlx/backend/rocm/kernel_utils.hpp"
 #include "mlx/primitives.h"
 #include "mlx/types/half_types.h"
 
@@ -83,8 +84,11 @@ void gemm_rocblas(
   // dimensions come directly from check_transpose() for each operand.
   const int64_t ld_b = ldb;
   const int64_t ld_a = lda;
+  const void* a_ptr = gpu_ptr<void>(a);
+  const void* b_ptr = gpu_ptr<void>(b);
+  void* out_ptr = gpu_ptr<void>(out);
 
-  encoder.launch_kernel([&](hipStream_t stream) {
+  encoder.launch_kernel([&, a_ptr, b_ptr, out_ptr](hipStream_t stream) {
     rocblas_set_stream(handle, stream);
 
     switch (a.dtype()) {
@@ -99,12 +103,12 @@ void gemm_rocblas(
             M, // n (cols of op(A))
             K, // k
             &alpha_f,
-            b.data<float>(),
+            static_cast<const float*>(b_ptr),
             ld_b,
-            a.data<float>(),
+            static_cast<const float*>(a_ptr),
             ld_a,
             &beta_f,
-            out.data<float>(),
+            static_cast<float*>(out_ptr),
             N); // ldc
         break;
       }
@@ -119,12 +123,12 @@ void gemm_rocblas(
             M,
             K,
             &alpha_d,
-            b.data<double>(),
+            static_cast<const double*>(b_ptr),
             ld_b,
-            a.data<double>(),
+            static_cast<const double*>(a_ptr),
             ld_a,
             &beta_d,
-            out.data<double>(),
+            static_cast<double*>(out_ptr),
             N);
         break;
       }
@@ -143,12 +147,14 @@ void gemm_rocblas(
             M,
             K,
             &alpha_h,
-            reinterpret_cast<const rocblas_half*>(b.data<float16_t>()),
+            reinterpret_cast<const rocblas_half*>(
+                static_cast<const float16_t*>(b_ptr)),
             ld_b,
-            reinterpret_cast<const rocblas_half*>(a.data<float16_t>()),
+            reinterpret_cast<const rocblas_half*>(
+                static_cast<const float16_t*>(a_ptr)),
             ld_a,
             &beta_h,
-            reinterpret_cast<rocblas_half*>(out.data<float16_t>()),
+            reinterpret_cast<rocblas_half*>(static_cast<float16_t*>(out_ptr)),
             N);
         break;
       }
@@ -164,17 +170,17 @@ void gemm_rocblas(
             M,
             K,
             &alpha_f,
-            b.data<bfloat16_t>(),
+            static_cast<const bfloat16_t*>(b_ptr),
             rocblas_datatype_bf16_r,
             ld_b,
-            a.data<bfloat16_t>(),
+            static_cast<const bfloat16_t*>(a_ptr),
             rocblas_datatype_bf16_r,
             ld_a,
             &beta_f,
-            out.data<bfloat16_t>(),
+            static_cast<bfloat16_t*>(out_ptr),
             rocblas_datatype_bf16_r,
             N,
-            out.data<bfloat16_t>(),
+            static_cast<bfloat16_t*>(out_ptr),
             rocblas_datatype_bf16_r,
             N,
             rocblas_datatype_f32_r, // compute type
@@ -217,8 +223,11 @@ void gemm_strided_batched_rocblas(
 
   const int64_t ld_b = ldb;
   const int64_t ld_a = lda;
+  const void* a_ptr = gpu_ptr<void>(a);
+  const void* b_ptr = gpu_ptr<void>(b);
+  void* out_ptr = gpu_ptr<void>(out);
 
-  encoder.launch_kernel([&](hipStream_t stream) {
+  encoder.launch_kernel([&, a_ptr, b_ptr, out_ptr](hipStream_t stream) {
     rocblas_set_stream(handle, stream);
 
     switch (a.dtype()) {
@@ -233,14 +242,14 @@ void gemm_strided_batched_rocblas(
             M,
             K,
             &alpha_f,
-            b.data<float>(),
+            static_cast<const float*>(b_ptr),
             ld_b,
             stride_b,
-            a.data<float>(),
+            static_cast<const float*>(a_ptr),
             ld_a,
             stride_a,
             &beta_f,
-            out.data<float>(),
+            static_cast<float*>(out_ptr),
             N,
             stride_c,
             batch_count);
@@ -257,14 +266,14 @@ void gemm_strided_batched_rocblas(
             M,
             K,
             &alpha_d,
-            b.data<double>(),
+            static_cast<const double*>(b_ptr),
             ld_b,
             stride_b,
-            a.data<double>(),
+            static_cast<const double*>(a_ptr),
             ld_a,
             stride_a,
             &beta_d,
-            out.data<double>(),
+            static_cast<double*>(out_ptr),
             N,
             stride_c,
             batch_count);
@@ -284,14 +293,16 @@ void gemm_strided_batched_rocblas(
             M,
             K,
             &alpha_h,
-            reinterpret_cast<const rocblas_half*>(b.data<float16_t>()),
+            reinterpret_cast<const rocblas_half*>(
+                static_cast<const float16_t*>(b_ptr)),
             ld_b,
             stride_b,
-            reinterpret_cast<const rocblas_half*>(a.data<float16_t>()),
+            reinterpret_cast<const rocblas_half*>(
+                static_cast<const float16_t*>(a_ptr)),
             ld_a,
             stride_a,
             &beta_h,
-            reinterpret_cast<rocblas_half*>(out.data<float16_t>()),
+            reinterpret_cast<rocblas_half*>(static_cast<float16_t*>(out_ptr)),
             N,
             stride_c,
             batch_count);
@@ -308,20 +319,20 @@ void gemm_strided_batched_rocblas(
             M,
             K,
             &alpha_f,
-            b.data<bfloat16_t>(),
+            static_cast<const bfloat16_t*>(b_ptr),
             rocblas_datatype_bf16_r,
             ld_b,
             stride_b,
-            a.data<bfloat16_t>(),
+            static_cast<const bfloat16_t*>(a_ptr),
             rocblas_datatype_bf16_r,
             ld_a,
             stride_a,
             &beta_f,
-            out.data<bfloat16_t>(),
+            static_cast<bfloat16_t*>(out_ptr),
             rocblas_datatype_bf16_r,
             N,
             stride_c,
-            out.data<bfloat16_t>(),
+            static_cast<bfloat16_t*>(out_ptr),
             rocblas_datatype_bf16_r,
             N,
             stride_c,
@@ -471,6 +482,9 @@ void gemm_and_bias(
   } else {
     // Fallback: loop over batches for non-uniform strides
     if (use_rocblas) {
+      const void* a_ptr_base = gpu_ptr<void>(a);
+      const void* b_ptr_base = gpu_ptr<void>(b);
+      void* out_ptr_base = gpu_ptr<void>(out);
       for (int64_t batch = 0; batch < batch_count; ++batch) {
         int64_t a_offset = 0, b_offset = 0;
         int64_t batch_idx = batch;
@@ -481,8 +495,13 @@ void gemm_and_bias(
           b_offset += idx * b_batch_strides[i];
         }
 
-        encoder.launch_kernel([&, a_offset, b_offset, batch](
-                                  hipStream_t stream) {
+        encoder.launch_kernel([&,
+                               a_offset,
+                               b_offset,
+                               batch,
+                               a_ptr_base,
+                               b_ptr_base,
+                               out_ptr_base](hipStream_t stream) {
           auto& device = encoder.device();
           rocblas_handle handle = device.get_rocblas_handle();
           rocblas_set_stream(handle, stream);
@@ -506,12 +525,12 @@ void gemm_and_bias(
                   M,
                   K,
                   &alpha_f,
-                  b.data<float>() + b_offset,
+                  static_cast<const float*>(b_ptr_base) + b_offset,
                   ld_b,
-                  a.data<float>() + a_offset,
+                  static_cast<const float*>(a_ptr_base) + a_offset,
                   ld_a,
                   &beta_f,
-                  out.data<float>() + batch * M * N,
+                  static_cast<float*>(out_ptr_base) + batch * M * N,
                   N);
               break;
             }
@@ -526,12 +545,12 @@ void gemm_and_bias(
                   M,
                   K,
                   &alpha_d,
-                  b.data<double>() + b_offset,
+                  static_cast<const double*>(b_ptr_base) + b_offset,
                   ld_b,
-                  a.data<double>() + a_offset,
+                  static_cast<const double*>(a_ptr_base) + a_offset,
                   ld_a,
                   &beta_d,
-                  out.data<double>() + batch * M * N,
+                  static_cast<double*>(out_ptr_base) + batch * M * N,
                   N);
               break;
             }
@@ -550,21 +569,22 @@ void gemm_and_bias(
                   K,
                   &alpha_h,
                   reinterpret_cast<const rocblas_half*>(
-                      b.data<float16_t>() + b_offset),
+                      static_cast<const float16_t*>(b_ptr_base) + b_offset),
                   ld_b,
                   reinterpret_cast<const rocblas_half*>(
-                      a.data<float16_t>() + a_offset),
+                      static_cast<const float16_t*>(a_ptr_base) + a_offset),
                   ld_a,
                   &beta_h,
                   reinterpret_cast<rocblas_half*>(
-                      out.data<float16_t>() + batch * M * N),
+                      static_cast<float16_t*>(out_ptr_base) + batch * M * N),
                   N);
               break;
             }
             case bfloat16: {
               float alpha_f = alpha;
               float beta_f = beta;
-              auto* out_ptr = out.data<bfloat16_t>() + batch * M * N;
+              auto* out_ptr =
+                  static_cast<bfloat16_t*>(out_ptr_base) + batch * M * N;
               rocblas_gemm_ex(
                   handle,
                   trans_a,
@@ -573,10 +593,10 @@ void gemm_and_bias(
                   M,
                   K,
                   &alpha_f,
-                  b.data<bfloat16_t>() + b_offset,
+                  static_cast<const bfloat16_t*>(b_ptr_base) + b_offset,
                   rocblas_datatype_bf16_r,
                   ld_b,
-                  a.data<bfloat16_t>() + a_offset,
+                  static_cast<const bfloat16_t*>(a_ptr_base) + a_offset,
                   rocblas_datatype_bf16_r,
                   ld_a,
                   &beta_f,
@@ -787,42 +807,48 @@ void GatherMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   }
 
   if (use_rocblas) {
+    const void* a_ptr = gpu_ptr<void>(a_);
+    const void* b_ptr = gpu_ptr<void>(b_);
+    void* out_ptr = gpu_ptr<void>(out);
     for (int i = 0; i < batch_size; ++i) {
       int64_t a_offset = lhs_idx[i] * M * K;
       int64_t b_offset = rhs_idx[i] * K * N;
       int64_t out_offset = i * M * N;
 
-      encoder.launch_kernel([&, a_offset, b_offset, out_offset](
-                                hipStream_t stream) {
-        auto& device = encoder.device();
-        rocblas_handle handle = device.get_rocblas_handle();
-        rocblas_set_stream(handle, stream);
+      encoder.launch_kernel(
+          [&, a_offset, b_offset, out_offset, a_ptr, b_ptr, out_ptr](
+              hipStream_t stream) {
+            auto& device = encoder.device();
+            rocblas_handle handle = device.get_rocblas_handle();
+            rocblas_set_stream(handle, stream);
 
-        rocblas_operation trans_a =
-            transposed_b ? rocblas_operation_none : rocblas_operation_transpose;
-        rocblas_operation trans_b =
-            transposed_a ? rocblas_operation_none : rocblas_operation_transpose;
+            rocblas_operation trans_a = transposed_b
+                ? rocblas_operation_none
+                : rocblas_operation_transpose;
+            rocblas_operation trans_b = transposed_a
+                ? rocblas_operation_none
+                : rocblas_operation_transpose;
 
-        float alpha = 1.0f, beta = 0.0f;
+            float alpha = 1.0f, beta = 0.0f;
 
-        if (a.dtype() == float32) {
-          rocblas_sgemm(
-              handle,
-              trans_a,
-              trans_b,
-              N,
-              M,
-              K,
-              &alpha,
-              b_.data<float>() + b_offset,
-              transposed_b ? K : N,
-              a_.data<float>() + a_offset,
-              transposed_a ? M : K,
-              &beta,
-              out.data<float>() + out_offset,
-              N);
-        }
-      });
+            if (a.dtype() == float32) {
+              rocblas_sgemm(
+                  handle,
+                  trans_a,
+                  trans_b,
+                  N,
+                  M,
+                  K,
+                  &alpha,
+                  static_cast<const float*>(b_ptr) + b_offset,
+                  transposed_b ? K : N,
+                  static_cast<const float*>(a_ptr) + a_offset,
+                  transposed_a ? M : K,
+                  &beta,
+                  static_cast<float*>(out_ptr) + out_offset,
+                  N);
+            }
+          });
     }
   } else {
     // Use naive GEMM for each batch

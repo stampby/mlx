@@ -3,6 +3,7 @@
 #include "mlx/backend/rocm/gemms/rocblas_gemm.h"
 #include "mlx/backend/rocm/device.h"
 #include "mlx/backend/rocm/gemms/naive_gemm.h"
+#include "mlx/backend/rocm/kernel_utils.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -67,7 +68,11 @@ void rocblas_gemm(
     return;
   }
 
-  encoder.launch_kernel([&](hipStream_t stream) {
+  const void* a_ptr = gpu_ptr<void>(a);
+  const void* b_ptr = gpu_ptr<void>(b);
+  void* c_ptr = gpu_ptr<void>(c);
+
+  encoder.launch_kernel([&, a_ptr, b_ptr, c_ptr](hipStream_t stream) {
     rocblas_handle handle = encoder.device().get_rocblas_handle();
     rocblas_set_stream(handle, stream);
 
@@ -86,12 +91,12 @@ void rocblas_gemm(
             M,
             K,
             &alpha_f,
-            b.data<float>(),
+            static_cast<const float*>(b_ptr),
             ldb,
-            a.data<float>(),
+            static_cast<const float*>(a_ptr),
             lda,
             &beta_f,
-            c.data<float>(),
+            static_cast<float*>(c_ptr),
             ldc);
         break;
       }
@@ -109,12 +114,14 @@ void rocblas_gemm(
             M,
             K,
             &alpha_h,
-            reinterpret_cast<const rocblas_half*>(b.data<uint16_t>()),
+            reinterpret_cast<const rocblas_half*>(
+                static_cast<const uint16_t*>(b_ptr)),
             ldb,
-            reinterpret_cast<const rocblas_half*>(a.data<uint16_t>()),
+            reinterpret_cast<const rocblas_half*>(
+                static_cast<const uint16_t*>(a_ptr)),
             lda,
             &beta_h,
-            reinterpret_cast<rocblas_half*>(c.data<uint16_t>()),
+            reinterpret_cast<rocblas_half*>(static_cast<uint16_t*>(c_ptr)),
             ldc);
         break;
       }
@@ -168,7 +175,11 @@ void rocblas_gemm_batched(
     return;
   }
 
-  encoder.launch_kernel([&](hipStream_t stream) {
+  const void* a_ptr = gpu_ptr<void>(a);
+  const void* b_ptr = gpu_ptr<void>(b);
+  void* c_ptr = gpu_ptr<void>(c);
+
+  encoder.launch_kernel([&, a_ptr, b_ptr, c_ptr](hipStream_t stream) {
     rocblas_handle handle = encoder.device().get_rocblas_handle();
     rocblas_set_stream(handle, stream);
 
@@ -187,14 +198,14 @@ void rocblas_gemm_batched(
             M,
             K,
             &alpha_f,
-            b.data<float>(),
+            static_cast<const float*>(b_ptr),
             ldb,
             stride_b,
-            a.data<float>(),
+            static_cast<const float*>(a_ptr),
             lda,
             stride_a,
             &beta_f,
-            c.data<float>(),
+            static_cast<float*>(c_ptr),
             ldc,
             stride_c,
             batch_count);
@@ -213,14 +224,16 @@ void rocblas_gemm_batched(
             M,
             K,
             &alpha_h,
-            reinterpret_cast<const rocblas_half*>(b.data<uint16_t>()),
+            reinterpret_cast<const rocblas_half*>(
+                static_cast<const uint16_t*>(b_ptr)),
             ldb,
             stride_b,
-            reinterpret_cast<const rocblas_half*>(a.data<uint16_t>()),
+            reinterpret_cast<const rocblas_half*>(
+                static_cast<const uint16_t*>(a_ptr)),
             lda,
             stride_a,
             &beta_h,
-            reinterpret_cast<rocblas_half*>(c.data<uint16_t>()),
+            reinterpret_cast<rocblas_half*>(static_cast<uint16_t*>(c_ptr)),
             ldc,
             stride_c,
             batch_count);
