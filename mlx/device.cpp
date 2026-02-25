@@ -49,12 +49,13 @@ bool operator!=(const Device& lhs, const Device& rhs) {
 bool is_available(const Device& d) {
   switch (d.type) {
     case Device::cpu:
-      return cpu::is_available();
+      return cpu::is_available() && (d.index < cpu::device_count());
     case Device::gpu:
 #ifdef MLX_USE_ROCM
-      return gpu::is_available() || rocm::is_available();
+      return (gpu::is_available() || rocm::is_available()) &&
+          (d.index < gpu::device_count());
 #else
-      return gpu::is_available();
+      return gpu::is_available() && (d.index < gpu::device_count());
 #endif
   }
   // appease compiler
