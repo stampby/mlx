@@ -75,10 +75,18 @@ inline int select_qmv_cols_per_block(int K, int N, int bits) {
   }
 
   (void)K;
-  (void)bits;
 
   if (N < 256) {
     return 4;
+  }
+  if (bits == 8) {
+    if (N < 1024) {
+      return 8;
+    }
+    if (N < 4096) {
+      return 32;
+    }
+    return 16;
   }
   if (N < 1024) {
     return 8;
@@ -99,10 +107,18 @@ inline int select_gather_qmv_cols_per_block(int K, int N, int bits) {
   }
 
   (void)K;
-  (void)bits;
 
   if (N < 256) {
     return 4;
+  }
+  if (bits == 8) {
+    if (N < 1024) {
+      return 8;
+    }
+    if (N < 4096) {
+      return 32;
+    }
+    return 16;
   }
   if (N < 1024) {
     return 8;
@@ -203,28 +219,27 @@ __device__ inline float fp4_e2m1_to_float(uint8_t val) {
   }
 }
 
-__device__ inline float fp8_e4m3_to_float(uint8_t val) {
+__device__ __forceinline__ float fp8_e4m3_to_float(uint8_t val) {
   uint32_t sign = (val >> 7) & 0x1;
   uint32_t exp = (val >> 3) & 0xF;
   uint32_t mant = val & 0x7;
 
-  float result;
-  if (exp == 0) {
-    if (mant == 0) {
-      result = 0.0f;
-    } else {
-      result = ldexpf(static_cast<float>(mant), -9);
-    }
-  } else if (exp == 15 && mant == 7) {
-    result = __uint_as_float(0x7FC00000);
-  } else {
+  if (exp != 0 && !(exp == 15 && mant == 7)) {
     uint32_t float_exp = exp - 7 + 127;
     uint32_t float_mant = mant << 20;
     uint32_t bits = (sign << 31) | (float_exp << 23) | float_mant;
-    result = __uint_as_float(bits);
+    return __uint_as_float(bits);
   }
 
-  return sign ? -fabsf(result) : result;
+  if (exp == 0) {
+    if (mant == 0) {
+      return sign ? -0.0f : 0.0f;
+    }
+    float subnormal = ldexpf(static_cast<float>(mant), -9);
+    return sign ? -subnormal : subnormal;
+  }
+
+  return __uint_as_float(0x7FC00000);
 }
 
 template <int GROUP_SIZE>
@@ -364,24 +379,47 @@ __global__ void qmv_warp_kernel(
         }
         acc += group_acc;
       } else {
-        if (full_group) {
+        if constexpr (BITS == 8) {
+          float qx_acc = 0.0f;
+          if (full_group) {
 #pragma unroll
-          for (int k_local = lane; k_local < GROUP_SIZE; k_local += kWarpSize) {
-            int k = k_start + k_local;
-            uint8_t quant_val =
-                unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
-            float w_val =
-                dequantize_value<BITS, AFFINE>(quant_val, scale, bias);
-            acc = fmaf(x_group_shared[k_local], w_val, acc);
+            for (int k_local = lane; k_local < GROUP_SIZE; k_local += kWarpSize) {
+              int k = k_start + k_local;
+              uint8_t quant_val =
+                  unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              qx_acc = fmaf(
+                  x_group_shared[k_local], fp8_e4m3_to_float(quant_val), qx_acc);
+            }
+          } else {
+            for (int k_local = lane; k_local < group_len; k_local += kWarpSize) {
+              int k = k_start + k_local;
+              uint8_t quant_val =
+                  unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              qx_acc = fmaf(
+                  x_group_shared[k_local], fp8_e4m3_to_float(quant_val), qx_acc);
+            }
           }
+          acc = fmaf(scale, qx_acc, acc);
         } else {
-          for (int k_local = lane; k_local < group_len; k_local += kWarpSize) {
-            int k = k_start + k_local;
-            uint8_t quant_val =
-                unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
-            float w_val =
-                dequantize_value<BITS, AFFINE>(quant_val, scale, bias);
-            acc = fmaf(x_group_shared[k_local], w_val, acc);
+          if (full_group) {
+#pragma unroll
+            for (int k_local = lane; k_local < GROUP_SIZE; k_local += kWarpSize) {
+              int k = k_start + k_local;
+              uint8_t quant_val =
+                  unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              float w_val =
+                  dequantize_value<BITS, AFFINE>(quant_val, scale, bias);
+              acc = fmaf(x_group_shared[k_local], w_val, acc);
+            }
+          } else {
+            for (int k_local = lane; k_local < group_len; k_local += kWarpSize) {
+              int k = k_start + k_local;
+              uint8_t quant_val =
+                  unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              float w_val =
+                  dequantize_value<BITS, AFFINE>(quant_val, scale, bias);
+              acc = fmaf(x_group_shared[k_local], w_val, acc);
+            }
           }
         }
       }
@@ -472,28 +510,56 @@ __global__ void qmv_warp_noshared_kernel(
         }
         acc += group_acc;
       } else {
-        if (full_group) {
+        if constexpr (BITS == 8) {
+          float qx_acc = 0.0f;
+          if (full_group) {
 #pragma unroll
-          for (int k_local = lane; k_local < GROUP_SIZE; k_local += kWarpSize) {
-            int k = k_start + k_local;
-            uint8_t quant_val =
-                unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
-            float w_val =
-                dequantize_value<BITS, AFFINE>(quant_val, scale, bias);
-            acc = fmaf(static_cast<float>(x_row[k]), w_val, acc);
+            for (int k_local = lane; k_local < GROUP_SIZE; k_local += kWarpSize) {
+              int k = k_start + k_local;
+              uint8_t quant_val =
+                  unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              qx_acc = fmaf(
+                  static_cast<float>(x_row[k]),
+                  fp8_e4m3_to_float(quant_val),
+                  qx_acc);
+            }
+          } else {
+            for (int k_local = lane; k_local < group_len; k_local += kWarpSize) {
+              int k = k_start + k_local;
+              uint8_t quant_val =
+                  unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              qx_acc = fmaf(
+                  static_cast<float>(x_row[k]),
+                  fp8_e4m3_to_float(quant_val),
+                  qx_acc);
+            }
           }
+          acc = fmaf(scale, qx_acc, acc);
         } else {
-          for (int k_local = lane; k_local < group_len; k_local += kWarpSize) {
-            int k = k_start + k_local;
-            uint8_t quant_val =
-                unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
-            float w_val =
-                dequantize_value<BITS, AFFINE>(quant_val, scale, bias);
-            acc = fmaf(static_cast<float>(x_row[k]), w_val, acc);
+          if (full_group) {
+#pragma unroll
+            for (int k_local = lane; k_local < GROUP_SIZE; k_local += kWarpSize) {
+              int k = k_start + k_local;
+              uint8_t quant_val =
+                  unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              float w_val =
+                  dequantize_value<BITS, AFFINE>(quant_val, scale, bias);
+              acc = fmaf(static_cast<float>(x_row[k]), w_val, acc);
+            }
+          } else {
+            for (int k_local = lane; k_local < group_len; k_local += kWarpSize) {
+              int k = k_start + k_local;
+              uint8_t quant_val =
+                  unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              float w_val =
+                  dequantize_value<BITS, AFFINE>(quant_val, scale, bias);
+              acc = fmaf(static_cast<float>(x_row[k]), w_val, acc);
+            }
           }
         }
       }
     }
+
   }
 
   acc = warp_reduce_sum_qmm(acc);
@@ -539,12 +605,24 @@ __global__ void qmv_kernel(
     int k_start = g * GROUP_SIZE;
     int k_end = min(k_start + GROUP_SIZE, K);
 
-    for (int k = k_start; k < k_end; ++k) {
-      uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
-      float w_val = dequantize_value<BITS, AFFINE>(quant_val, scale, bias);
+    if constexpr (!AFFINE && BITS == 8) {
+      float qx_acc = 0.0f;
+      for (int k = k_start; k < k_end; ++k) {
+        uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+        qx_acc = fmaf(
+            static_cast<float>(x[row * K + k]),
+            fp8_e4m3_to_float(quant_val),
+            qx_acc);
+      }
+      acc = fmaf(scale, qx_acc, acc);
+    } else {
+      for (int k = k_start; k < k_end; ++k) {
+        uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+        float w_val = dequantize_value<BITS, AFFINE>(quant_val, scale, bias);
 
-      // Accumulate
-      acc += static_cast<float>(x[row * K + k]) * w_val;
+        // Accumulate
+        acc += static_cast<float>(x[row * K + k]) * w_val;
+      }
     }
   }
 
@@ -587,12 +665,24 @@ __global__ void qmv_t_kernel(
     int k_start = g * GROUP_SIZE;
     int k_end = min(k_start + GROUP_SIZE, K);
 
-    for (int k = k_start; k < k_end; ++k) {
-      uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
-      float w_val = dequantize_value<BITS, AFFINE>(quant_val, scale, bias);
+    if constexpr (!AFFINE && BITS == 8) {
+      float qx_acc = 0.0f;
+      for (int k = k_start; k < k_end; ++k) {
+        uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+        qx_acc = fmaf(
+            static_cast<float>(x[row * K + k]),
+            fp8_e4m3_to_float(quant_val),
+            qx_acc);
+      }
+      acc = fmaf(scale, qx_acc, acc);
+    } else {
+      for (int k = k_start; k < k_end; ++k) {
+        uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+        float w_val = dequantize_value<BITS, AFFINE>(quant_val, scale, bias);
 
-      // Accumulate
-      acc += static_cast<float>(x[row * K + k]) * w_val;
+        // Accumulate
+        acc += static_cast<float>(x[row * K + k]) * w_val;
+      }
     }
   }
 
@@ -956,12 +1046,22 @@ __global__ void gather_qmv_kernel(
     int k_start = g * GROUP_SIZE;
     int k_end = min(k_start + GROUP_SIZE, K);
 
-    for (int k = k_start; k < k_end; ++k) {
-      uint8_t quant_val = unpack_packed_value_fast<BITS>(w_ptr, k, row_bytes);
-      float w_val = dequantize_value<BITS, AFFINE>(quant_val, scale, bias);
+    if constexpr (!AFFINE && BITS == 8) {
+      float qx_acc = 0.0f;
+      for (int k = k_start; k < k_end; ++k) {
+        uint8_t quant_val = unpack_packed_value_fast<BITS>(w_ptr, k, row_bytes);
+        qx_acc =
+            fmaf(static_cast<float>(x_ptr[k]), fp8_e4m3_to_float(quant_val), qx_acc);
+      }
+      acc = fmaf(scale, qx_acc, acc);
+    } else {
+      for (int k = k_start; k < k_end; ++k) {
+        uint8_t quant_val = unpack_packed_value_fast<BITS>(w_ptr, k, row_bytes);
+        float w_val = dequantize_value<BITS, AFFINE>(quant_val, scale, bias);
 
-      // Accumulate
-      acc += static_cast<float>(x_ptr[k]) * w_val;
+        // Accumulate
+        acc += static_cast<float>(x_ptr[k]) * w_val;
+      }
     }
   }
 
@@ -1109,24 +1209,47 @@ __global__ void gather_qmv_warp_kernel(
         }
         acc += group_acc;
       } else {
-        if (full_group) {
+        if constexpr (BITS == 8) {
+          float qx_acc = 0.0f;
+          if (full_group) {
 #pragma unroll
-          for (int k_local = lane; k_local < GROUP_SIZE; k_local += kWarpSize) {
-            int k = k_start + k_local;
-            uint8_t quant_val =
-                unpack_packed_value_fast<BITS>(w_ptr, k, row_bytes);
-            float w_val =
-                dequantize_value<BITS, AFFINE>(quant_val, scale, bias);
-            acc = fmaf(x_group_shared[k_local], w_val, acc);
+            for (int k_local = lane; k_local < GROUP_SIZE; k_local += kWarpSize) {
+              int k = k_start + k_local;
+              uint8_t quant_val =
+                  unpack_packed_value_fast<BITS>(w_ptr, k, row_bytes);
+              qx_acc = fmaf(
+                  x_group_shared[k_local], fp8_e4m3_to_float(quant_val), qx_acc);
+            }
+          } else {
+            for (int k_local = lane; k_local < group_len; k_local += kWarpSize) {
+              int k = k_start + k_local;
+              uint8_t quant_val =
+                  unpack_packed_value_fast<BITS>(w_ptr, k, row_bytes);
+              qx_acc = fmaf(
+                  x_group_shared[k_local], fp8_e4m3_to_float(quant_val), qx_acc);
+            }
           }
+          acc = fmaf(scale, qx_acc, acc);
         } else {
-          for (int k_local = lane; k_local < group_len; k_local += kWarpSize) {
-            int k = k_start + k_local;
-            uint8_t quant_val =
-                unpack_packed_value_fast<BITS>(w_ptr, k, row_bytes);
-            float w_val =
-                dequantize_value<BITS, AFFINE>(quant_val, scale, bias);
-            acc = fmaf(x_group_shared[k_local], w_val, acc);
+          if (full_group) {
+#pragma unroll
+            for (int k_local = lane; k_local < GROUP_SIZE; k_local += kWarpSize) {
+              int k = k_start + k_local;
+              uint8_t quant_val =
+                  unpack_packed_value_fast<BITS>(w_ptr, k, row_bytes);
+              float w_val =
+                  dequantize_value<BITS, AFFINE>(quant_val, scale, bias);
+              acc = fmaf(x_group_shared[k_local], w_val, acc);
+            }
+          } else {
+            for (int k_local = lane; k_local < group_len; k_local += kWarpSize) {
+              int k = k_start + k_local;
+              uint8_t quant_val =
+                  unpack_packed_value_fast<BITS>(w_ptr, k, row_bytes);
+              float w_val =
+                  dequantize_value<BITS, AFFINE>(quant_val, scale, bias);
+              acc = fmaf(x_group_shared[k_local], w_val, acc);
+            }
           }
         }
       }
