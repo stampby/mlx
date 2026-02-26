@@ -63,18 +63,103 @@ __device__ inline uint8_t unpack_packed_value(
   }
 }
 
+__device__ inline float fp4_e2m1_to_float(uint8_t val) {
+  switch (val & 0xF) {
+    case 0x0:
+      return 0.0f;
+    case 0x1:
+      return 0.5f;
+    case 0x2:
+      return 1.0f;
+    case 0x3:
+      return 1.5f;
+    case 0x4:
+      return 2.0f;
+    case 0x5:
+      return 3.0f;
+    case 0x6:
+      return 4.0f;
+    case 0x7:
+      return 6.0f;
+    case 0x8:
+      return -0.0f;
+    case 0x9:
+      return -0.5f;
+    case 0xA:
+      return -1.0f;
+    case 0xB:
+      return -1.5f;
+    case 0xC:
+      return -2.0f;
+    case 0xD:
+      return -3.0f;
+    case 0xE:
+      return -4.0f;
+    case 0xF:
+      return -6.0f;
+    default:
+      return 0.0f;
+  }
+}
+
+__device__ inline float fp8_e4m3_to_float(uint8_t val) {
+  uint32_t sign = (val >> 7) & 0x1;
+  uint32_t exp = (val >> 3) & 0xF;
+  uint32_t mant = val & 0x7;
+
+  float result;
+  if (exp == 0) {
+    if (mant == 0) {
+      result = 0.0f;
+    } else {
+      result = ldexpf(static_cast<float>(mant), -9);
+    }
+  } else if (exp == 15 && mant == 7) {
+    result = __uint_as_float(0x7FC00000);
+  } else {
+    uint32_t float_exp = exp - 7 + 127;
+    uint32_t float_mant = mant << 20;
+    uint32_t bits = (sign << 31) | (float_exp << 23) | float_mant;
+    result = __uint_as_float(bits);
+  }
+
+  return sign ? -fabsf(result) : result;
+}
+
+template <int GROUP_SIZE>
+__device__ inline float fp_scale_to_float(uint8_t s) {
+  if constexpr (GROUP_SIZE == 16) {
+    return fp8_e4m3_to_float(s);
+  } else {
+    union {
+      uint16_t i;
+      hip_bfloat16 f;
+    } out;
+    out.i = (s == 0 ? 0x40 : (static_cast<uint16_t>(s) << 7));
+    return static_cast<float>(out.f);
+  }
+}
+
+template <typename ScaleT, int GROUP_SIZE, bool AFFINE>
+__device__ inline float load_scale_value(ScaleT raw) {
+  if constexpr (AFFINE) {
+    return static_cast<float>(raw);
+  } else {
+    return fp_scale_to_float<GROUP_SIZE>(static_cast<uint8_t>(raw));
+  }
+}
+
 template <int BITS, bool AFFINE>
 __device__ inline float dequantize_value(uint8_t quant_val, float scale, float bias) {
   if constexpr (AFFINE) {
     return static_cast<float>(quant_val) * scale + bias;
   } else {
-    constexpr uint8_t mask = (1u << BITS) - 1u;
-    constexpr uint8_t sign_bit = 1u << (BITS - 1);
-    int8_t signed_val = static_cast<int8_t>(quant_val);
-    if (quant_val & sign_bit) {
-      signed_val = static_cast<int8_t>(quant_val | ~mask);
+    (void)bias;
+    if constexpr (BITS == 8) {
+      return fp8_e4m3_to_float(quant_val) * scale;
+    } else {
+      return fp4_e2m1_to_float(quant_val) * scale;
     }
-    return static_cast<float>(signed_val) * scale + bias;
   }
 }
 
@@ -106,7 +191,8 @@ __global__ void qmv_kernel(
   const uint8_t* w_row = w + col * row_bytes;
 
   for (int g = 0; g < num_groups; ++g) {
-    float scale = static_cast<float>(scales[col * num_groups + g]);
+    float scale = load_scale_value<ScaleT, GROUP_SIZE, AFFINE>(
+        scales[col * num_groups + g]);
     float bias = has_bias ? static_cast<float>(biases[col * num_groups + g]) : 0.0f;
     
     int k_start = g * GROUP_SIZE;
@@ -151,7 +237,8 @@ __global__ void qmv_t_kernel(
   const uint8_t* w_row = w + col * row_bytes;
 
   for (int g = 0; g < num_groups; ++g) {
-    float scale = static_cast<float>(scales[col * num_groups + g]);
+    float scale = load_scale_value<ScaleT, GROUP_SIZE, AFFINE>(
+        scales[col * num_groups + g]);
     float bias = has_bias ? static_cast<float>(biases[col * num_groups + g]) : 0.0f;
     
     int k_start = g * GROUP_SIZE;
@@ -254,13 +341,14 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     
     #define DISPATCH_GROUP_SIZE(T, ScaleT, BITS) \
       switch (group_size_) { \
+        case 16: LAUNCH_QMV(T, ScaleT, BITS, 16); break; \
         case 32: LAUNCH_QMV(T, ScaleT, BITS, 32); break; \
         case 64: LAUNCH_QMV(T, ScaleT, BITS, 64); break; \
         case 128: LAUNCH_QMV(T, ScaleT, BITS, 128); break; \
         default: throw std::runtime_error("Unsupported group_size for QuantizedMatmul: " + std::to_string(group_size_)); \
       }
     
-    #define DISPATCH_BITS(T, ScaleT) \
+    #define DISPATCH_BITS_AFFINE(T, ScaleT) \
       switch (bits_) { \
         case 2: DISPATCH_GROUP_SIZE(T, ScaleT, 2); break; \
         case 3: DISPATCH_GROUP_SIZE(T, ScaleT, 3); break; \
@@ -270,22 +358,42 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
         case 8: DISPATCH_GROUP_SIZE(T, ScaleT, 8); break; \
         default: throw std::runtime_error("Unsupported bits for QuantizedMatmul: " + std::to_string(bits_)); \
       }
-    
+
+    #define DISPATCH_BITS_FP(T) \
+      switch (bits_) { \
+        case 4: DISPATCH_GROUP_SIZE(T, uint8_t, 4); break; \
+        case 8: DISPATCH_GROUP_SIZE(T, uint8_t, 8); break; \
+        default: throw std::runtime_error("Unsupported fp bits for QuantizedMatmul: " + std::to_string(bits_)); \
+      }
+
     switch (x.dtype()) {
       case float32:
-        DISPATCH_BITS(float, float);
+        if (mode_ == QuantizationMode::Affine) {
+          DISPATCH_BITS_AFFINE(float, float);
+        } else {
+          DISPATCH_BITS_FP(float);
+        }
         break;
       case float16:
-        DISPATCH_BITS(__half, __half);
+        if (mode_ == QuantizationMode::Affine) {
+          DISPATCH_BITS_AFFINE(__half, __half);
+        } else {
+          DISPATCH_BITS_FP(__half);
+        }
         break;
       case bfloat16:
-        DISPATCH_BITS(hip_bfloat16, hip_bfloat16);
+        if (mode_ == QuantizationMode::Affine) {
+          DISPATCH_BITS_AFFINE(hip_bfloat16, hip_bfloat16);
+        } else {
+          DISPATCH_BITS_FP(hip_bfloat16);
+        }
         break;
       default:
         throw std::runtime_error("Unsupported dtype for QuantizedMatmul");
     }
     
-    #undef DISPATCH_BITS
+    #undef DISPATCH_BITS_FP
+    #undef DISPATCH_BITS_AFFINE
     #undef DISPATCH_GROUP_SIZE
     #undef LAUNCH_QMV
   });
@@ -351,7 +459,7 @@ __global__ void gather_qmv_kernel(
   float acc = 0.0f;
   
   for (int g = 0; g < num_groups; ++g) {
-    float scale = static_cast<float>(scales_ptr[g]);
+    float scale = load_scale_value<ScaleT, GROUP_SIZE, AFFINE>(scales_ptr[g]);
     float bias = has_bias ? static_cast<float>(biases_ptr[g]) : 0.0f;
     
     int k_start = g * GROUP_SIZE;
@@ -459,13 +567,14 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     
     #define DISPATCH_GROUP_SIZE_GATHER(T, ScaleT, BITS) \
       switch (group_size_) { \
+        case 16: LAUNCH_GATHER_QMV(T, ScaleT, BITS, 16); break; \
         case 32: LAUNCH_GATHER_QMV(T, ScaleT, BITS, 32); break; \
         case 64: LAUNCH_GATHER_QMV(T, ScaleT, BITS, 64); break; \
         case 128: LAUNCH_GATHER_QMV(T, ScaleT, BITS, 128); break; \
         default: throw std::runtime_error("Unsupported group_size for GatherQMM: " + std::to_string(group_size_)); \
       }
     
-    #define DISPATCH_BITS_GATHER(T, ScaleT) \
+    #define DISPATCH_BITS_GATHER_AFFINE(T, ScaleT) \
       switch (bits_) { \
         case 2: DISPATCH_GROUP_SIZE_GATHER(T, ScaleT, 2); break; \
         case 3: DISPATCH_GROUP_SIZE_GATHER(T, ScaleT, 3); break; \
@@ -475,22 +584,42 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         case 8: DISPATCH_GROUP_SIZE_GATHER(T, ScaleT, 8); break; \
         default: throw std::runtime_error("Unsupported bits for GatherQMM: " + std::to_string(bits_)); \
       }
+
+    #define DISPATCH_BITS_GATHER_FP(T) \
+      switch (bits_) { \
+        case 4: DISPATCH_GROUP_SIZE_GATHER(T, uint8_t, 4); break; \
+        case 8: DISPATCH_GROUP_SIZE_GATHER(T, uint8_t, 8); break; \
+        default: throw std::runtime_error("Unsupported fp bits for GatherQMM: " + std::to_string(bits_)); \
+      }
     
     switch (x.dtype()) {
       case float32:
-        DISPATCH_BITS_GATHER(float, float);
+        if (mode_ == QuantizationMode::Affine) {
+          DISPATCH_BITS_GATHER_AFFINE(float, float);
+        } else {
+          DISPATCH_BITS_GATHER_FP(float);
+        }
         break;
       case float16:
-        DISPATCH_BITS_GATHER(__half, __half);
+        if (mode_ == QuantizationMode::Affine) {
+          DISPATCH_BITS_GATHER_AFFINE(__half, __half);
+        } else {
+          DISPATCH_BITS_GATHER_FP(__half);
+        }
         break;
       case bfloat16:
-        DISPATCH_BITS_GATHER(hip_bfloat16, hip_bfloat16);
+        if (mode_ == QuantizationMode::Affine) {
+          DISPATCH_BITS_GATHER_AFFINE(hip_bfloat16, hip_bfloat16);
+        } else {
+          DISPATCH_BITS_GATHER_FP(hip_bfloat16);
+        }
         break;
       default:
         throw std::runtime_error("Unsupported dtype for GatherQMM");
     }
     
-    #undef DISPATCH_BITS_GATHER
+    #undef DISPATCH_BITS_GATHER_FP
+    #undef DISPATCH_BITS_GATHER_AFFINE
     #undef DISPATCH_GROUP_SIZE_GATHER
     #undef LAUNCH_GATHER_QMV
   });
