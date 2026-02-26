@@ -63,6 +63,15 @@ __device__ inline uint8_t unpack_packed_value(
   }
 }
 
+template <typename T>
+__device__ __forceinline__ T warp_reduce_sum_qmm(T val) {
+#pragma unroll
+  for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+    val += __shfl_down(val, offset);
+  }
+  return val;
+}
+
 __device__ inline float fp4_e2m1_to_float(uint8_t val) {
   switch (val & 0xF) {
     case 0x0:
@@ -163,6 +172,56 @@ __device__ inline float dequantize_value(uint8_t quant_val, float scale, float b
   }
 }
 
+template <typename T, typename ScaleT, int BITS, int GROUP_SIZE, bool AFFINE>
+__global__ void qmv_warp_kernel(
+    const T* __restrict__ x,
+    const uint8_t* __restrict__ w,
+    const ScaleT* __restrict__ scales,
+    const ScaleT* __restrict__ biases,
+    T* __restrict__ out,
+    int M,
+    int N,
+    int K,
+    bool has_bias) {
+  const int lane = threadIdx.x;
+  const int col = blockIdx.x * blockDim.y + threadIdx.y;
+  const int row = blockIdx.y;
+
+  if (row >= M || col >= N) {
+    return;
+  }
+
+  constexpr int kWarpSize = WARP_SIZE;
+  const int num_groups = (K + GROUP_SIZE - 1) / GROUP_SIZE;
+  const int row_bytes = (K * BITS + 7) / 8;
+
+  const T* x_row = x + row * K;
+  const uint8_t* w_row = w + col * row_bytes;
+  const ScaleT* scales_row = scales + col * num_groups;
+  const ScaleT* biases_row = has_bias ? biases + col * num_groups : nullptr;
+
+  float acc = 0.0f;
+
+  for (int g = 0; g < num_groups; ++g) {
+    float scale =
+        load_scale_value<ScaleT, GROUP_SIZE, AFFINE>(scales_row[g]);
+    float bias = has_bias ? static_cast<float>(biases_row[g]) : 0.0f;
+
+    int k_start = g * GROUP_SIZE;
+    int k_end = min(k_start + GROUP_SIZE, K);
+    for (int k = k_start + lane; k < k_end; k += kWarpSize) {
+      uint8_t quant_val = unpack_packed_value<BITS>(w_row, k, row_bytes);
+      float w_val = dequantize_value<BITS, AFFINE>(quant_val, scale, bias);
+      acc += static_cast<float>(x_row[k]) * w_val;
+    }
+  }
+
+  acc = warp_reduce_sum_qmm(acc);
+  if (lane == 0) {
+    out[row * N + col] = static_cast<T>(acc);
+  }
+}
+
 // Quantized matrix-vector multiply kernel
 // Performs: out = x @ dequantize(w, scales, biases)
 // where w is quantized weights, scales and biases are per-group parameters
@@ -187,7 +246,7 @@ __global__ void qmv_kernel(
   
   int num_groups = (K + GROUP_SIZE - 1) / GROUP_SIZE;
   
-  const int row_bytes = (K * BITS) / 8;
+  const int row_bytes = (K * BITS + 7) / 8;
   const uint8_t* w_row = w + col * row_bytes;
 
   for (int g = 0; g < num_groups; ++g) {
@@ -233,7 +292,7 @@ __global__ void qmv_t_kernel(
   
   int num_groups = (K + GROUP_SIZE - 1) / GROUP_SIZE;
   
-  const int row_bytes = (K * BITS) / 8;
+  const int row_bytes = (K * BITS + 7) / 8;
   const uint8_t* w_row = w + col * row_bytes;
 
   for (int g = 0; g < num_groups; ++g) {
@@ -289,9 +348,15 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   int M = non_batched ? x.size() / K : x.shape(-2);
   int N = out.shape(-1);
 
+  bool use_fast_qmv = transpose_ && non_batched;
+
   int block_size = 256;
   dim3 grid((M + 0) / 1, (N + block_size - 1) / block_size);
   grid.x = M;
+
+  int cols_per_block = 8;
+  dim3 fast_block(WARP_SIZE, cols_per_block);
+  dim3 fast_grid((N + cols_per_block - 1) / cols_per_block, M);
 
   const void* x_ptr = gpu_ptr<void>(x);
   const uint8_t* w_ptr = gpu_ptr<const uint8_t>(w);
@@ -302,7 +367,15 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   enc.launch_kernel([&, x_ptr, w_ptr, scales_ptr, biases_ptr, out_ptr](hipStream_t stream) {
     #define LAUNCH_QMV(T, ScaleT, BITS, GROUP_SIZE) \
       if (mode_ == QuantizationMode::Affine) { \
-        if (transpose_) { \
+        if (use_fast_qmv) { \
+          hipLaunchKernelGGL( \
+              (rocm::qmv_warp_kernel<T, ScaleT, BITS, GROUP_SIZE, true>), \
+              fast_grid, fast_block, 0, stream, \
+              static_cast<const T*>(x_ptr), w_ptr, \
+              static_cast<const ScaleT*>(scales_ptr), \
+              has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr, \
+              static_cast<T*>(out_ptr), M, N, K, has_bias); \
+        } else if (transpose_) { \
           hipLaunchKernelGGL( \
               (rocm::qmv_t_kernel<T, ScaleT, BITS, GROUP_SIZE, true>), \
               grid, dim3(block_size), 0, stream, \
@@ -320,7 +393,15 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
               static_cast<T*>(out_ptr), M, N, K, has_bias); \
         } \
       } else { \
-        if (transpose_) { \
+        if (use_fast_qmv) { \
+          hipLaunchKernelGGL( \
+              (rocm::qmv_warp_kernel<T, ScaleT, BITS, GROUP_SIZE, false>), \
+              fast_grid, fast_block, 0, stream, \
+              static_cast<const T*>(x_ptr), w_ptr, \
+              static_cast<const ScaleT*>(scales_ptr), \
+              has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr, \
+              static_cast<T*>(out_ptr), M, N, K, has_bias); \
+        } else if (transpose_) { \
           hipLaunchKernelGGL( \
               (rocm::qmv_t_kernel<T, ScaleT, BITS, GROUP_SIZE, false>), \
               grid, dim3(block_size), 0, stream, \
@@ -448,7 +529,7 @@ __global__ void gather_qmv_kernel(
   uint32_t rhs_idx = rhs_indices[rhs_idx_loc];
   
   int num_groups = (K + GROUP_SIZE - 1) / GROUP_SIZE;
-  int row_bytes = (K * BITS) / 8;
+  int row_bytes = (K * BITS + 7) / 8;
 
   const T* x_ptr = x + lhs_idx * M * K + row * K;
   const uint8_t* w_ptr = w + rhs_idx * N * row_bytes + col * row_bytes;
