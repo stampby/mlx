@@ -1,14 +1,14 @@
 // Copyright © 2025 Apple Inc.
 
-#include "mlx/backend/rocm/quantized/quantized.h"
+#include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/rocm/device.h"
 #include "mlx/backend/rocm/kernel_utils.hpp"
-#include "mlx/backend/gpu/copy.h"
+#include "mlx/backend/rocm/quantized/quantized.h"
 #include "mlx/primitives.h"
 
-#include <hip/hip_runtime.h>
-#include <hip/hip_fp16.h>
 #include <hip/hip_bfloat16.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
 #include <rocblas/rocblas.h>
 
 namespace mlx::core {
@@ -40,10 +40,8 @@ inline array ensure_row_contiguous_matrix(
 namespace rocm {
 
 template <int BITS>
-__device__ inline uint8_t unpack_packed_value(
-    const uint8_t* packed_row,
-    int k,
-    int row_bytes) {
+__device__ inline uint8_t
+unpack_packed_value(const uint8_t* packed_row, int k, int row_bytes) {
   constexpr uint8_t mask = (1u << BITS) - 1u;
   if constexpr (BITS == 2 || BITS == 4 || BITS == 8) {
     constexpr int pack_factor = 8 / BITS;
@@ -60,6 +58,25 @@ __device__ inline uint8_t unpack_packed_value(
       window |= static_cast<uint32_t>(packed_row[byte_idx + 1]) << 8;
     }
     return static_cast<uint8_t>((window >> bit_offset) & mask);
+  }
+}
+
+template <int BITS>
+__device__ inline uint8_t
+unpack_packed_value_fast(const uint8_t* packed_row, int k, int row_bytes) {
+  if constexpr (BITS == 8) {
+    (void)row_bytes;
+    return packed_row[k];
+  } else if constexpr (BITS == 4) {
+    (void)row_bytes;
+    uint8_t packed = packed_row[k >> 1];
+    return (k & 1) ? (packed >> 4) : (packed & 0xF);
+  } else if constexpr (BITS == 2) {
+    (void)row_bytes;
+    uint8_t packed = packed_row[k >> 2];
+    return (packed >> ((k & 0x3) * 2)) & 0x3;
+  } else {
+    return unpack_packed_value<BITS>(packed_row, k, row_bytes);
   }
 }
 
@@ -159,7 +176,8 @@ __device__ inline float load_scale_value(ScaleT raw) {
 }
 
 template <int BITS, bool AFFINE>
-__device__ inline float dequantize_value(uint8_t quant_val, float scale, float bias) {
+__device__ inline float
+dequantize_value(uint8_t quant_val, float scale, float bias) {
   if constexpr (AFFINE) {
     return static_cast<float>(quant_val) * scale + bias;
   } else {
@@ -201,19 +219,62 @@ __global__ void qmv_warp_kernel(
   const ScaleT* biases_row = has_bias ? biases + col * num_groups : nullptr;
 
   float acc = 0.0f;
+  __shared__ float x_group_shared[GROUP_SIZE];
+  __shared__ float x_group_sum_shared;
+  const int block_threads = blockDim.x * blockDim.y;
+  const int linear_tid = threadIdx.y * blockDim.x + lane;
 
   for (int g = 0; g < num_groups; ++g) {
-    float scale =
-        load_scale_value<ScaleT, GROUP_SIZE, AFFINE>(scales_row[g]);
+    int k_start = g * GROUP_SIZE;
+    int group_len = min(GROUP_SIZE, K - k_start);
+
+    for (int i = linear_tid; i < group_len; i += block_threads) {
+      x_group_shared[i] = static_cast<float>(x_row[k_start + i]);
+    }
+    __syncthreads();
+
+    if constexpr (AFFINE) {
+      if (has_bias && threadIdx.y == 0) {
+        float x_group_sum = 0.0f;
+        for (int i = lane; i < group_len; i += kWarpSize) {
+          x_group_sum += x_group_shared[i];
+        }
+        x_group_sum = warp_reduce_sum_qmm(x_group_sum);
+        if (lane == 0) {
+          x_group_sum_shared = x_group_sum;
+        }
+      }
+      if (has_bias) {
+        __syncthreads();
+      }
+    }
+
+    float scale = load_scale_value<ScaleT, GROUP_SIZE, AFFINE>(scales_row[g]);
     float bias = has_bias ? static_cast<float>(biases_row[g]) : 0.0f;
 
-    int k_start = g * GROUP_SIZE;
-    int k_end = min(k_start + GROUP_SIZE, K);
-    for (int k = k_start + lane; k < k_end; k += kWarpSize) {
-      uint8_t quant_val = unpack_packed_value<BITS>(w_row, k, row_bytes);
-      float w_val = dequantize_value<BITS, AFFINE>(quant_val, scale, bias);
-      acc += static_cast<float>(x_row[k]) * w_val;
+    if constexpr (AFFINE) {
+      float qx_acc = 0.0f;
+      for (int k_local = lane; k_local < group_len; k_local += kWarpSize) {
+        int k = k_start + k_local;
+        uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+        qx_acc = fmaf(
+            x_group_shared[k_local], static_cast<float>(quant_val), qx_acc);
+      }
+      float group_acc = scale * qx_acc;
+      if (has_bias) {
+        group_acc = fmaf(bias, x_group_sum_shared, group_acc);
+      }
+      acc += group_acc;
+    } else {
+      for (int k_local = lane; k_local < group_len; k_local += kWarpSize) {
+        int k = k_start + k_local;
+        uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+        float w_val = dequantize_value<BITS, AFFINE>(quant_val, scale, bias);
+        acc = fmaf(x_group_shared[k_local], w_val, acc);
+      }
     }
+
+    __syncthreads();
   }
 
   acc = warp_reduce_sum_qmm(acc);
@@ -227,45 +288,47 @@ __global__ void qmv_warp_kernel(
 // where w is quantized weights, scales and biases are per-group parameters
 template <typename T, typename ScaleT, int BITS, int GROUP_SIZE, bool AFFINE>
 __global__ void qmv_kernel(
-    const T* __restrict__ x,           // [M, K]
-    const uint8_t* __restrict__ w,     // [N, K * BITS / 8] packed
+    const T* __restrict__ x, // [M, K]
+    const uint8_t* __restrict__ w, // [N, K * BITS / 8] packed
     const ScaleT* __restrict__ scales, // [N, K/GROUP_SIZE]
     const ScaleT* __restrict__ biases, // [N, K/GROUP_SIZE] or nullptr
-    T* __restrict__ out,               // [M, N]
+    T* __restrict__ out, // [M, N]
     int M,
     int N,
     int K,
     bool has_bias) {
-  
-  const int row = blockIdx.x;  // output row (M dimension)
-  const int col = blockIdx.y * blockDim.x + threadIdx.x;  // output col (N dimension)
-  
-  if (row >= M || col >= N) return;
-  
+  const int row = blockIdx.x; // output row (M dimension)
+  const int col =
+      blockIdx.y * blockDim.x + threadIdx.x; // output col (N dimension)
+
+  if (row >= M || col >= N)
+    return;
+
   float acc = 0.0f;
-  
+
   int num_groups = (K + GROUP_SIZE - 1) / GROUP_SIZE;
-  
+
   const int row_bytes = (K * BITS + 7) / 8;
   const uint8_t* w_row = w + col * row_bytes;
 
   for (int g = 0; g < num_groups; ++g) {
     float scale = load_scale_value<ScaleT, GROUP_SIZE, AFFINE>(
         scales[col * num_groups + g]);
-    float bias = has_bias ? static_cast<float>(biases[col * num_groups + g]) : 0.0f;
-    
+    float bias =
+        has_bias ? static_cast<float>(biases[col * num_groups + g]) : 0.0f;
+
     int k_start = g * GROUP_SIZE;
     int k_end = min(k_start + GROUP_SIZE, K);
-    
+
     for (int k = k_start; k < k_end; ++k) {
-      uint8_t quant_val = unpack_packed_value<BITS>(w_row, k, row_bytes);
+      uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
       float w_val = dequantize_value<BITS, AFFINE>(quant_val, scale, bias);
-      
+
       // Accumulate
       acc += static_cast<float>(x[row * K + k]) * w_val;
     }
   }
-  
+
   out[row * N + col] = static_cast<T>(acc);
 }
 
@@ -273,45 +336,47 @@ __global__ void qmv_kernel(
 // Performs: out = x @ dequantize(w, scales, biases).T
 template <typename T, typename ScaleT, int BITS, int GROUP_SIZE, bool AFFINE>
 __global__ void qmv_t_kernel(
-    const T* __restrict__ x,           // [M, K]
-    const uint8_t* __restrict__ w,     // [N, K * BITS / 8] packed
+    const T* __restrict__ x, // [M, K]
+    const uint8_t* __restrict__ w, // [N, K * BITS / 8] packed
     const ScaleT* __restrict__ scales, // [N, K/GROUP_SIZE]
     const ScaleT* __restrict__ biases, // [N, K/GROUP_SIZE] or nullptr
-    T* __restrict__ out,               // [M, N]
+    T* __restrict__ out, // [M, N]
     int M,
     int N,
     int K,
     bool has_bias) {
-  
-  const int row = blockIdx.x;  // output row (M dimension)
-  const int col = blockIdx.y * blockDim.x + threadIdx.x;  // output col (N dimension)
-  
-  if (row >= M || col >= N) return;
-  
+  const int row = blockIdx.x; // output row (M dimension)
+  const int col =
+      blockIdx.y * blockDim.x + threadIdx.x; // output col (N dimension)
+
+  if (row >= M || col >= N)
+    return;
+
   float acc = 0.0f;
-  
+
   int num_groups = (K + GROUP_SIZE - 1) / GROUP_SIZE;
-  
+
   const int row_bytes = (K * BITS + 7) / 8;
   const uint8_t* w_row = w + col * row_bytes;
 
   for (int g = 0; g < num_groups; ++g) {
     float scale = load_scale_value<ScaleT, GROUP_SIZE, AFFINE>(
         scales[col * num_groups + g]);
-    float bias = has_bias ? static_cast<float>(biases[col * num_groups + g]) : 0.0f;
-    
+    float bias =
+        has_bias ? static_cast<float>(biases[col * num_groups + g]) : 0.0f;
+
     int k_start = g * GROUP_SIZE;
     int k_end = min(k_start + GROUP_SIZE, K);
-    
+
     for (int k = k_start; k < k_end; ++k) {
-      uint8_t quant_val = unpack_packed_value<BITS>(w_row, k, row_bytes);
+      uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
       float w_val = dequantize_value<BITS, AFFINE>(quant_val, scale, bias);
-      
+
       // Accumulate
       acc += static_cast<float>(x[row * K + k]) * w_val;
     }
   }
-  
+
   out[row * N + col] = static_cast<T>(acc);
 }
 
@@ -363,121 +428,201 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   const void* scales_ptr = gpu_ptr<void>(scales);
   const void* biases_ptr = has_bias ? gpu_ptr<void>(*biases) : nullptr;
   void* out_ptr = gpu_ptr<void>(out);
-  
-  enc.launch_kernel([&, x_ptr, w_ptr, scales_ptr, biases_ptr, out_ptr](hipStream_t stream) {
-    #define LAUNCH_QMV(T, ScaleT, BITS, GROUP_SIZE) \
-      if (mode_ == QuantizationMode::Affine) { \
-        if (use_fast_qmv) { \
-          hipLaunchKernelGGL( \
-              (rocm::qmv_warp_kernel<T, ScaleT, BITS, GROUP_SIZE, true>), \
-              fast_grid, fast_block, 0, stream, \
-              static_cast<const T*>(x_ptr), w_ptr, \
-              static_cast<const ScaleT*>(scales_ptr), \
-              has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr, \
-              static_cast<T*>(out_ptr), M, N, K, has_bias); \
-        } else if (transpose_) { \
-          hipLaunchKernelGGL( \
-              (rocm::qmv_t_kernel<T, ScaleT, BITS, GROUP_SIZE, true>), \
-              grid, dim3(block_size), 0, stream, \
-              static_cast<const T*>(x_ptr), w_ptr, \
-              static_cast<const ScaleT*>(scales_ptr), \
-              has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr, \
-              static_cast<T*>(out_ptr), M, N, K, has_bias); \
-        } else { \
-          hipLaunchKernelGGL( \
-              (rocm::qmv_kernel<T, ScaleT, BITS, GROUP_SIZE, true>), \
-              grid, dim3(block_size), 0, stream, \
-              static_cast<const T*>(x_ptr), w_ptr, \
-              static_cast<const ScaleT*>(scales_ptr), \
-              has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr, \
-              static_cast<T*>(out_ptr), M, N, K, has_bias); \
-        } \
-      } else { \
-        if (use_fast_qmv) { \
-          hipLaunchKernelGGL( \
-              (rocm::qmv_warp_kernel<T, ScaleT, BITS, GROUP_SIZE, false>), \
-              fast_grid, fast_block, 0, stream, \
-              static_cast<const T*>(x_ptr), w_ptr, \
-              static_cast<const ScaleT*>(scales_ptr), \
-              has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr, \
-              static_cast<T*>(out_ptr), M, N, K, has_bias); \
-        } else if (transpose_) { \
-          hipLaunchKernelGGL( \
-              (rocm::qmv_t_kernel<T, ScaleT, BITS, GROUP_SIZE, false>), \
-              grid, dim3(block_size), 0, stream, \
-              static_cast<const T*>(x_ptr), w_ptr, \
-              static_cast<const ScaleT*>(scales_ptr), \
-              has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr, \
-              static_cast<T*>(out_ptr), M, N, K, has_bias); \
-        } else { \
-          hipLaunchKernelGGL( \
-              (rocm::qmv_kernel<T, ScaleT, BITS, GROUP_SIZE, false>), \
-              grid, dim3(block_size), 0, stream, \
-              static_cast<const T*>(x_ptr), w_ptr, \
-              static_cast<const ScaleT*>(scales_ptr), \
-              has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr, \
-              static_cast<T*>(out_ptr), M, N, K, has_bias); \
-        } \
-      }
-    
-    #define DISPATCH_GROUP_SIZE(T, ScaleT, BITS) \
-      switch (group_size_) { \
-        case 16: LAUNCH_QMV(T, ScaleT, BITS, 16); break; \
-        case 32: LAUNCH_QMV(T, ScaleT, BITS, 32); break; \
-        case 64: LAUNCH_QMV(T, ScaleT, BITS, 64); break; \
-        case 128: LAUNCH_QMV(T, ScaleT, BITS, 128); break; \
-        default: throw std::runtime_error("Unsupported group_size for QuantizedMatmul: " + std::to_string(group_size_)); \
-      }
-    
-    #define DISPATCH_BITS_AFFINE(T, ScaleT) \
-      switch (bits_) { \
-        case 2: DISPATCH_GROUP_SIZE(T, ScaleT, 2); break; \
-        case 3: DISPATCH_GROUP_SIZE(T, ScaleT, 3); break; \
-        case 4: DISPATCH_GROUP_SIZE(T, ScaleT, 4); break; \
-        case 5: DISPATCH_GROUP_SIZE(T, ScaleT, 5); break; \
-        case 6: DISPATCH_GROUP_SIZE(T, ScaleT, 6); break; \
-        case 8: DISPATCH_GROUP_SIZE(T, ScaleT, 8); break; \
-        default: throw std::runtime_error("Unsupported bits for QuantizedMatmul: " + std::to_string(bits_)); \
-      }
 
-    #define DISPATCH_BITS_FP(T) \
-      switch (bits_) { \
-        case 4: DISPATCH_GROUP_SIZE(T, uint8_t, 4); break; \
-        case 8: DISPATCH_GROUP_SIZE(T, uint8_t, 8); break; \
-        default: throw std::runtime_error("Unsupported fp bits for QuantizedMatmul: " + std::to_string(bits_)); \
-      }
+  enc.launch_kernel(
+      [&, x_ptr, w_ptr, scales_ptr, biases_ptr, out_ptr](hipStream_t stream) {
+#define LAUNCH_QMV(T, ScaleT, BITS, GROUP_SIZE)                        \
+  if (mode_ == QuantizationMode::Affine) {                             \
+    if (use_fast_qmv) {                                                \
+      hipLaunchKernelGGL(                                              \
+          (rocm::qmv_warp_kernel<T, ScaleT, BITS, GROUP_SIZE, true>),  \
+          fast_grid,                                                   \
+          fast_block,                                                  \
+          0,                                                           \
+          stream,                                                      \
+          static_cast<const T*>(x_ptr),                                \
+          w_ptr,                                                       \
+          static_cast<const ScaleT*>(scales_ptr),                      \
+          has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr, \
+          static_cast<T*>(out_ptr),                                    \
+          M,                                                           \
+          N,                                                           \
+          K,                                                           \
+          has_bias);                                                   \
+    } else if (transpose_) {                                           \
+      hipLaunchKernelGGL(                                              \
+          (rocm::qmv_t_kernel<T, ScaleT, BITS, GROUP_SIZE, true>),     \
+          grid,                                                        \
+          dim3(block_size),                                            \
+          0,                                                           \
+          stream,                                                      \
+          static_cast<const T*>(x_ptr),                                \
+          w_ptr,                                                       \
+          static_cast<const ScaleT*>(scales_ptr),                      \
+          has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr, \
+          static_cast<T*>(out_ptr),                                    \
+          M,                                                           \
+          N,                                                           \
+          K,                                                           \
+          has_bias);                                                   \
+    } else {                                                           \
+      hipLaunchKernelGGL(                                              \
+          (rocm::qmv_kernel<T, ScaleT, BITS, GROUP_SIZE, true>),       \
+          grid,                                                        \
+          dim3(block_size),                                            \
+          0,                                                           \
+          stream,                                                      \
+          static_cast<const T*>(x_ptr),                                \
+          w_ptr,                                                       \
+          static_cast<const ScaleT*>(scales_ptr),                      \
+          has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr, \
+          static_cast<T*>(out_ptr),                                    \
+          M,                                                           \
+          N,                                                           \
+          K,                                                           \
+          has_bias);                                                   \
+    }                                                                  \
+  } else {                                                             \
+    if (use_fast_qmv) {                                                \
+      hipLaunchKernelGGL(                                              \
+          (rocm::qmv_warp_kernel<T, ScaleT, BITS, GROUP_SIZE, false>), \
+          fast_grid,                                                   \
+          fast_block,                                                  \
+          0,                                                           \
+          stream,                                                      \
+          static_cast<const T*>(x_ptr),                                \
+          w_ptr,                                                       \
+          static_cast<const ScaleT*>(scales_ptr),                      \
+          has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr, \
+          static_cast<T*>(out_ptr),                                    \
+          M,                                                           \
+          N,                                                           \
+          K,                                                           \
+          has_bias);                                                   \
+    } else if (transpose_) {                                           \
+      hipLaunchKernelGGL(                                              \
+          (rocm::qmv_t_kernel<T, ScaleT, BITS, GROUP_SIZE, false>),    \
+          grid,                                                        \
+          dim3(block_size),                                            \
+          0,                                                           \
+          stream,                                                      \
+          static_cast<const T*>(x_ptr),                                \
+          w_ptr,                                                       \
+          static_cast<const ScaleT*>(scales_ptr),                      \
+          has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr, \
+          static_cast<T*>(out_ptr),                                    \
+          M,                                                           \
+          N,                                                           \
+          K,                                                           \
+          has_bias);                                                   \
+    } else {                                                           \
+      hipLaunchKernelGGL(                                              \
+          (rocm::qmv_kernel<T, ScaleT, BITS, GROUP_SIZE, false>),      \
+          grid,                                                        \
+          dim3(block_size),                                            \
+          0,                                                           \
+          stream,                                                      \
+          static_cast<const T*>(x_ptr),                                \
+          w_ptr,                                                       \
+          static_cast<const ScaleT*>(scales_ptr),                      \
+          has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr, \
+          static_cast<T*>(out_ptr),                                    \
+          M,                                                           \
+          N,                                                           \
+          K,                                                           \
+          has_bias);                                                   \
+    }                                                                  \
+  }
 
-    switch (x.dtype()) {
-      case float32:
-        if (mode_ == QuantizationMode::Affine) {
-          DISPATCH_BITS_AFFINE(float, float);
-        } else {
-          DISPATCH_BITS_FP(float);
+#define DISPATCH_GROUP_SIZE(T, ScaleT, BITS)               \
+  switch (group_size_) {                                   \
+    case 16:                                               \
+      LAUNCH_QMV(T, ScaleT, BITS, 16);                     \
+      break;                                               \
+    case 32:                                               \
+      LAUNCH_QMV(T, ScaleT, BITS, 32);                     \
+      break;                                               \
+    case 64:                                               \
+      LAUNCH_QMV(T, ScaleT, BITS, 64);                     \
+      break;                                               \
+    case 128:                                              \
+      LAUNCH_QMV(T, ScaleT, BITS, 128);                    \
+      break;                                               \
+    default:                                               \
+      throw std::runtime_error(                            \
+          "Unsupported group_size for QuantizedMatmul: " + \
+          std::to_string(group_size_));                    \
+  }
+
+#define DISPATCH_BITS_AFFINE(T, ScaleT)                                      \
+  switch (bits_) {                                                           \
+    case 2:                                                                  \
+      DISPATCH_GROUP_SIZE(T, ScaleT, 2);                                     \
+      break;                                                                 \
+    case 3:                                                                  \
+      DISPATCH_GROUP_SIZE(T, ScaleT, 3);                                     \
+      break;                                                                 \
+    case 4:                                                                  \
+      DISPATCH_GROUP_SIZE(T, ScaleT, 4);                                     \
+      break;                                                                 \
+    case 5:                                                                  \
+      DISPATCH_GROUP_SIZE(T, ScaleT, 5);                                     \
+      break;                                                                 \
+    case 6:                                                                  \
+      DISPATCH_GROUP_SIZE(T, ScaleT, 6);                                     \
+      break;                                                                 \
+    case 8:                                                                  \
+      DISPATCH_GROUP_SIZE(T, ScaleT, 8);                                     \
+      break;                                                                 \
+    default:                                                                 \
+      throw std::runtime_error(                                              \
+          "Unsupported bits for QuantizedMatmul: " + std::to_string(bits_)); \
+  }
+
+#define DISPATCH_BITS_FP(T)                             \
+  switch (bits_) {                                      \
+    case 4:                                             \
+      DISPATCH_GROUP_SIZE(T, uint8_t, 4);               \
+      break;                                            \
+    case 8:                                             \
+      DISPATCH_GROUP_SIZE(T, uint8_t, 8);               \
+      break;                                            \
+    default:                                            \
+      throw std::runtime_error(                         \
+          "Unsupported fp bits for QuantizedMatmul: " + \
+          std::to_string(bits_));                       \
+  }
+        switch (x.dtype()) {
+          case float32:
+            if (mode_ == QuantizationMode::Affine) {
+              DISPATCH_BITS_AFFINE(float, float);
+            } else {
+              DISPATCH_BITS_FP(float);
+            }
+            break;
+          case float16:
+            if (mode_ == QuantizationMode::Affine) {
+              DISPATCH_BITS_AFFINE(__half, __half);
+            } else {
+              DISPATCH_BITS_FP(__half);
+            }
+            break;
+          case bfloat16:
+            if (mode_ == QuantizationMode::Affine) {
+              DISPATCH_BITS_AFFINE(hip_bfloat16, hip_bfloat16);
+            } else {
+              DISPATCH_BITS_FP(hip_bfloat16);
+            }
+            break;
+          default:
+            throw std::runtime_error("Unsupported dtype for QuantizedMatmul");
         }
-        break;
-      case float16:
-        if (mode_ == QuantizationMode::Affine) {
-          DISPATCH_BITS_AFFINE(__half, __half);
-        } else {
-          DISPATCH_BITS_FP(__half);
-        }
-        break;
-      case bfloat16:
-        if (mode_ == QuantizationMode::Affine) {
-          DISPATCH_BITS_AFFINE(hip_bfloat16, hip_bfloat16);
-        } else {
-          DISPATCH_BITS_FP(hip_bfloat16);
-        }
-        break;
-      default:
-        throw std::runtime_error("Unsupported dtype for QuantizedMatmul");
-    }
-    
-    #undef DISPATCH_BITS_FP
-    #undef DISPATCH_BITS_AFFINE
-    #undef DISPATCH_GROUP_SIZE
-    #undef LAUNCH_QMV
-  });
+
+#undef DISPATCH_BITS_FP
+#undef DISPATCH_BITS_AFFINE
+#undef DISPATCH_GROUP_SIZE
+#undef LAUNCH_QMV
+      });
 }
 
 // GatherQMM kernel - gather-based quantized matrix multiply
@@ -485,8 +630,8 @@ namespace rocm {
 
 template <typename T, typename ScaleT, int BITS, int GROUP_SIZE, bool AFFINE>
 __global__ void gather_qmv_kernel(
-    const T* __restrict__ x,           // [B, M, K]
-    const uint8_t* __restrict__ w,     // [E, N, K * BITS / 8] packed
+    const T* __restrict__ x, // [B, M, K]
+    const uint8_t* __restrict__ w, // [E, N, K * BITS / 8] packed
     const ScaleT* __restrict__ scales, // [E, N, K/GROUP_SIZE]
     const ScaleT* __restrict__ biases, // [E, N, K/GROUP_SIZE] or nullptr
     const uint32_t* __restrict__ lhs_indices, // [B]
@@ -495,19 +640,19 @@ __global__ void gather_qmv_kernel(
     const Strides lhs_idx_strides,
     const Strides rhs_idx_strides,
     int batch_ndim,
-    T* __restrict__ out,               // [B, M, N]
+    T* __restrict__ out, // [B, M, N]
     int B,
     int M,
     int N,
     int K,
     int E,
     bool has_bias) {
-  
   int batch = blockIdx.z;
-  int row = blockIdx.x;  // output row (M dimension)
-  int col = blockIdx.y * blockDim.x + threadIdx.x;  // output col (N dimension)
-  
-  if (batch >= B || row >= M || col >= N) return;
+  int row = blockIdx.x; // output row (M dimension)
+  int col = blockIdx.y * blockDim.x + threadIdx.x; // output col (N dimension)
+
+  if (batch >= B || row >= M || col >= N)
+    return;
 
   int64_t lhs_idx_loc = 0;
   int64_t rhs_idx_loc = 0;
@@ -527,34 +672,35 @@ __global__ void gather_qmv_kernel(
 
   uint32_t lhs_idx = lhs_indices[lhs_idx_loc];
   uint32_t rhs_idx = rhs_indices[rhs_idx_loc];
-  
+
   int num_groups = (K + GROUP_SIZE - 1) / GROUP_SIZE;
   int row_bytes = (K * BITS + 7) / 8;
 
   const T* x_ptr = x + lhs_idx * M * K + row * K;
   const uint8_t* w_ptr = w + rhs_idx * N * row_bytes + col * row_bytes;
-  const ScaleT* scales_ptr = scales + rhs_idx * N * num_groups + col * num_groups;
+  const ScaleT* scales_ptr =
+      scales + rhs_idx * N * num_groups + col * num_groups;
   const ScaleT* biases_ptr =
       has_bias ? biases + rhs_idx * N * num_groups + col * num_groups : nullptr;
 
   float acc = 0.0f;
-  
+
   for (int g = 0; g < num_groups; ++g) {
     float scale = load_scale_value<ScaleT, GROUP_SIZE, AFFINE>(scales_ptr[g]);
     float bias = has_bias ? static_cast<float>(biases_ptr[g]) : 0.0f;
-    
+
     int k_start = g * GROUP_SIZE;
     int k_end = min(k_start + GROUP_SIZE, K);
-    
+
     for (int k = k_start; k < k_end; ++k) {
-      uint8_t quant_val = unpack_packed_value<BITS>(w_ptr, k, row_bytes);
+      uint8_t quant_val = unpack_packed_value_fast<BITS>(w_ptr, k, row_bytes);
       float w_val = dequantize_value<BITS, AFFINE>(quant_val, scale, bias);
-      
+
       // Accumulate
       acc += static_cast<float>(x_ptr[k]) * w_val;
     }
   }
-  
+
   out[batch * M * N + row * N + col] = static_cast<T>(acc);
 }
 
@@ -613,66 +759,123 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   const uint32_t* lhs_indices_ptr = gpu_ptr<const uint32_t>(lhs_indices);
   const uint32_t* rhs_indices_ptr = gpu_ptr<const uint32_t>(rhs_indices);
   void* out_ptr = gpu_ptr<void>(out);
-  
-  enc.launch_kernel([
-                        &,
-                        x_ptr,
-                        w_ptr,
-                        scales_ptr,
-                        biases_ptr,
-                        lhs_indices_ptr,
-                        rhs_indices_ptr,
-                        out_ptr](hipStream_t stream) {
-    #define LAUNCH_GATHER_QMV(T, ScaleT, BITS, GROUP_SIZE) \
-      if (mode_ == QuantizationMode::Affine) { \
-        hipLaunchKernelGGL( \
-            (rocm::gather_qmv_kernel<T, ScaleT, BITS, GROUP_SIZE, true>), \
-            grid, dim3(block_size), 0, stream, \
-            static_cast<const T*>(x_ptr), w_ptr, \
-            static_cast<const ScaleT*>(scales_ptr), \
-            has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr, \
-            lhs_indices_ptr, rhs_indices_ptr, \
-            batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, \
-            batch_ndim, static_cast<T*>(out_ptr), B, M, N, K, E, has_bias); \
-      } else { \
-        hipLaunchKernelGGL( \
-            (rocm::gather_qmv_kernel<T, ScaleT, BITS, GROUP_SIZE, false>), \
-            grid, dim3(block_size), 0, stream, \
-            static_cast<const T*>(x_ptr), w_ptr, \
-            static_cast<const ScaleT*>(scales_ptr), \
-            has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr, \
-            lhs_indices_ptr, rhs_indices_ptr, \
-            batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, \
-            batch_ndim, static_cast<T*>(out_ptr), B, M, N, K, E, has_bias); \
-      }
-    
-    #define DISPATCH_GROUP_SIZE_GATHER(T, ScaleT, BITS) \
-      switch (group_size_) { \
-        case 16: LAUNCH_GATHER_QMV(T, ScaleT, BITS, 16); break; \
-        case 32: LAUNCH_GATHER_QMV(T, ScaleT, BITS, 32); break; \
-        case 64: LAUNCH_GATHER_QMV(T, ScaleT, BITS, 64); break; \
-        case 128: LAUNCH_GATHER_QMV(T, ScaleT, BITS, 128); break; \
-        default: throw std::runtime_error("Unsupported group_size for GatherQMM: " + std::to_string(group_size_)); \
-      }
-    
-    #define DISPATCH_BITS_GATHER_AFFINE(T, ScaleT) \
-      switch (bits_) { \
-        case 2: DISPATCH_GROUP_SIZE_GATHER(T, ScaleT, 2); break; \
-        case 3: DISPATCH_GROUP_SIZE_GATHER(T, ScaleT, 3); break; \
-        case 4: DISPATCH_GROUP_SIZE_GATHER(T, ScaleT, 4); break; \
-        case 5: DISPATCH_GROUP_SIZE_GATHER(T, ScaleT, 5); break; \
-        case 6: DISPATCH_GROUP_SIZE_GATHER(T, ScaleT, 6); break; \
-        case 8: DISPATCH_GROUP_SIZE_GATHER(T, ScaleT, 8); break; \
-        default: throw std::runtime_error("Unsupported bits for GatherQMM: " + std::to_string(bits_)); \
-      }
 
-    #define DISPATCH_BITS_GATHER_FP(T) \
-      switch (bits_) { \
-        case 4: DISPATCH_GROUP_SIZE_GATHER(T, uint8_t, 4); break; \
-        case 8: DISPATCH_GROUP_SIZE_GATHER(T, uint8_t, 8); break; \
-        default: throw std::runtime_error("Unsupported fp bits for GatherQMM: " + std::to_string(bits_)); \
-      }
-    
+  enc.launch_kernel([&,
+                     x_ptr,
+                     w_ptr,
+                     scales_ptr,
+                     biases_ptr,
+                     lhs_indices_ptr,
+                     rhs_indices_ptr,
+                     out_ptr](hipStream_t stream) {
+#define LAUNCH_GATHER_QMV(T, ScaleT, BITS, GROUP_SIZE)                 \
+  if (mode_ == QuantizationMode::Affine) {                             \
+    hipLaunchKernelGGL(                                                \
+        (rocm::gather_qmv_kernel<T, ScaleT, BITS, GROUP_SIZE, true>),  \
+        grid,                                                          \
+        dim3(block_size),                                              \
+        0,                                                             \
+        stream,                                                        \
+        static_cast<const T*>(x_ptr),                                  \
+        w_ptr,                                                         \
+        static_cast<const ScaleT*>(scales_ptr),                        \
+        has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr,   \
+        lhs_indices_ptr,                                               \
+        rhs_indices_ptr,                                               \
+        batch_shape_param,                                             \
+        lhs_idx_strides_param,                                         \
+        rhs_idx_strides_param,                                         \
+        batch_ndim,                                                    \
+        static_cast<T*>(out_ptr),                                      \
+        B,                                                             \
+        M,                                                             \
+        N,                                                             \
+        K,                                                             \
+        E,                                                             \
+        has_bias);                                                     \
+  } else {                                                             \
+    hipLaunchKernelGGL(                                                \
+        (rocm::gather_qmv_kernel<T, ScaleT, BITS, GROUP_SIZE, false>), \
+        grid,                                                          \
+        dim3(block_size),                                              \
+        0,                                                             \
+        stream,                                                        \
+        static_cast<const T*>(x_ptr),                                  \
+        w_ptr,                                                         \
+        static_cast<const ScaleT*>(scales_ptr),                        \
+        has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr,   \
+        lhs_indices_ptr,                                               \
+        rhs_indices_ptr,                                               \
+        batch_shape_param,                                             \
+        lhs_idx_strides_param,                                         \
+        rhs_idx_strides_param,                                         \
+        batch_ndim,                                                    \
+        static_cast<T*>(out_ptr),                                      \
+        B,                                                             \
+        M,                                                             \
+        N,                                                             \
+        K,                                                             \
+        E,                                                             \
+        has_bias);                                                     \
+  }
+
+#define DISPATCH_GROUP_SIZE_GATHER(T, ScaleT, BITS)  \
+  switch (group_size_) {                             \
+    case 16:                                         \
+      LAUNCH_GATHER_QMV(T, ScaleT, BITS, 16);        \
+      break;                                         \
+    case 32:                                         \
+      LAUNCH_GATHER_QMV(T, ScaleT, BITS, 32);        \
+      break;                                         \
+    case 64:                                         \
+      LAUNCH_GATHER_QMV(T, ScaleT, BITS, 64);        \
+      break;                                         \
+    case 128:                                        \
+      LAUNCH_GATHER_QMV(T, ScaleT, BITS, 128);       \
+      break;                                         \
+    default:                                         \
+      throw std::runtime_error(                      \
+          "Unsupported group_size for GatherQMM: " + \
+          std::to_string(group_size_));              \
+  }
+
+#define DISPATCH_BITS_GATHER_AFFINE(T, ScaleT)                         \
+  switch (bits_) {                                                     \
+    case 2:                                                            \
+      DISPATCH_GROUP_SIZE_GATHER(T, ScaleT, 2);                        \
+      break;                                                           \
+    case 3:                                                            \
+      DISPATCH_GROUP_SIZE_GATHER(T, ScaleT, 3);                        \
+      break;                                                           \
+    case 4:                                                            \
+      DISPATCH_GROUP_SIZE_GATHER(T, ScaleT, 4);                        \
+      break;                                                           \
+    case 5:                                                            \
+      DISPATCH_GROUP_SIZE_GATHER(T, ScaleT, 5);                        \
+      break;                                                           \
+    case 6:                                                            \
+      DISPATCH_GROUP_SIZE_GATHER(T, ScaleT, 6);                        \
+      break;                                                           \
+    case 8:                                                            \
+      DISPATCH_GROUP_SIZE_GATHER(T, ScaleT, 8);                        \
+      break;                                                           \
+    default:                                                           \
+      throw std::runtime_error(                                        \
+          "Unsupported bits for GatherQMM: " + std::to_string(bits_)); \
+  }
+
+#define DISPATCH_BITS_GATHER_FP(T)                                        \
+  switch (bits_) {                                                        \
+    case 4:                                                               \
+      DISPATCH_GROUP_SIZE_GATHER(T, uint8_t, 4);                          \
+      break;                                                              \
+    case 8:                                                               \
+      DISPATCH_GROUP_SIZE_GATHER(T, uint8_t, 8);                          \
+      break;                                                              \
+    default:                                                              \
+      throw std::runtime_error(                                           \
+          "Unsupported fp bits for GatherQMM: " + std::to_string(bits_)); \
+  }
     switch (x.dtype()) {
       case float32:
         if (mode_ == QuantizationMode::Affine) {
@@ -698,11 +901,11 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
       default:
         throw std::runtime_error("Unsupported dtype for GatherQMM");
     }
-    
-    #undef DISPATCH_BITS_GATHER_FP
-    #undef DISPATCH_BITS_GATHER_AFFINE
-    #undef DISPATCH_GROUP_SIZE_GATHER
-    #undef LAUNCH_GATHER_QMV
+
+#undef DISPATCH_BITS_GATHER_FP
+#undef DISPATCH_BITS_GATHER_AFFINE
+#undef DISPATCH_GROUP_SIZE_GATHER
+#undef LAUNCH_GATHER_QMV
   });
 }
 
