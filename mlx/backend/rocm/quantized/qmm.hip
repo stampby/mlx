@@ -48,9 +48,25 @@ inline int parse_cols_per_block_env(const char* env_name) {
     return 0;
   }
 
-  return (value == 4 || value == 8 || value == 16 || value == 32)
+  return (value == 4 || value == 8 || value == 16 || value == 32 || value == 64)
       ? static_cast<int>(value)
       : 0;
+}
+
+inline int parse_threads_per_col_env(const char* env_name) {
+  const char* raw = std::getenv(env_name);
+  if (raw == nullptr || *raw == '\0') {
+    return 0;
+  }
+
+  char* end = nullptr;
+  long value = std::strtol(raw, &end, 10);
+  if (end == raw || *end != '\0') {
+    return 0;
+  }
+
+  return (value == 16 || value == 32 || value == 64) ? static_cast<int>(value)
+                                                     : 0;
 }
 
 inline bool parse_warp_kernel_env(const char* env_name, bool default_value) {
@@ -171,13 +187,21 @@ unpack_packed_value_fast(const uint8_t* packed_row, int k, int row_bytes) {
   }
 }
 
-template <typename T>
-__device__ __forceinline__ T warp_reduce_sum_qmm(T val) {
+template <int SUBGROUP_SIZE, typename T>
+__device__ __forceinline__ T subgroup_reduce_sum_qmm(T val) {
+  static_assert((SUBGROUP_SIZE & (SUBGROUP_SIZE - 1)) == 0);
+  static_assert(SUBGROUP_SIZE <= WARP_SIZE);
+
 #pragma unroll
-  for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-    val += __shfl_down(val, offset);
+  for (int offset = SUBGROUP_SIZE / 2; offset > 0; offset /= 2) {
+    val += __shfl_xor(val, offset);
   }
   return val;
+}
+
+template <typename T>
+__device__ __forceinline__ T warp_reduce_sum_qmm(T val) {
+  return subgroup_reduce_sum_qmm<WARP_SIZE>(val);
 }
 
 __device__ inline float fp4_e2m1_to_float(uint8_t val) {
@@ -280,7 +304,13 @@ dequantize_value(uint8_t quant_val, float scale, float bias) {
   }
 }
 
-template <typename T, typename ScaleT, int BITS, int GROUP_SIZE, bool AFFINE>
+template <
+    typename T,
+    typename ScaleT,
+    int BITS,
+    int GROUP_SIZE,
+    bool AFFINE,
+    int THREADS_PER_COL>
 __global__ void qmv_warp_kernel(
     const T* __restrict__ x,
     const uint8_t* __restrict__ w,
@@ -298,7 +328,7 @@ __global__ void qmv_warp_kernel(
   const bool row_valid = (row < M);
   const bool valid = row_valid && (col < N);
 
-  constexpr int kWarpSize = WARP_SIZE;
+  constexpr int kThreadsPerCol = THREADS_PER_COL;
   const int num_groups = (K + GROUP_SIZE - 1) / GROUP_SIZE;
   const int row_bytes = (K * BITS + 7) / 8;
 
@@ -331,15 +361,15 @@ __global__ void qmv_warp_kernel(
         float x_group_sum = 0.0f;
         if (full_group) {
 #pragma unroll
-          for (int i = lane; i < GROUP_SIZE; i += kWarpSize) {
+          for (int i = lane; i < GROUP_SIZE; i += kThreadsPerCol) {
             x_group_sum += x_group_shared[i];
           }
         } else {
-          for (int i = lane; i < group_len; i += kWarpSize) {
+          for (int i = lane; i < group_len; i += kThreadsPerCol) {
             x_group_sum += x_group_shared[i];
           }
         }
-        x_group_sum = warp_reduce_sum_qmm(x_group_sum);
+        x_group_sum = subgroup_reduce_sum_qmm<kThreadsPerCol>(x_group_sum);
         if (lane == 0) {
           x_group_sum_shared = x_group_sum;
         }
@@ -357,7 +387,8 @@ __global__ void qmv_warp_kernel(
         float qx_acc = 0.0f;
         if (full_group) {
 #pragma unroll
-          for (int k_local = lane; k_local < GROUP_SIZE; k_local += kWarpSize) {
+          for (int k_local = lane; k_local < GROUP_SIZE;
+               k_local += kThreadsPerCol) {
             int k = k_start + k_local;
             uint8_t quant_val =
                 unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
@@ -365,7 +396,8 @@ __global__ void qmv_warp_kernel(
                 x_group_shared[k_local], static_cast<float>(quant_val), qx_acc);
           }
         } else {
-          for (int k_local = lane; k_local < group_len; k_local += kWarpSize) {
+          for (int k_local = lane; k_local < group_len;
+               k_local += kThreadsPerCol) {
             int k = k_start + k_local;
             uint8_t quant_val =
                 unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
@@ -383,27 +415,34 @@ __global__ void qmv_warp_kernel(
           float qx_acc = 0.0f;
           if (full_group) {
 #pragma unroll
-            for (int k_local = lane; k_local < GROUP_SIZE; k_local += kWarpSize) {
+            for (int k_local = lane; k_local < GROUP_SIZE;
+                 k_local += kThreadsPerCol) {
               int k = k_start + k_local;
               uint8_t quant_val =
                   unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
               qx_acc = fmaf(
-                  x_group_shared[k_local], fp8_e4m3_to_float(quant_val), qx_acc);
+                  x_group_shared[k_local],
+                  fp8_e4m3_to_float(quant_val),
+                  qx_acc);
             }
           } else {
-            for (int k_local = lane; k_local < group_len; k_local += kWarpSize) {
+            for (int k_local = lane; k_local < group_len;
+                 k_local += kThreadsPerCol) {
               int k = k_start + k_local;
               uint8_t quant_val =
                   unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
               qx_acc = fmaf(
-                  x_group_shared[k_local], fp8_e4m3_to_float(quant_val), qx_acc);
+                  x_group_shared[k_local],
+                  fp8_e4m3_to_float(quant_val),
+                  qx_acc);
             }
           }
           acc = fmaf(scale, qx_acc, acc);
         } else {
           if (full_group) {
 #pragma unroll
-            for (int k_local = lane; k_local < GROUP_SIZE; k_local += kWarpSize) {
+            for (int k_local = lane; k_local < GROUP_SIZE;
+                 k_local += kThreadsPerCol) {
               int k = k_start + k_local;
               uint8_t quant_val =
                   unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
@@ -412,7 +451,8 @@ __global__ void qmv_warp_kernel(
               acc = fmaf(x_group_shared[k_local], w_val, acc);
             }
           } else {
-            for (int k_local = lane; k_local < group_len; k_local += kWarpSize) {
+            for (int k_local = lane; k_local < group_len;
+                 k_local += kThreadsPerCol) {
               int k = k_start + k_local;
               uint8_t quant_val =
                   unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
@@ -428,13 +468,19 @@ __global__ void qmv_warp_kernel(
     __syncthreads();
   }
 
-  acc = warp_reduce_sum_qmm(acc);
+  acc = subgroup_reduce_sum_qmm<kThreadsPerCol>(acc);
   if (valid && lane == 0) {
     out[row * N + col] = static_cast<T>(acc);
   }
 }
 
-template <typename T, typename ScaleT, int BITS, int GROUP_SIZE, bool AFFINE>
+template <
+    typename T,
+    typename ScaleT,
+    int BITS,
+    int GROUP_SIZE,
+    bool AFFINE,
+    int THREADS_PER_COL>
 __global__ void qmv_warp_noshared_kernel(
     const T* __restrict__ x,
     const uint8_t* __restrict__ w,
@@ -452,7 +498,7 @@ __global__ void qmv_warp_noshared_kernel(
   const bool row_valid = (row < M);
   const bool valid = row_valid && (col < N);
 
-  constexpr int kWarpSize = WARP_SIZE;
+  constexpr int kThreadsPerCol = THREADS_PER_COL;
   const int num_groups = (K + GROUP_SIZE - 1) / GROUP_SIZE;
   const int row_bytes = (K * BITS + 7) / 8;
 
@@ -478,7 +524,8 @@ __global__ void qmv_warp_noshared_kernel(
         float x_group_sum = 0.0f;
         if (full_group) {
 #pragma unroll
-          for (int k_local = lane; k_local < GROUP_SIZE; k_local += kWarpSize) {
+          for (int k_local = lane; k_local < GROUP_SIZE;
+               k_local += kThreadsPerCol) {
             int k = k_start + k_local;
             float x_val = static_cast<float>(x_row[k]);
             uint8_t quant_val =
@@ -489,7 +536,8 @@ __global__ void qmv_warp_noshared_kernel(
             }
           }
         } else {
-          for (int k_local = lane; k_local < group_len; k_local += kWarpSize) {
+          for (int k_local = lane; k_local < group_len;
+               k_local += kThreadsPerCol) {
             int k = k_start + k_local;
             float x_val = static_cast<float>(x_row[k]);
             uint8_t quant_val =
@@ -503,7 +551,7 @@ __global__ void qmv_warp_noshared_kernel(
 
         float group_acc = scale * qx_acc;
         if (has_bias) {
-          x_group_sum = warp_reduce_sum_qmm(x_group_sum);
+          x_group_sum = subgroup_reduce_sum_qmm<kThreadsPerCol>(x_group_sum);
           if (lane == 0) {
             group_acc = fmaf(bias, x_group_sum, group_acc);
           }
@@ -514,7 +562,8 @@ __global__ void qmv_warp_noshared_kernel(
           float qx_acc = 0.0f;
           if (full_group) {
 #pragma unroll
-            for (int k_local = lane; k_local < GROUP_SIZE; k_local += kWarpSize) {
+            for (int k_local = lane; k_local < GROUP_SIZE;
+                 k_local += kThreadsPerCol) {
               int k = k_start + k_local;
               uint8_t quant_val =
                   unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
@@ -524,7 +573,8 @@ __global__ void qmv_warp_noshared_kernel(
                   qx_acc);
             }
           } else {
-            for (int k_local = lane; k_local < group_len; k_local += kWarpSize) {
+            for (int k_local = lane; k_local < group_len;
+                 k_local += kThreadsPerCol) {
               int k = k_start + k_local;
               uint8_t quant_val =
                   unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
@@ -538,7 +588,8 @@ __global__ void qmv_warp_noshared_kernel(
         } else {
           if (full_group) {
 #pragma unroll
-            for (int k_local = lane; k_local < GROUP_SIZE; k_local += kWarpSize) {
+            for (int k_local = lane; k_local < GROUP_SIZE;
+                 k_local += kThreadsPerCol) {
               int k = k_start + k_local;
               uint8_t quant_val =
                   unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
@@ -547,7 +598,8 @@ __global__ void qmv_warp_noshared_kernel(
               acc = fmaf(static_cast<float>(x_row[k]), w_val, acc);
             }
           } else {
-            for (int k_local = lane; k_local < group_len; k_local += kWarpSize) {
+            for (int k_local = lane; k_local < group_len;
+                 k_local += kThreadsPerCol) {
               int k = k_start + k_local;
               uint8_t quant_val =
                   unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
@@ -559,10 +611,9 @@ __global__ void qmv_warp_noshared_kernel(
         }
       }
     }
-
   }
 
-  acc = warp_reduce_sum_qmm(acc);
+  acc = subgroup_reduce_sum_qmm<kThreadsPerCol>(acc);
   if (valid && lane == 0) {
     out[row * N + col] = static_cast<T>(acc);
   }
@@ -731,8 +782,23 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   dim3 grid((M + 0) / 1, (N + block_size - 1) / block_size);
   grid.x = M;
 
+  int fast_threads_per_col = (WARP_SIZE == 32) ? 16 : WARP_SIZE;
+  int fast_threads_env =
+      parse_threads_per_col_env("MLX_ROCM_QMV_THREADS_PER_COL");
+  if (fast_threads_env > 0 && fast_threads_env <= WARP_SIZE &&
+      (WARP_SIZE % fast_threads_env) == 0) {
+    fast_threads_per_col = fast_threads_env;
+  }
   int fast_cols_per_block = select_qmv_cols_per_block(K, N, bits_);
-  dim3 fast_block(WARP_SIZE, fast_cols_per_block);
+  if (group_size_ == 16 &&
+      parse_cols_per_block_env("MLX_ROCM_QMV_COLS_PER_BLOCK") == 0) {
+    fast_cols_per_block = min(32, fast_cols_per_block * (WARP_SIZE / 16));
+  }
+  int max_cols_per_block = rocm::kMaxThreadsPerBlock / fast_threads_per_col;
+  while (fast_cols_per_block > max_cols_per_block) {
+    fast_cols_per_block /= 2;
+  }
+  dim3 fast_block(fast_threads_per_col, fast_cols_per_block);
   dim3 fast_grid((N + fast_cols_per_block - 1) / fast_cols_per_block, M);
 
   const void* x_ptr = gpu_ptr<void>(x);
@@ -746,39 +812,92 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 #define LAUNCH_QMV(T, ScaleT, BITS, GROUP_SIZE)                                \
   if (mode_ == QuantizationMode::Affine) {                                     \
     if (use_fast_qmv) {                                                        \
-      if (use_shared_fast_qmv) {                                               \
-        hipLaunchKernelGGL(                                                    \
-            (rocm::qmv_warp_kernel<T, ScaleT, BITS, GROUP_SIZE, true>),        \
-            fast_grid,                                                         \
-            fast_block,                                                        \
-            0,                                                                 \
-            stream,                                                            \
-            static_cast<const T*>(x_ptr),                                      \
-            w_ptr,                                                             \
-            static_cast<const ScaleT*>(scales_ptr),                            \
-            has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr,       \
-            static_cast<T*>(out_ptr),                                          \
-            M,                                                                 \
-            N,                                                                 \
-            K,                                                                 \
-            has_bias);                                                         \
+      if (fast_threads_per_col == 16) {                                        \
+        if (use_shared_fast_qmv) {                                             \
+          hipLaunchKernelGGL(                                                  \
+              (rocm::qmv_warp_kernel<T, ScaleT, BITS, GROUP_SIZE, true, 16>),  \
+              fast_grid,                                                       \
+              fast_block,                                                      \
+              0,                                                               \
+              stream,                                                          \
+              static_cast<const T*>(x_ptr),                                    \
+              w_ptr,                                                           \
+              static_cast<const ScaleT*>(scales_ptr),                          \
+              has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr,     \
+              static_cast<T*>(out_ptr),                                        \
+              M,                                                               \
+              N,                                                               \
+              K,                                                               \
+              has_bias);                                                       \
+        } else {                                                               \
+          hipLaunchKernelGGL(                                                  \
+              (rocm::qmv_warp_noshared_kernel<                                 \
+                  T,                                                           \
+                  ScaleT,                                                      \
+                  BITS,                                                        \
+                  GROUP_SIZE,                                                  \
+                  true,                                                        \
+                  16>),                                                        \
+              fast_grid,                                                       \
+              fast_block,                                                      \
+              0,                                                               \
+              stream,                                                          \
+              static_cast<const T*>(x_ptr),                                    \
+              w_ptr,                                                           \
+              static_cast<const ScaleT*>(scales_ptr),                          \
+              has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr,     \
+              static_cast<T*>(out_ptr),                                        \
+              M,                                                               \
+              N,                                                               \
+              K,                                                               \
+              has_bias);                                                       \
+        }                                                                      \
       } else {                                                                 \
-        hipLaunchKernelGGL(                                                    \
-            (rocm::                                                            \
-                 qmv_warp_noshared_kernel<T, ScaleT, BITS, GROUP_SIZE, true>), \
-            fast_grid,                                                         \
-            fast_block,                                                        \
-            0,                                                                 \
-            stream,                                                            \
-            static_cast<const T*>(x_ptr),                                      \
-            w_ptr,                                                             \
-            static_cast<const ScaleT*>(scales_ptr),                            \
-            has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr,       \
-            static_cast<T*>(out_ptr),                                          \
-            M,                                                                 \
-            N,                                                                 \
-            K,                                                                 \
-            has_bias);                                                         \
+        if (use_shared_fast_qmv) {                                             \
+          hipLaunchKernelGGL(                                                  \
+              (rocm::qmv_warp_kernel<                                          \
+                  T,                                                           \
+                  ScaleT,                                                      \
+                  BITS,                                                        \
+                  GROUP_SIZE,                                                  \
+                  true,                                                        \
+                  WARP_SIZE>),                                                 \
+              fast_grid,                                                       \
+              fast_block,                                                      \
+              0,                                                               \
+              stream,                                                          \
+              static_cast<const T*>(x_ptr),                                    \
+              w_ptr,                                                           \
+              static_cast<const ScaleT*>(scales_ptr),                          \
+              has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr,     \
+              static_cast<T*>(out_ptr),                                        \
+              M,                                                               \
+              N,                                                               \
+              K,                                                               \
+              has_bias);                                                       \
+        } else {                                                               \
+          hipLaunchKernelGGL(                                                  \
+              (rocm::qmv_warp_noshared_kernel<                                 \
+                  T,                                                           \
+                  ScaleT,                                                      \
+                  BITS,                                                        \
+                  GROUP_SIZE,                                                  \
+                  true,                                                        \
+                  WARP_SIZE>),                                                 \
+              fast_grid,                                                       \
+              fast_block,                                                      \
+              0,                                                               \
+              stream,                                                          \
+              static_cast<const T*>(x_ptr),                                    \
+              w_ptr,                                                           \
+              static_cast<const ScaleT*>(scales_ptr),                          \
+              has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr,     \
+              static_cast<T*>(out_ptr),                                        \
+              M,                                                               \
+              N,                                                               \
+              K,                                                               \
+              has_bias);                                                       \
+        }                                                                      \
       }                                                                        \
     } else if (transpose_) {                                                   \
       hipLaunchKernelGGL(                                                      \
@@ -815,43 +934,92 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     }                                                                          \
   } else {                                                                     \
     if (use_fast_qmv) {                                                        \
-      if (use_shared_fast_qmv) {                                               \
-        hipLaunchKernelGGL(                                                    \
-            (rocm::qmv_warp_kernel<T, ScaleT, BITS, GROUP_SIZE, false>),       \
-            fast_grid,                                                         \
-            fast_block,                                                        \
-            0,                                                                 \
-            stream,                                                            \
-            static_cast<const T*>(x_ptr),                                      \
-            w_ptr,                                                             \
-            static_cast<const ScaleT*>(scales_ptr),                            \
-            has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr,       \
-            static_cast<T*>(out_ptr),                                          \
-            M,                                                                 \
-            N,                                                                 \
-            K,                                                                 \
-            has_bias);                                                         \
+      if (fast_threads_per_col == 16) {                                        \
+        if (use_shared_fast_qmv) {                                             \
+          hipLaunchKernelGGL(                                                  \
+              (rocm::qmv_warp_kernel<T, ScaleT, BITS, GROUP_SIZE, false, 16>), \
+              fast_grid,                                                       \
+              fast_block,                                                      \
+              0,                                                               \
+              stream,                                                          \
+              static_cast<const T*>(x_ptr),                                    \
+              w_ptr,                                                           \
+              static_cast<const ScaleT*>(scales_ptr),                          \
+              has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr,     \
+              static_cast<T*>(out_ptr),                                        \
+              M,                                                               \
+              N,                                                               \
+              K,                                                               \
+              has_bias);                                                       \
+        } else {                                                               \
+          hipLaunchKernelGGL(                                                  \
+              (rocm::qmv_warp_noshared_kernel<                                 \
+                  T,                                                           \
+                  ScaleT,                                                      \
+                  BITS,                                                        \
+                  GROUP_SIZE,                                                  \
+                  false,                                                       \
+                  16>),                                                        \
+              fast_grid,                                                       \
+              fast_block,                                                      \
+              0,                                                               \
+              stream,                                                          \
+              static_cast<const T*>(x_ptr),                                    \
+              w_ptr,                                                           \
+              static_cast<const ScaleT*>(scales_ptr),                          \
+              has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr,     \
+              static_cast<T*>(out_ptr),                                        \
+              M,                                                               \
+              N,                                                               \
+              K,                                                               \
+              has_bias);                                                       \
+        }                                                                      \
       } else {                                                                 \
-        hipLaunchKernelGGL(                                                    \
-            (rocm::qmv_warp_noshared_kernel<                                   \
-                T,                                                             \
-                ScaleT,                                                        \
-                BITS,                                                          \
-                GROUP_SIZE,                                                    \
-                false>),                                                       \
-            fast_grid,                                                         \
-            fast_block,                                                        \
-            0,                                                                 \
-            stream,                                                            \
-            static_cast<const T*>(x_ptr),                                      \
-            w_ptr,                                                             \
-            static_cast<const ScaleT*>(scales_ptr),                            \
-            has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr,       \
-            static_cast<T*>(out_ptr),                                          \
-            M,                                                                 \
-            N,                                                                 \
-            K,                                                                 \
-            has_bias);                                                         \
+        if (use_shared_fast_qmv) {                                             \
+          hipLaunchKernelGGL(                                                  \
+              (rocm::qmv_warp_kernel<                                          \
+                  T,                                                           \
+                  ScaleT,                                                      \
+                  BITS,                                                        \
+                  GROUP_SIZE,                                                  \
+                  false,                                                       \
+                  WARP_SIZE>),                                                 \
+              fast_grid,                                                       \
+              fast_block,                                                      \
+              0,                                                               \
+              stream,                                                          \
+              static_cast<const T*>(x_ptr),                                    \
+              w_ptr,                                                           \
+              static_cast<const ScaleT*>(scales_ptr),                          \
+              has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr,     \
+              static_cast<T*>(out_ptr),                                        \
+              M,                                                               \
+              N,                                                               \
+              K,                                                               \
+              has_bias);                                                       \
+        } else {                                                               \
+          hipLaunchKernelGGL(                                                  \
+              (rocm::qmv_warp_noshared_kernel<                                 \
+                  T,                                                           \
+                  ScaleT,                                                      \
+                  BITS,                                                        \
+                  GROUP_SIZE,                                                  \
+                  false,                                                       \
+                  WARP_SIZE>),                                                 \
+              fast_grid,                                                       \
+              fast_block,                                                      \
+              0,                                                               \
+              stream,                                                          \
+              static_cast<const T*>(x_ptr),                                    \
+              w_ptr,                                                           \
+              static_cast<const ScaleT*>(scales_ptr),                          \
+              has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr,     \
+              static_cast<T*>(out_ptr),                                        \
+              M,                                                               \
+              N,                                                               \
+              K,                                                               \
+              has_bias);                                                       \
+        }                                                                      \
       }                                                                        \
     } else if (transpose_) {                                                   \
       hipLaunchKernelGGL(                                                      \
@@ -1050,8 +1218,8 @@ __global__ void gather_qmv_kernel(
       float qx_acc = 0.0f;
       for (int k = k_start; k < k_end; ++k) {
         uint8_t quant_val = unpack_packed_value_fast<BITS>(w_ptr, k, row_bytes);
-        qx_acc =
-            fmaf(static_cast<float>(x_ptr[k]), fp8_e4m3_to_float(quant_val), qx_acc);
+        qx_acc = fmaf(
+            static_cast<float>(x_ptr[k]), fp8_e4m3_to_float(quant_val), qx_acc);
       }
       acc = fmaf(scale, qx_acc, acc);
     } else {
@@ -1068,7 +1236,13 @@ __global__ void gather_qmv_kernel(
   out[batch * M * N + row * N + col] = static_cast<T>(acc);
 }
 
-template <typename T, typename ScaleT, int BITS, int GROUP_SIZE, bool AFFINE>
+template <
+    typename T,
+    typename ScaleT,
+    int BITS,
+    int GROUP_SIZE,
+    bool AFFINE,
+    int THREADS_PER_COL>
 __global__ void gather_qmv_warp_kernel(
     const T* __restrict__ x,
     const uint8_t* __restrict__ w,
@@ -1094,7 +1268,7 @@ __global__ void gather_qmv_warp_kernel(
   const bool batch_row_valid = (batch < B) && (row < M);
   const bool valid = batch_row_valid && (col < N);
 
-  constexpr int kWarpSize = WARP_SIZE;
+  constexpr int kThreadsPerCol = THREADS_PER_COL;
   const int num_groups = (K + GROUP_SIZE - 1) / GROUP_SIZE;
   const int row_bytes = (K * BITS + 7) / 8;
 
@@ -1161,15 +1335,15 @@ __global__ void gather_qmv_warp_kernel(
         float x_group_sum = 0.0f;
         if (full_group) {
 #pragma unroll
-          for (int i = lane; i < GROUP_SIZE; i += kWarpSize) {
+          for (int i = lane; i < GROUP_SIZE; i += kThreadsPerCol) {
             x_group_sum += x_group_shared[i];
           }
         } else {
-          for (int i = lane; i < group_len; i += kWarpSize) {
+          for (int i = lane; i < group_len; i += kThreadsPerCol) {
             x_group_sum += x_group_shared[i];
           }
         }
-        x_group_sum = warp_reduce_sum_qmm(x_group_sum);
+        x_group_sum = subgroup_reduce_sum_qmm<kThreadsPerCol>(x_group_sum);
         if (lane == 0) {
           x_group_sum_shared = x_group_sum;
         }
@@ -1187,7 +1361,8 @@ __global__ void gather_qmv_warp_kernel(
         float qx_acc = 0.0f;
         if (full_group) {
 #pragma unroll
-          for (int k_local = lane; k_local < GROUP_SIZE; k_local += kWarpSize) {
+          for (int k_local = lane; k_local < GROUP_SIZE;
+               k_local += kThreadsPerCol) {
             int k = k_start + k_local;
             uint8_t quant_val =
                 unpack_packed_value_fast<BITS>(w_ptr, k, row_bytes);
@@ -1195,7 +1370,8 @@ __global__ void gather_qmv_warp_kernel(
                 x_group_shared[k_local], static_cast<float>(quant_val), qx_acc);
           }
         } else {
-          for (int k_local = lane; k_local < group_len; k_local += kWarpSize) {
+          for (int k_local = lane; k_local < group_len;
+               k_local += kThreadsPerCol) {
             int k = k_start + k_local;
             uint8_t quant_val =
                 unpack_packed_value_fast<BITS>(w_ptr, k, row_bytes);
@@ -1213,27 +1389,34 @@ __global__ void gather_qmv_warp_kernel(
           float qx_acc = 0.0f;
           if (full_group) {
 #pragma unroll
-            for (int k_local = lane; k_local < GROUP_SIZE; k_local += kWarpSize) {
+            for (int k_local = lane; k_local < GROUP_SIZE;
+                 k_local += kThreadsPerCol) {
               int k = k_start + k_local;
               uint8_t quant_val =
                   unpack_packed_value_fast<BITS>(w_ptr, k, row_bytes);
               qx_acc = fmaf(
-                  x_group_shared[k_local], fp8_e4m3_to_float(quant_val), qx_acc);
+                  x_group_shared[k_local],
+                  fp8_e4m3_to_float(quant_val),
+                  qx_acc);
             }
           } else {
-            for (int k_local = lane; k_local < group_len; k_local += kWarpSize) {
+            for (int k_local = lane; k_local < group_len;
+                 k_local += kThreadsPerCol) {
               int k = k_start + k_local;
               uint8_t quant_val =
                   unpack_packed_value_fast<BITS>(w_ptr, k, row_bytes);
               qx_acc = fmaf(
-                  x_group_shared[k_local], fp8_e4m3_to_float(quant_val), qx_acc);
+                  x_group_shared[k_local],
+                  fp8_e4m3_to_float(quant_val),
+                  qx_acc);
             }
           }
           acc = fmaf(scale, qx_acc, acc);
         } else {
           if (full_group) {
 #pragma unroll
-            for (int k_local = lane; k_local < GROUP_SIZE; k_local += kWarpSize) {
+            for (int k_local = lane; k_local < GROUP_SIZE;
+                 k_local += kThreadsPerCol) {
               int k = k_start + k_local;
               uint8_t quant_val =
                   unpack_packed_value_fast<BITS>(w_ptr, k, row_bytes);
@@ -1242,7 +1425,8 @@ __global__ void gather_qmv_warp_kernel(
               acc = fmaf(x_group_shared[k_local], w_val, acc);
             }
           } else {
-            for (int k_local = lane; k_local < group_len; k_local += kWarpSize) {
+            for (int k_local = lane; k_local < group_len;
+                 k_local += kThreadsPerCol) {
               int k = k_start + k_local;
               uint8_t quant_val =
                   unpack_packed_value_fast<BITS>(w_ptr, k, row_bytes);
@@ -1258,7 +1442,7 @@ __global__ void gather_qmv_warp_kernel(
     __syncthreads();
   }
 
-  acc = warp_reduce_sum_qmm(acc);
+  acc = subgroup_reduce_sum_qmm<kThreadsPerCol>(acc);
   if (valid && lane == 0) {
     out[batch * M * N + row * N + col] = static_cast<T>(acc);
   }
@@ -1311,8 +1495,28 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   int block_size = 256;
   dim3 grid(M, (N + block_size - 1) / block_size, B);
+  int fast_threads_per_col = (group_size_ == 16) ? 16 : WARP_SIZE;
+  int fast_threads_env =
+      parse_threads_per_col_env("MLX_ROCM_GATHER_QMV_THREADS_PER_COL");
+  if (fast_threads_env == 0) {
+    fast_threads_env =
+        parse_threads_per_col_env("MLX_ROCM_QMV_THREADS_PER_COL");
+  }
+  if (fast_threads_env > 0 && fast_threads_env <= WARP_SIZE &&
+      (WARP_SIZE % fast_threads_env) == 0) {
+    fast_threads_per_col = fast_threads_env;
+  }
   int fast_cols_per_block = select_gather_qmv_cols_per_block(K, N, bits_);
-  dim3 fast_block(WARP_SIZE, fast_cols_per_block);
+  if (group_size_ == 16 &&
+      parse_cols_per_block_env("MLX_ROCM_GATHER_QMV_COLS_PER_BLOCK") == 0 &&
+      parse_cols_per_block_env("MLX_ROCM_QMV_COLS_PER_BLOCK") == 0) {
+    fast_cols_per_block = min(32, fast_cols_per_block * (WARP_SIZE / 16));
+  }
+  int max_cols_per_block = rocm::kMaxThreadsPerBlock / fast_threads_per_col;
+  while (fast_cols_per_block > max_cols_per_block) {
+    fast_cols_per_block /= 2;
+  }
+  dim3 fast_block(fast_threads_per_col, fast_cols_per_block);
   dim3 fast_grid((N + fast_cols_per_block - 1) / fast_cols_per_block, M, B);
 
   bool use_fast_gather_qmv = true;
@@ -1335,107 +1539,183 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
                      lhs_indices_ptr,
                      rhs_indices_ptr,
                      out_ptr](hipStream_t stream) {
-#define LAUNCH_GATHER_QMV(T, ScaleT, BITS, GROUP_SIZE)                        \
-  if (mode_ == QuantizationMode::Affine) {                                    \
-    if (use_fast_gather_qmv) {                                                \
-      hipLaunchKernelGGL(                                                     \
-          (rocm::gather_qmv_warp_kernel<T, ScaleT, BITS, GROUP_SIZE, true>),  \
-          fast_grid,                                                          \
-          fast_block,                                                         \
-          0,                                                                  \
-          stream,                                                             \
-          static_cast<const T*>(x_ptr),                                       \
-          w_ptr,                                                              \
-          static_cast<const ScaleT*>(scales_ptr),                             \
-          has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr,        \
-          lhs_indices_ptr,                                                    \
-          rhs_indices_ptr,                                                    \
-          batch_shape_param,                                                  \
-          lhs_idx_strides_param,                                              \
-          rhs_idx_strides_param,                                              \
-          batch_ndim,                                                         \
-          static_cast<T*>(out_ptr),                                           \
-          B,                                                                  \
-          M,                                                                  \
-          N,                                                                  \
-          K,                                                                  \
-          E,                                                                  \
-          has_bias);                                                          \
-    } else {                                                                  \
-      hipLaunchKernelGGL(                                                     \
-          (rocm::gather_qmv_kernel<T, ScaleT, BITS, GROUP_SIZE, true>),       \
-          grid,                                                               \
-          dim3(block_size),                                                   \
-          0,                                                                  \
-          stream,                                                             \
-          static_cast<const T*>(x_ptr),                                       \
-          w_ptr,                                                              \
-          static_cast<const ScaleT*>(scales_ptr),                             \
-          has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr,        \
-          lhs_indices_ptr,                                                    \
-          rhs_indices_ptr,                                                    \
-          batch_shape_param,                                                  \
-          lhs_idx_strides_param,                                              \
-          rhs_idx_strides_param,                                              \
-          batch_ndim,                                                         \
-          static_cast<T*>(out_ptr),                                           \
-          B,                                                                  \
-          M,                                                                  \
-          N,                                                                  \
-          K,                                                                  \
-          E,                                                                  \
-          has_bias);                                                          \
-    }                                                                         \
-  } else {                                                                    \
-    if (use_fast_gather_qmv) {                                                \
-      hipLaunchKernelGGL(                                                     \
-          (rocm::gather_qmv_warp_kernel<T, ScaleT, BITS, GROUP_SIZE, false>), \
-          fast_grid,                                                          \
-          fast_block,                                                         \
-          0,                                                                  \
-          stream,                                                             \
-          static_cast<const T*>(x_ptr),                                       \
-          w_ptr,                                                              \
-          static_cast<const ScaleT*>(scales_ptr),                             \
-          has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr,        \
-          lhs_indices_ptr,                                                    \
-          rhs_indices_ptr,                                                    \
-          batch_shape_param,                                                  \
-          lhs_idx_strides_param,                                              \
-          rhs_idx_strides_param,                                              \
-          batch_ndim,                                                         \
-          static_cast<T*>(out_ptr),                                           \
-          B,                                                                  \
-          M,                                                                  \
-          N,                                                                  \
-          K,                                                                  \
-          E,                                                                  \
-          has_bias);                                                          \
-    } else {                                                                  \
-      hipLaunchKernelGGL(                                                     \
-          (rocm::gather_qmv_kernel<T, ScaleT, BITS, GROUP_SIZE, false>),      \
-          grid,                                                               \
-          dim3(block_size),                                                   \
-          0,                                                                  \
-          stream,                                                             \
-          static_cast<const T*>(x_ptr),                                       \
-          w_ptr,                                                              \
-          static_cast<const ScaleT*>(scales_ptr),                             \
-          has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr,        \
-          lhs_indices_ptr,                                                    \
-          rhs_indices_ptr,                                                    \
-          batch_shape_param,                                                  \
-          lhs_idx_strides_param,                                              \
-          rhs_idx_strides_param,                                              \
-          batch_ndim,                                                         \
-          static_cast<T*>(out_ptr),                                           \
-          B,                                                                  \
-          M,                                                                  \
-          N,                                                                  \
-          K,                                                                  \
-          E,                                                                  \
-          has_bias);                                                          \
-    }                                                                         \
+#define LAUNCH_GATHER_QMV(T, ScaleT, BITS, GROUP_SIZE)                   \
+  if (mode_ == QuantizationMode::Affine) {                               \
+    if (use_fast_gather_qmv) {                                           \
+      if (fast_threads_per_col == 16) {                                  \
+        hipLaunchKernelGGL(                                              \
+            (rocm::gather_qmv_warp_kernel<                               \
+                T,                                                       \
+                ScaleT,                                                  \
+                BITS,                                                    \
+                GROUP_SIZE,                                              \
+                true,                                                    \
+                16>),                                                    \
+            fast_grid,                                                   \
+            fast_block,                                                  \
+            0,                                                           \
+            stream,                                                      \
+            static_cast<const T*>(x_ptr),                                \
+            w_ptr,                                                       \
+            static_cast<const ScaleT*>(scales_ptr),                      \
+            has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr, \
+            lhs_indices_ptr,                                             \
+            rhs_indices_ptr,                                             \
+            batch_shape_param,                                           \
+            lhs_idx_strides_param,                                       \
+            rhs_idx_strides_param,                                       \
+            batch_ndim,                                                  \
+            static_cast<T*>(out_ptr),                                    \
+            B,                                                           \
+            M,                                                           \
+            N,                                                           \
+            K,                                                           \
+            E,                                                           \
+            has_bias);                                                   \
+      } else {                                                           \
+        hipLaunchKernelGGL(                                              \
+            (rocm::gather_qmv_warp_kernel<                               \
+                T,                                                       \
+                ScaleT,                                                  \
+                BITS,                                                    \
+                GROUP_SIZE,                                              \
+                true,                                                    \
+                WARP_SIZE>),                                             \
+            fast_grid,                                                   \
+            fast_block,                                                  \
+            0,                                                           \
+            stream,                                                      \
+            static_cast<const T*>(x_ptr),                                \
+            w_ptr,                                                       \
+            static_cast<const ScaleT*>(scales_ptr),                      \
+            has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr, \
+            lhs_indices_ptr,                                             \
+            rhs_indices_ptr,                                             \
+            batch_shape_param,                                           \
+            lhs_idx_strides_param,                                       \
+            rhs_idx_strides_param,                                       \
+            batch_ndim,                                                  \
+            static_cast<T*>(out_ptr),                                    \
+            B,                                                           \
+            M,                                                           \
+            N,                                                           \
+            K,                                                           \
+            E,                                                           \
+            has_bias);                                                   \
+      }                                                                  \
+    } else {                                                             \
+      hipLaunchKernelGGL(                                                \
+          (rocm::gather_qmv_kernel<T, ScaleT, BITS, GROUP_SIZE, true>),  \
+          grid,                                                          \
+          dim3(block_size),                                              \
+          0,                                                             \
+          stream,                                                        \
+          static_cast<const T*>(x_ptr),                                  \
+          w_ptr,                                                         \
+          static_cast<const ScaleT*>(scales_ptr),                        \
+          has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr,   \
+          lhs_indices_ptr,                                               \
+          rhs_indices_ptr,                                               \
+          batch_shape_param,                                             \
+          lhs_idx_strides_param,                                         \
+          rhs_idx_strides_param,                                         \
+          batch_ndim,                                                    \
+          static_cast<T*>(out_ptr),                                      \
+          B,                                                             \
+          M,                                                             \
+          N,                                                             \
+          K,                                                             \
+          E,                                                             \
+          has_bias);                                                     \
+    }                                                                    \
+  } else {                                                               \
+    if (use_fast_gather_qmv) {                                           \
+      if (fast_threads_per_col == 16) {                                  \
+        hipLaunchKernelGGL(                                              \
+            (rocm::gather_qmv_warp_kernel<                               \
+                T,                                                       \
+                ScaleT,                                                  \
+                BITS,                                                    \
+                GROUP_SIZE,                                              \
+                false,                                                   \
+                16>),                                                    \
+            fast_grid,                                                   \
+            fast_block,                                                  \
+            0,                                                           \
+            stream,                                                      \
+            static_cast<const T*>(x_ptr),                                \
+            w_ptr,                                                       \
+            static_cast<const ScaleT*>(scales_ptr),                      \
+            has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr, \
+            lhs_indices_ptr,                                             \
+            rhs_indices_ptr,                                             \
+            batch_shape_param,                                           \
+            lhs_idx_strides_param,                                       \
+            rhs_idx_strides_param,                                       \
+            batch_ndim,                                                  \
+            static_cast<T*>(out_ptr),                                    \
+            B,                                                           \
+            M,                                                           \
+            N,                                                           \
+            K,                                                           \
+            E,                                                           \
+            has_bias);                                                   \
+      } else {                                                           \
+        hipLaunchKernelGGL(                                              \
+            (rocm::gather_qmv_warp_kernel<                               \
+                T,                                                       \
+                ScaleT,                                                  \
+                BITS,                                                    \
+                GROUP_SIZE,                                              \
+                false,                                                   \
+                WARP_SIZE>),                                             \
+            fast_grid,                                                   \
+            fast_block,                                                  \
+            0,                                                           \
+            stream,                                                      \
+            static_cast<const T*>(x_ptr),                                \
+            w_ptr,                                                       \
+            static_cast<const ScaleT*>(scales_ptr),                      \
+            has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr, \
+            lhs_indices_ptr,                                             \
+            rhs_indices_ptr,                                             \
+            batch_shape_param,                                           \
+            lhs_idx_strides_param,                                       \
+            rhs_idx_strides_param,                                       \
+            batch_ndim,                                                  \
+            static_cast<T*>(out_ptr),                                    \
+            B,                                                           \
+            M,                                                           \
+            N,                                                           \
+            K,                                                           \
+            E,                                                           \
+            has_bias);                                                   \
+      }                                                                  \
+    } else {                                                             \
+      hipLaunchKernelGGL(                                                \
+          (rocm::gather_qmv_kernel<T, ScaleT, BITS, GROUP_SIZE, false>), \
+          grid,                                                          \
+          dim3(block_size),                                              \
+          0,                                                             \
+          stream,                                                        \
+          static_cast<const T*>(x_ptr),                                  \
+          w_ptr,                                                         \
+          static_cast<const ScaleT*>(scales_ptr),                        \
+          has_bias ? static_cast<const ScaleT*>(biases_ptr) : nullptr,   \
+          lhs_indices_ptr,                                               \
+          rhs_indices_ptr,                                               \
+          batch_shape_param,                                             \
+          lhs_idx_strides_param,                                         \
+          rhs_idx_strides_param,                                         \
+          batch_ndim,                                                    \
+          static_cast<T*>(out_ptr),                                      \
+          B,                                                             \
+          M,                                                             \
+          N,                                                             \
+          K,                                                             \
+          E,                                                             \
+          has_bias);                                                     \
+    }                                                                    \
   }
 
 #define DISPATCH_GROUP_SIZE_GATHER(T, ScaleT, BITS)  \
