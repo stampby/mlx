@@ -16,7 +16,7 @@ namespace mlx::core::rocm {
 namespace {
 
 // Can be tuned with MLX_MAX_OPS_PER_BUFFER
-constexpr int default_max_ops_per_buffer = 20;
+constexpr int default_max_ops_per_buffer = 1000;
 
 } // namespace
 
