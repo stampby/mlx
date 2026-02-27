@@ -2,7 +2,7 @@
 
 #pragma once
 
-#include "mlx/allocator.h"
+#include "mlx/backend/rocm/allocator.h"
 #include "mlx/backend/rocm/utils.h"
 #include "mlx/stream.h"
 
@@ -60,7 +60,8 @@ class AtomicEvent {
 
  private:
   std::atomic<uint64_t>* atomic() const {
-    return static_cast<std::atomic<uint64_t>*>(buf_->raw_ptr());
+    auto* rbuf = static_cast<RocmBuffer*>(buf_->ptr());
+    return static_cast<std::atomic<uint64_t>*>(rbuf->data);
   }
 
   std::shared_ptr<allocator::Buffer> buf_;

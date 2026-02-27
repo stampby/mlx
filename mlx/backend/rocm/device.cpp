@@ -179,6 +179,19 @@ void CommandEncoder::synchronize() {
 
 Device& device(mlx::core::Device device) {
   static std::unordered_map<int, Device> devices;
+  static bool flags_set = false;
+  if (!flags_set) {
+    flags_set = true;
+    // Set blocking sync for all devices to reduce CPU usage
+    int device_count = 0;
+    hipGetDeviceCount(&device_count);
+    for (int i = 0; i < device_count; i++) {
+      hipSetDevice(i);
+      hipSetDeviceFlags(hipDeviceScheduleBlockingSync);
+    }
+    // Restore default device
+    hipSetDevice(0);
+  }
   auto it = devices.find(device.index);
   if (it == devices.end()) {
     it = devices.try_emplace(device.index, device.index).first;

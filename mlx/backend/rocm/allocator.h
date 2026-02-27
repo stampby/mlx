@@ -20,6 +20,7 @@ struct RocmBuffer {
   void* data;
   size_t size;
   bool is_managed; // true if allocated with hipMallocManaged
+  int device; // -1 for managed/host, >= 0 for VRAM
 };
 
 class SmallSizePool {
@@ -32,6 +33,7 @@ class SmallSizePool {
   Block* buffer_{nullptr};
   void* data_{nullptr};
   Block* next_free_{nullptr};
+  bool is_managed_{false};
 
  public:
   SmallSizePool();
@@ -50,6 +52,8 @@ class RocmAllocator : public allocator::Allocator {
   Buffer malloc(size_t size) override;
   void free(Buffer buffer) override;
   size_t size(Buffer buffer) const override;
+
+  void move_to_unified_memory(RocmBuffer& buf);
 
   size_t get_active_memory() const;
   size_t get_peak_memory() const;
