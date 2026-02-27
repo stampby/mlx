@@ -125,6 +125,36 @@ void rocblas_gemm(
             ldc);
         break;
       }
+      case bfloat16: {
+        float alpha_f = alpha;
+        float beta_f = beta;
+        rocblas_gemm_ex(
+            handle,
+            op_b,
+            op_a,
+            N,
+            M,
+            K,
+            &alpha_f,
+            b_ptr,
+            rocblas_datatype_bf16_r,
+            ldb,
+            a_ptr,
+            rocblas_datatype_bf16_r,
+            lda,
+            &beta_f,
+            c_ptr,
+            rocblas_datatype_bf16_r,
+            ldc,
+            c_ptr,
+            rocblas_datatype_bf16_r,
+            ldc,
+            rocblas_datatype_f32_r, // compute type
+            rocblas_gemm_algo_standard,
+            0, // solution index
+            0); // flags
+        break;
+      }
       default:
         throw std::runtime_error("Unsupported dtype for rocBLAS GEMM");
     }
@@ -237,6 +267,41 @@ void rocblas_gemm_batched(
             ldc,
             stride_c,
             batch_count);
+        break;
+      }
+      case bfloat16: {
+        float alpha_f = alpha;
+        float beta_f = beta;
+        rocblas_gemm_strided_batched_ex(
+            handle,
+            op_b,
+            op_a,
+            N,
+            M,
+            K,
+            &alpha_f,
+            b_ptr,
+            rocblas_datatype_bf16_r,
+            ldb,
+            stride_b,
+            a_ptr,
+            rocblas_datatype_bf16_r,
+            lda,
+            stride_a,
+            &beta_f,
+            c_ptr,
+            rocblas_datatype_bf16_r,
+            ldc,
+            stride_c,
+            c_ptr,
+            rocblas_datatype_bf16_r,
+            ldc,
+            stride_c,
+            batch_count,
+            rocblas_datatype_f32_r,
+            rocblas_gemm_algo_standard,
+            0,
+            0);
         break;
       }
       default:
