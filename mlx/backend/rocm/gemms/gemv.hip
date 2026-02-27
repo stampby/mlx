@@ -11,7 +11,7 @@
 
 namespace mlx::core::rocm {
 
-static constexpr int rows_per_block = 8;
+static constexpr int rows_per_block = 16;
 static constexpr int kMaxInlineBatchDims = 8;
 
 struct GemvBatchParams {
@@ -92,14 +92,13 @@ gemv_impl(const T* mat, const T* vec, T* out, int rows, int cols) {
     // Each thread processes multiple elements
     for (int col = n_per_thread * threadIdx.x; col < cols;
          col += (WARP_SIZE * n_per_thread)) {
-      // Load and accumulate
+      // Load and accumulate using vectorized loads if possible
+      auto mat_v = load_vector<n_per_thread>(mat + row * cols, col / n_per_thread, cols, T(0));
+      auto vec_v = load_vector<n_per_thread>(vec, col / n_per_thread, cols, T(0));
+
 #pragma unroll
       for (int j = 0; j < n_per_thread; ++j) {
-        int idx = col + j;
-        if (idx < cols) {
-          sum += static_cast<Acc>(mat[row * cols + idx]) *
-              static_cast<Acc>(vec[idx]);
-        }
+        sum += static_cast<Acc>(mat_v[j]) * static_cast<Acc>(vec_v[j]);
       }
     }
 
@@ -364,6 +363,12 @@ void dispatch_n_per_thread(int n_per_thread, F&& f) {
     case 4:
       f(std::integral_constant<int, 4>{});
       break;
+    case 8:
+      f(std::integral_constant<int, 8>{});
+      break;
+    case 16:
+      f(std::integral_constant<int, 16>{});
+      break;
   }
 }
 
@@ -412,7 +417,11 @@ void gemv(
 
   // Determine n_per_thread based on alignment
   int n_per_t = 1;
-  if (K % 128 == 0) {
+  if (K % 512 == 0) {
+    n_per_t = 16;
+  } else if (K % 256 == 0) {
+    n_per_t = 8;
+  } else if (K % 128 == 0) {
     n_per_t = 4;
   } else if (K % 64 == 0) {
     n_per_t = 2;
