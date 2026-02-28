@@ -125,6 +125,13 @@ void Device::make_current() {
   }
 }
 
+void Device::set_rocblas_stream(hipStream_t stream) {
+  if (rocblas_stream_ != stream) {
+    rocblas_set_stream(get_rocblas_handle(), stream);
+    rocblas_stream_ = stream;
+  }
+}
+
 CommandEncoder& Device::get_command_encoder(Stream s) {
   auto it = encoders_.find(s.index);
   if (it == encoders_.end()) {

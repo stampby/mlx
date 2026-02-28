@@ -28,6 +28,26 @@ void sdpa_vector(
     const std::optional<array>& sinks,
     Stream s);
 
+// Defined in flash_attention.hip
+bool supports_sdpa_flash(
+    const array& q,
+    const array& k,
+    const array& v,
+    bool has_mask,
+    bool has_arr_mask,
+    bool do_causal,
+    bool output_logsumexp);
+
+void sdpa_flash(
+    const array& q,
+    const array& k,
+    const array& v,
+    float scale,
+    array& o,
+    bool do_causal,
+    const std::optional<array>& sinks,
+    Stream s);
+
 namespace {
 
 array prepare_sdpa_input(const array& x, Stream s) {
@@ -57,7 +77,9 @@ bool ScaledDotProductAttention::use_fallback(
     bool output_logsumexp,
     Stream /*s*/) {
   return !supports_sdpa_vector(
-      q, k, v, has_mask, has_arr_mask, do_causal, output_logsumexp);
+             q, k, v, has_mask, has_arr_mask, do_causal, output_logsumexp) &&
+      !supports_sdpa_flash(
+          q, k, v, has_mask, has_arr_mask, do_causal, output_logsumexp);
 }
 
 bool ScaledDotProductAttention::supports_bool_mask() {
@@ -88,6 +110,19 @@ void ScaledDotProductAttention::eval_gpu(
       sdpa_vector(q, k, v, scale_, out, do_causal_, inputs.back(), s);
     } else {
       sdpa_vector(q, k, v, scale_, out, do_causal_, std::nullopt, s);
+    }
+  } else if (supports_sdpa_flash(
+                 q,
+                 k,
+                 v,
+                 has_mask,
+                 has_arr_mask,
+                 do_causal_,
+                 output_logsumexp_)) {
+    if (has_sinks_) {
+      sdpa_flash(q, k, v, scale_, out, do_causal_, inputs.back(), s);
+    } else {
+      sdpa_flash(q, k, v, scale_, out, do_causal_, std::nullopt, s);
     }
   } else {
     // Fallback: compute attention manually

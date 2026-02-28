@@ -89,7 +89,7 @@ void gemm_rocblas(
   void* out_ptr = gpu_ptr<void>(out);
 
   encoder.launch_kernel([&, a_ptr, b_ptr, out_ptr](hipStream_t stream) {
-    rocblas_set_stream(handle, stream);
+    encoder.device().set_rocblas_stream(stream);
 
     switch (a.dtype()) {
       case float32: {
@@ -228,7 +228,7 @@ void gemm_strided_batched_rocblas(
   void* out_ptr = gpu_ptr<void>(out);
 
   encoder.launch_kernel([&, a_ptr, b_ptr, out_ptr](hipStream_t stream) {
-    rocblas_set_stream(handle, stream);
+    encoder.device().set_rocblas_stream(stream);
 
     switch (a.dtype()) {
       case float32: {
@@ -503,8 +503,7 @@ void gemm_and_bias(
                                b_ptr_base,
                                out_ptr_base](hipStream_t stream) {
           auto& device = encoder.device();
-          rocblas_handle handle = device.get_rocblas_handle();
-          rocblas_set_stream(handle, stream);
+          device.set_rocblas_stream(stream);
 
           rocblas_operation trans_a = b_transposed ? rocblas_operation_transpose
                                                    : rocblas_operation_none;

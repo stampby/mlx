@@ -85,6 +85,7 @@ class Device {
   }
 
   rocblas_handle get_rocblas_handle();
+  void set_rocblas_stream(hipStream_t stream);
 
   // Check if rocBLAS is available for the current GPU architecture
   bool is_rocblas_available();
@@ -92,6 +93,7 @@ class Device {
  private:
   int device_;
   rocblas_handle rocblas_{nullptr};
+  hipStream_t rocblas_stream_{nullptr};
   bool rocblas_initialized_{false};
   bool rocblas_available_{true};
   std::unordered_map<int, std::unique_ptr<CommandEncoder>> encoders_;

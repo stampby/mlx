@@ -73,8 +73,8 @@ void rocblas_gemm(
   void* c_ptr = gpu_ptr<void>(c);
 
   encoder.launch_kernel([&, a_ptr, b_ptr, c_ptr](hipStream_t stream) {
+    encoder.device().set_rocblas_stream(stream);
     rocblas_handle handle = encoder.device().get_rocblas_handle();
-    rocblas_set_stream(handle, stream);
 
     rocblas_operation op_a = to_rocblas_op(transpose_a);
     rocblas_operation op_b = to_rocblas_op(transpose_b);
@@ -210,8 +210,8 @@ void rocblas_gemm_batched(
   void* c_ptr = gpu_ptr<void>(c);
 
   encoder.launch_kernel([&, a_ptr, b_ptr, c_ptr](hipStream_t stream) {
+    encoder.device().set_rocblas_stream(stream);
     rocblas_handle handle = encoder.device().get_rocblas_handle();
-    rocblas_set_stream(handle, stream);
 
     rocblas_operation op_a = to_rocblas_op(transpose_a);
     rocblas_operation op_b = to_rocblas_op(transpose_b);
