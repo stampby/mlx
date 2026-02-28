@@ -47,19 +47,17 @@ array prepare_sdpa_input(const array& x, Stream s) {
 namespace fast {
 
 bool ScaledDotProductAttention::use_fallback(
-    const array& /*q*/,
-    const array& /*k*/,
-    const array& /*v*/,
-    bool /*has_mask*/,
-    bool /*has_arr_mask*/,
-    bool /*do_causal*/,
+    const array& q,
+    const array& k,
+    const array& v,
+    bool has_mask,
+    bool has_arr_mask,
+    bool do_causal,
     bool /*is_training*/,
-    bool /*output_logsumexp*/,
+    bool output_logsumexp,
     Stream /*s*/) {
-  // The ROCm SDPA vector kernel is currently unstable for several valid input
-  // configurations (notably GQA and causal masking). Always use the primitive
-  // fallback for correctness and to avoid GPU memory faults.
-  return true;
+  return !supports_sdpa_vector(
+      q, k, v, has_mask, has_arr_mask, do_causal, output_logsumexp);
 }
 
 bool ScaledDotProductAttention::supports_bool_mask() {

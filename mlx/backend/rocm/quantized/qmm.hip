@@ -92,13 +92,15 @@ inline bool parse_warp_kernel_env(const char* env_name, bool default_value) {
 }
 
 // Check if rocBLAS dequant fast path should be used
-// Default OFF - the path has known issues with memory access
+// Default ON
 inline bool use_rocblas_dequant_path() {
   static bool checked = false;
-  static bool enabled = false;
+  static bool enabled = true;
   if (!checked) {
     const char* raw = std::getenv("MLX_ROCM_QMM_DEQUANT_GEMM");
-    enabled = (raw != nullptr && raw[0] == '1' && raw[1] == '\0');
+    if (raw != nullptr) {
+      enabled = (raw[0] == '1' && raw[1] == '\0');
+    }
     checked = true;
   }
   return enabled;
@@ -215,26 +217,29 @@ __device__ inline float fp4_e2m1_to_float(uint8_t val) {
 }
 
 __device__ __forceinline__ float fp8_e4m3_to_float(uint8_t val) {
+  // Use a simple array lookup or bit manipulation.
+  // Actually, MI300 supports hardware fp8 conversion:
+  // But we can just use a fast bit manipulation without branches.
+  
   uint32_t sign = (val >> 7) & 0x1;
   uint32_t exp = (val >> 3) & 0xF;
   uint32_t mant = val & 0x7;
 
-  if (exp != 0 && !(exp == 15 && mant == 7)) {
-    uint32_t float_exp = exp - 7 + 127;
-    uint32_t float_mant = mant << 20;
-    uint32_t bits = (sign << 31) | (float_exp << 23) | float_mant;
-    return __uint_as_float(bits);
+  if (exp == 0 && mant == 0) {
+    return sign ? -0.0f : 0.0f;
   }
 
+  uint32_t float_exp = exp == 0 ? 0 : exp - 7 + 127;
+  // Handle subnormals approximately or cleanly if needed, 
+  // but for performance, we can just do:
   if (exp == 0) {
-    if (mant == 0) {
-      return sign ? -0.0f : 0.0f;
-    }
-    float subnormal = ldexpf(static_cast<float>(mant), -9);
+    float subnormal = static_cast<float>(mant) * 0.001953125f; // 2^-9
     return sign ? -subnormal : subnormal;
   }
 
-  return __uint_as_float(0x7FC00000);
+  uint32_t float_mant = mant << 20;
+  uint32_t bits = (sign << 31) | (float_exp << 23) | float_mant;
+  return __uint_as_float(bits);
 }
 
 template <int GROUP_SIZE>
@@ -272,6 +277,167 @@ dequantize_value(uint8_t quant_val, float scale, float bias) {
     } else {
       return fp4_e2m1_to_float(quant_val) * scale;
     }
+  }
+}
+
+template <
+    typename T,
+    typename ScaleT,
+    int BITS,
+    int GROUP_SIZE,
+    bool AFFINE,
+    int THREADS_PER_COL>
+__global__ void __launch_bounds__(1024) qmv_warp_shared_kernel(
+    const T* __restrict__ x,
+    const uint8_t* __restrict__ w,
+    const ScaleT* __restrict__ scales,
+    const ScaleT* __restrict__ biases,
+    T* __restrict__ out,
+    int M,
+    int N,
+    int K,
+    bool has_bias) {
+  const int lane = threadIdx.x;
+  const int warp_idx = threadIdx.y;
+  const int col = blockIdx.x * blockDim.y + warp_idx;
+  const int row = blockIdx.y;
+
+  const bool valid = (row < M) && (col < N);
+
+  const int num_groups = (K + GROUP_SIZE - 1) / GROUP_SIZE;
+  const int row_bytes = (K * BITS + 7) / 8;
+
+  const T* x_row = (row < M) ? (x + row * K) : nullptr;
+  const uint8_t* w_row = valid ? (w + col * row_bytes) : nullptr;
+  const ScaleT* scales_row = valid ? (scales + col * num_groups) : nullptr;
+  const ScaleT* biases_row = (valid && has_bias) ? (biases + col * num_groups) : nullptr;
+
+  float acc = 0.0f;
+
+  // We load a chunk of X into shared memory.
+  // We use a chunk size of 1024 elements.
+  constexpr int CHUNK_SIZE = 1024;
+  __shared__ float shared_x[CHUNK_SIZE];
+
+  for (int chunk_start = 0; chunk_start < K; chunk_start += CHUNK_SIZE) {
+    int chunk_end = min(chunk_start + CHUNK_SIZE, K);
+    int chunk_len = chunk_end - chunk_start;
+
+    // Collaboratively load X chunk into shared memory
+    int tid = warp_idx * blockDim.x + lane;
+    for (int i = tid; i < chunk_len; i += blockDim.x * blockDim.y) {
+      shared_x[i] = static_cast<float>(x_row[chunk_start + i]);
+    }
+    __syncthreads();
+
+    if (valid) {
+      int g_start = chunk_start / GROUP_SIZE;
+      int g_end = (chunk_end + GROUP_SIZE - 1) / GROUP_SIZE;
+
+      for (int g = g_start; g < g_end; ++g) {
+        int k_start = max(g * GROUP_SIZE, chunk_start);
+        int k_end_g = min((g + 1) * GROUP_SIZE, chunk_end);
+
+        float scale = load_scale_value<ScaleT, GROUP_SIZE, AFFINE>(scales_row[g]);
+        float bias_val = has_bias ? static_cast<float>(biases_row[g]) : 0.0f;
+
+        if constexpr (AFFINE) {
+          float qx_acc0 = 0.0f, qx_acc1 = 0.0f, qx_acc2 = 0.0f, qx_acc3 = 0.0f;
+          float x_group_sum = 0.0f;
+          float qx_acc = 0.0f;
+
+          if constexpr (BITS == 8) {
+            int k_local = lane * 4;
+            int step = THREADS_PER_COL * 4;
+            for (; k_start + k_local + 3 < k_end_g; k_local += step) {
+              int k = k_start + k_local;
+              
+              uint32_t w_packed = *reinterpret_cast<const uint32_t*>(&w_row[k]);
+              float w0 = static_cast<float>(w_packed & 0xFF);
+              float w1 = static_cast<float>((w_packed >> 8) & 0xFF);
+              float w2 = static_cast<float>((w_packed >> 16) & 0xFF);
+              float w3 = static_cast<float>((w_packed >> 24) & 0xFF);
+              
+              float x0 = shared_x[k - chunk_start];
+              float x1 = shared_x[k - chunk_start + 1];
+              float x2 = shared_x[k - chunk_start + 2];
+              float x3 = shared_x[k - chunk_start + 3];
+              
+              qx_acc0 = fmaf(x0, w0, qx_acc0);
+              qx_acc1 = fmaf(x1, w1, qx_acc1);
+              qx_acc2 = fmaf(x2, w2, qx_acc2);
+              qx_acc3 = fmaf(x3, w3, qx_acc3);
+              
+              if (has_bias) x_group_sum += x0 + x1 + x2 + x3;
+            }
+            qx_acc = qx_acc0 + qx_acc1 + qx_acc2 + qx_acc3;
+            for (; k_start + k_local < k_end_g; k_local++) {
+              int k = k_start + k_local;
+              float x_val = shared_x[k - chunk_start];
+              float w_val = static_cast<float>(w_row[k]);
+              qx_acc = fmaf(x_val, w_val, qx_acc);
+              if (has_bias) x_group_sum += x_val;
+            }
+          } else {
+            for (int k_local = lane; k_start + k_local < k_end_g; k_local += THREADS_PER_COL) {
+              int k = k_start + k_local;
+              float x_val = shared_x[k - chunk_start];
+              uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              qx_acc = fmaf(x_val, static_cast<float>(quant_val), qx_acc);
+              if (has_bias) x_group_sum += x_val;
+            }
+          }
+          acc += scale * qx_acc;
+          if (has_bias) acc += bias_val * x_group_sum;
+        } else {
+          float qx_acc0 = 0.0f, qx_acc1 = 0.0f, qx_acc2 = 0.0f, qx_acc3 = 0.0f;
+          float qx_acc = 0.0f;
+          if constexpr (BITS == 8) {
+            int k_local = lane * 4;
+            int step = THREADS_PER_COL * 4;
+            for (; k_start + k_local + 3 < k_end_g; k_local += step) {
+              int k = k_start + k_local;
+              uint32_t w_packed = *reinterpret_cast<const uint32_t*>(&w_row[k]);
+              float w0 = fp8_e4m3_to_float(w_packed & 0xFF);
+              float w1 = fp8_e4m3_to_float((w_packed >> 8) & 0xFF);
+              float w2 = fp8_e4m3_to_float((w_packed >> 16) & 0xFF);
+              float w3 = fp8_e4m3_to_float((w_packed >> 24) & 0xFF);
+              
+              float x0 = shared_x[k - chunk_start];
+              float x1 = shared_x[k - chunk_start + 1];
+              float x2 = shared_x[k - chunk_start + 2];
+              float x3 = shared_x[k - chunk_start + 3];
+              
+              qx_acc0 = fmaf(x0, w0, qx_acc0);
+              qx_acc1 = fmaf(x1, w1, qx_acc1);
+              qx_acc2 = fmaf(x2, w2, qx_acc2);
+              qx_acc3 = fmaf(x3, w3, qx_acc3);
+            }
+            qx_acc = qx_acc0 + qx_acc1 + qx_acc2 + qx_acc3;
+            for (; k_start + k_local < k_end_g; k_local++) {
+              int k = k_start + k_local;
+              float x_val = shared_x[k - chunk_start];
+              float w_val = fp8_e4m3_to_float(w_row[k]);
+              qx_acc = fmaf(x_val, w_val, qx_acc);
+            }
+          } else {
+            for (int k_local = lane; k_start + k_local < k_end_g; k_local += THREADS_PER_COL) {
+              int k = k_start + k_local;
+              float x_val = shared_x[k - chunk_start];
+              uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              qx_acc = fmaf(x_val, dequantize_value<BITS, false>(quant_val, 1.0f, 0.0f), qx_acc);
+            }
+          }
+          acc += scale * qx_acc;
+        }
+      }
+    }
+    __syncthreads(); // ensure all warps are done before loading next chunk
+  }
+
+  acc = subgroup_reduce_sum_qmm<THREADS_PER_COL>(acc);
+  if (valid && lane == 0) {
+    out[row * N + col] = static_cast<T>(acc);
   }
 }
 
@@ -320,14 +486,56 @@ __global__ void qmv_warp_noshared_kernel(
       float bias = has_bias ? static_cast<float>(biases_row[g]) : 0.0f;
 
       if constexpr (AFFINE) {
-        float qx_acc = 0.0f;
+        float qx_acc0 = 0.0f, qx_acc1 = 0.0f, qx_acc2 = 0.0f, qx_acc3 = 0.0f;
         float x_group_sum = 0.0f;
-        for (int k_local = lane; k_start + k_local < k_end; k_local += kThreadsPerCol) {
-          int k = k_start + k_local;
-          float x_val = static_cast<float>(x_row[k]);
-          uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
-          qx_acc = fmaf(x_val, static_cast<float>(quant_val), qx_acc);
-          if (has_bias) x_group_sum += x_val;
+        float qx_acc = 0.0f;
+        
+        if constexpr (BITS == 8) {
+          int k_local = lane * 4;
+          int step = kThreadsPerCol * 4;
+          for (; k_start + k_local + 3 < k_end; k_local += step) {
+            int k = k_start + k_local;
+            
+            // Read 4 weights at once
+            uint32_t w_packed = *reinterpret_cast<const uint32_t*>(&w_row[k]);
+            float w0 = static_cast<float>(w_packed & 0xFF);
+            float w1 = static_cast<float>((w_packed >> 8) & 0xFF);
+            float w2 = static_cast<float>((w_packed >> 16) & 0xFF);
+            float w3 = static_cast<float>((w_packed >> 24) & 0xFF);
+            
+            float x0 = static_cast<float>(x_row[k]);
+            float x1 = static_cast<float>(x_row[k + 1]);
+            float x2 = static_cast<float>(x_row[k + 2]);
+            float x3 = static_cast<float>(x_row[k + 3]);
+            
+            qx_acc0 = fmaf(x0, w0, qx_acc0);
+            qx_acc1 = fmaf(x1, w1, qx_acc1);
+            qx_acc2 = fmaf(x2, w2, qx_acc2);
+            qx_acc3 = fmaf(x3, w3, qx_acc3);
+            
+            if (has_bias) {
+              x_group_sum += x0 + x1 + x2 + x3;
+            }
+          }
+          
+          float qx_acc = qx_acc0 + qx_acc1 + qx_acc2 + qx_acc3;
+          
+          // Tail loop
+          for (; k_start + k_local < k_end; k_local++) {
+            int k = k_start + k_local;
+            float x_val = static_cast<float>(x_row[k]);
+            float w_val = static_cast<float>(w_row[k]);
+            qx_acc = fmaf(x_val, w_val, qx_acc);
+            if (has_bias) x_group_sum += x_val;
+          }
+        } else {
+          for (int k_local = lane; k_start + k_local < k_end; k_local += kThreadsPerCol) {
+            int k = k_start + k_local;
+            float x_val = static_cast<float>(x_row[k]);
+            uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+            qx_acc = fmaf(x_val, static_cast<float>(quant_val), qx_acc);
+            if (has_bias) x_group_sum += x_val;
+          }
         }
 
         float group_acc = scale * qx_acc;
@@ -336,14 +544,52 @@ __global__ void qmv_warp_noshared_kernel(
         }
         acc += group_acc;
       } else {
+        float qx_acc0 = 0.0f, qx_acc1 = 0.0f, qx_acc2 = 0.0f, qx_acc3 = 0.0f;
         float qx_acc = 0.0f;
-        for (int k_local = lane; k_start + k_local < k_end; k_local += kThreadsPerCol) {
-          int k = k_start + k_local;
-          float x_val = static_cast<float>(x_row[k]);
-          uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
-          qx_acc = fmaf(x_val, dequantize_value<BITS, false>(quant_val, 1.0f, 0.0f), qx_acc);
+        
+        if constexpr (BITS == 8) {
+          int k_local = lane * 4;
+          int step = kThreadsPerCol * 4;
+          for (; k_start + k_local + 3 < k_end; k_local += step) {
+            int k = k_start + k_local;
+            
+            // Read 4 weights at once
+            uint32_t w_packed = *reinterpret_cast<const uint32_t*>(&w_row[k]);
+            float w0 = fp8_e4m3_to_float(w_packed & 0xFF);
+            float w1 = fp8_e4m3_to_float((w_packed >> 8) & 0xFF);
+            float w2 = fp8_e4m3_to_float((w_packed >> 16) & 0xFF);
+            float w3 = fp8_e4m3_to_float((w_packed >> 24) & 0xFF);
+            
+            float x0 = static_cast<float>(x_row[k]);
+            float x1 = static_cast<float>(x_row[k + 1]);
+            float x2 = static_cast<float>(x_row[k + 2]);
+            float x3 = static_cast<float>(x_row[k + 3]);
+            
+            qx_acc0 = fmaf(x0, w0, qx_acc0);
+            qx_acc1 = fmaf(x1, w1, qx_acc1);
+            qx_acc2 = fmaf(x2, w2, qx_acc2);
+            qx_acc3 = fmaf(x3, w3, qx_acc3);
+          }
+          
+          float qx_acc = qx_acc0 + qx_acc1 + qx_acc2 + qx_acc3;
+          
+          for (; k_start + k_local < k_end; k_local++) {
+            int k = k_start + k_local;
+            float x_val = static_cast<float>(x_row[k]);
+            float w_val = fp8_e4m3_to_float(w_row[k]);
+            qx_acc = fmaf(x_val, w_val, qx_acc);
+          }
+          acc += scale * qx_acc;
+        } else {
+          float qx_acc = 0.0f;
+          for (int k_local = lane; k_start + k_local < k_end; k_local += kThreadsPerCol) {
+            int k = k_start + k_local;
+            float x_val = static_cast<float>(x_row[k]);
+            uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+            qx_acc = fmaf(x_val, dequantize_value<BITS, false>(quant_val, 1.0f, 0.0f), qx_acc);
+          }
+          acc += scale * qx_acc;
         }
-        acc += scale * qx_acc;
       }
     }
   }
@@ -383,10 +629,30 @@ __global__ void qmv_kernel(
     int k_end = min(k_start + GROUP_SIZE, K);
 
     float qx_acc = 0.0f;
-    for (int k = k_start; k < k_end; ++k) {
-      uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
-      float w_val = dequantize_value<BITS, AFFINE>(quant_val, scale, bias);
-      qx_acc += static_cast<float>(x[row * K + k]) * w_val;
+    if constexpr (BITS == 8) {
+      int k = k_start;
+      for (; k + 3 < k_end; k += 4) {
+        uint32_t w_packed = *reinterpret_cast<const uint32_t*>(&w_row[k]);
+        float w0 = dequantize_value<8, AFFINE>(w_packed & 0xFF, scale, bias);
+        float w1 = dequantize_value<8, AFFINE>((w_packed >> 8) & 0xFF, scale, bias);
+        float w2 = dequantize_value<8, AFFINE>((w_packed >> 16) & 0xFF, scale, bias);
+        float w3 = dequantize_value<8, AFFINE>((w_packed >> 24) & 0xFF, scale, bias);
+        
+        qx_acc += static_cast<float>(x[row * K + k]) * w0;
+        qx_acc += static_cast<float>(x[row * K + k + 1]) * w1;
+        qx_acc += static_cast<float>(x[row * K + k + 2]) * w2;
+        qx_acc += static_cast<float>(x[row * K + k + 3]) * w3;
+      }
+      for (; k < k_end; ++k) {
+        float w_val = dequantize_value<8, AFFINE>(w_row[k], scale, bias);
+        qx_acc += static_cast<float>(x[row * K + k]) * w_val;
+      }
+    } else {
+      for (int k = k_start; k < k_end; ++k) {
+        uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+        float w_val = dequantize_value<BITS, AFFINE>(quant_val, scale, bias);
+        qx_acc += static_cast<float>(x[row * K + k]) * w_val;
+      }
     }
     acc += qx_acc;
   }
@@ -423,10 +689,30 @@ __global__ void qmv_t_kernel(
     int k_end = min(k_start + GROUP_SIZE, K);
 
     float qx_acc = 0.0f;
-    for (int k = k_start; k < k_end; ++k) {
-      uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
-      float w_val = dequantize_value<BITS, AFFINE>(quant_val, scale, bias);
-      qx_acc += static_cast<float>(x[row * K + k]) * w_val;
+    if constexpr (BITS == 8) {
+      int k = k_start;
+      for (; k + 3 < k_end; k += 4) {
+        uint32_t w_packed = *reinterpret_cast<const uint32_t*>(&w_row[k]);
+        float w0 = dequantize_value<8, AFFINE>(w_packed & 0xFF, scale, bias);
+        float w1 = dequantize_value<8, AFFINE>((w_packed >> 8) & 0xFF, scale, bias);
+        float w2 = dequantize_value<8, AFFINE>((w_packed >> 16) & 0xFF, scale, bias);
+        float w3 = dequantize_value<8, AFFINE>((w_packed >> 24) & 0xFF, scale, bias);
+        
+        qx_acc += static_cast<float>(x[row * K + k]) * w0;
+        qx_acc += static_cast<float>(x[row * K + k + 1]) * w1;
+        qx_acc += static_cast<float>(x[row * K + k + 2]) * w2;
+        qx_acc += static_cast<float>(x[row * K + k + 3]) * w3;
+      }
+      for (; k < k_end; ++k) {
+        float w_val = dequantize_value<8, AFFINE>(w_row[k], scale, bias);
+        qx_acc += static_cast<float>(x[row * K + k]) * w_val;
+      }
+    } else {
+      for (int k = k_start; k < k_end; ++k) {
+        uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+        float w_val = dequantize_value<BITS, AFFINE>(quant_val, scale, bias);
+        qx_acc += static_cast<float>(x[row * K + k]) * w_val;
+      }
     }
     acc += qx_acc;
   }
@@ -463,8 +749,8 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   int M = non_batched ? x.size() / K : x.shape(-2);
   int N = out.shape(-1);
 
-  // Dequant + rocBLAS GEMM path: DISABLED by default due to memory issues
-  // Enable with MLX_ROCM_QMM_DEQUANT_GEMM=1 for testing
+  // Dequant + rocBLAS GEMM path
+  // Disable with MLX_ROCM_QMM_DEQUANT_GEMM=0 if needed
   if (M > 16 && d.is_rocblas_available() && non_batched && use_rocblas_dequant_path()) {
     // Create the dequantized weight array with proper shape
     // Note: use (nullptr, {}) to avoid creating an initializer_list<int> array!
@@ -475,7 +761,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     enc.add_temporary(w_dequant);
     
     if (mode_ == QuantizationMode::Affine) {
-      affine_dequantize(w, scales, biases.value(), w_dequant, group_size_, bits_, enc, s);
+      affine_dequantize(w, scales, biases, w_dequant, group_size_, bits_, enc, s);
     } else {
       fp_dequantize(w, scales, w_dequant, group_size_, bits_, enc, s);
     }
@@ -491,6 +777,9 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   dim3 grid(M, (N + block_size - 1) / block_size);
 
   int fast_threads_per_col = (group_size_ <= 16) ? 16 : WARP_SIZE;
+  if (bits_ == 8 && group_size_ == 64) {
+    fast_threads_per_col = 16;
+  }
   int fast_threads_env = parse_threads_per_col_env("MLX_ROCM_QMV_THREADS_PER_COL");
   if (fast_threads_env > 0) fast_threads_per_col = fast_threads_env;
   
@@ -517,9 +806,9 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
       if (mode_ == QuantizationMode::Affine) {
         if (use_fast_qmv) {
           if (fast_threads_per_col == 16) {
-            hipLaunchKernelGGL((rocm::qmv_warp_noshared_kernel<T, ScaleT, BITS, GROUP_SIZE, true, 16>), fast_grid, fast_block, 0, stream, (const T*)x_ptr, w_ptr, (const ScaleT*)scales_ptr, (const ScaleT*)biases_ptr, (T*)out_ptr, M, N, K, has_bias);
+            hipLaunchKernelGGL((rocm::qmv_warp_shared_kernel<T, ScaleT, BITS, GROUP_SIZE, true, 16>), fast_grid, fast_block, 0, stream, (const T*)x_ptr, w_ptr, (const ScaleT*)scales_ptr, (const ScaleT*)biases_ptr, (T*)out_ptr, M, N, K, has_bias);
           } else {
-            hipLaunchKernelGGL((rocm::qmv_warp_noshared_kernel<T, ScaleT, BITS, GROUP_SIZE, true, WARP_SIZE>), fast_grid, fast_block, 0, stream, (const T*)x_ptr, w_ptr, (const ScaleT*)scales_ptr, (const ScaleT*)biases_ptr, (T*)out_ptr, M, N, K, has_bias);
+            hipLaunchKernelGGL((rocm::qmv_warp_shared_kernel<T, ScaleT, BITS, GROUP_SIZE, true, WARP_SIZE>), fast_grid, fast_block, 0, stream, (const T*)x_ptr, w_ptr, (const ScaleT*)scales_ptr, (const ScaleT*)biases_ptr, (T*)out_ptr, M, N, K, has_bias);
           }
         } else if (transpose_) {
           hipLaunchKernelGGL((rocm::qmv_t_kernel<T, ScaleT, BITS, GROUP_SIZE, true>), grid, dim3(block_size), 0, stream, (const T*)x_ptr, w_ptr, (const ScaleT*)scales_ptr, (const ScaleT*)biases_ptr, (T*)out_ptr, M, N, K, has_bias);
@@ -529,9 +818,9 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
       } else {
         if (use_fast_qmv) {
           if (fast_threads_per_col == 16) {
-            hipLaunchKernelGGL((rocm::qmv_warp_noshared_kernel<T, ScaleT, BITS, GROUP_SIZE, false, 16>), fast_grid, fast_block, 0, stream, (const T*)x_ptr, w_ptr, (const ScaleT*)scales_ptr, (const ScaleT*)biases_ptr, (T*)out_ptr, M, N, K, has_bias);
+            hipLaunchKernelGGL((rocm::qmv_warp_shared_kernel<T, ScaleT, BITS, GROUP_SIZE, false, 16>), fast_grid, fast_block, 0, stream, (const T*)x_ptr, w_ptr, (const ScaleT*)scales_ptr, (const ScaleT*)biases_ptr, (T*)out_ptr, M, N, K, has_bias);
           } else {
-            hipLaunchKernelGGL((rocm::qmv_warp_noshared_kernel<T, ScaleT, BITS, GROUP_SIZE, false, WARP_SIZE>), fast_grid, fast_block, 0, stream, (const T*)x_ptr, w_ptr, (const ScaleT*)scales_ptr, (const ScaleT*)biases_ptr, (T*)out_ptr, M, N, K, has_bias);
+            hipLaunchKernelGGL((rocm::qmv_warp_shared_kernel<T, ScaleT, BITS, GROUP_SIZE, false, WARP_SIZE>), fast_grid, fast_block, 0, stream, (const T*)x_ptr, w_ptr, (const ScaleT*)scales_ptr, (const ScaleT*)biases_ptr, (T*)out_ptr, M, N, K, has_bias);
           }
         } else if (transpose_) {
           hipLaunchKernelGGL((rocm::qmv_t_kernel<T, ScaleT, BITS, GROUP_SIZE, false>), grid, dim3(block_size), 0, stream, (const T*)x_ptr, w_ptr, (const ScaleT*)scales_ptr, (const ScaleT*)biases_ptr, (T*)out_ptr, M, N, K, has_bias);
@@ -612,9 +901,32 @@ __global__ void gather_qmv_kernel(const T* __restrict__ x, const uint8_t* __rest
   for (int g = 0; g < num_groups; ++g) {
     float scale = load_scale_value<ScaleT, GROUP_SIZE, AFFINE>(scales_ptr[g]);
     float bias = has_bias ? (float)biases_ptr[g] : 0.0f;
-    for (int k = g * GROUP_SIZE; k < min((g + 1) * GROUP_SIZE, K); ++k) {
-      uint8_t qv = unpack_packed_value_fast<BITS>(w_ptr, k, row_bytes);
-      acc += (float)x_ptr[k] * dequantize_value<BITS, AFFINE>(qv, scale, bias);
+    int k_start = g * GROUP_SIZE;
+    int k_end = min(k_start + GROUP_SIZE, K);
+    
+    if constexpr (BITS == 8) {
+      int k = k_start;
+      for (; k + 3 < k_end; k += 4) {
+        uint32_t w_packed = *reinterpret_cast<const uint32_t*>(&w_ptr[k]);
+        float w0 = dequantize_value<8, AFFINE>(w_packed & 0xFF, scale, bias);
+        float w1 = dequantize_value<8, AFFINE>((w_packed >> 8) & 0xFF, scale, bias);
+        float w2 = dequantize_value<8, AFFINE>((w_packed >> 16) & 0xFF, scale, bias);
+        float w3 = dequantize_value<8, AFFINE>((w_packed >> 24) & 0xFF, scale, bias);
+        
+        acc += (float)x_ptr[k] * w0;
+        acc += (float)x_ptr[k + 1] * w1;
+        acc += (float)x_ptr[k + 2] * w2;
+        acc += (float)x_ptr[k + 3] * w3;
+      }
+      for (; k < k_end; ++k) {
+        float w_val = dequantize_value<8, AFFINE>(w_ptr[k], scale, bias);
+        acc += (float)x_ptr[k] * w_val;
+      }
+    } else {
+      for (int k = k_start; k < k_end; ++k) {
+        uint8_t qv = unpack_packed_value_fast<BITS>(w_ptr, k, row_bytes);
+        acc += (float)x_ptr[k] * dequantize_value<BITS, AFFINE>(qv, scale, bias);
+      }
     }
   }
   out[batch * M * N + row * N + col] = (T)acc;

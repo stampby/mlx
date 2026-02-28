@@ -88,7 +88,7 @@ __global__ void affine_dequantize_kernel(
   if (group_idx >= num_groups) return;
   
   float scale = static_cast<float>(scales[group_idx]);
-  float bias = static_cast<float>(biases[group_idx]);
+  float bias = biases ? static_cast<float>(biases[group_idx]) : 0.0f;
   
   int input_base = group_idx * (group_size * BITS / 8);
   T* group_output = output + group_idx * group_size;
@@ -130,7 +130,7 @@ __global__ void affine_dequantize_packed_kernel(
   
   size_t gindex = oindex / group_size;
   float scale = static_cast<float>(scales[gindex]);
-  float bias = static_cast<float>(biases[gindex]);
+  float bias = biases ? static_cast<float>(biases[gindex]) : 0.0f;
   
   uint8_t val = input[idx];
   
@@ -212,7 +212,7 @@ void affine_quantize(
 void affine_dequantize(
     const array& wq,
     const array& scales,
-    const array& biases,
+    const std::optional<array>& biases,
     array& w,
     int group_size,
     int bits,
@@ -221,7 +221,7 @@ void affine_dequantize(
   
   enc.set_input_array(wq);
   enc.set_input_array(scales);
-  enc.set_input_array(biases);
+  if (biases) enc.set_input_array(*biases);
   enc.set_output_array(w);
   
   // Use packed kernel for power-of-2 bits
@@ -237,7 +237,7 @@ void affine_dequantize(
         hipLaunchKernelGGL( \
             (rocm::affine_dequantize_packed_kernel<T, BITS>), \
             dim3(num_blocks), dim3(block_size), 0, stream, \
-            wq.data<uint8_t>(), scales.data<T>(), biases.data<T>(), \
+            wq.data<uint8_t>(), scales.data<T>(), biases ? biases->data<T>() : nullptr, \
             w.data<T>(), w.size(), group_size)
       
       #define DISPATCH_BITS_PACKED(T) \
@@ -278,7 +278,7 @@ void affine_dequantize(
         hipLaunchKernelGGL( \
             (rocm::affine_dequantize_kernel<T, ScaleT, BITS>), \
             dim3(num_blocks), dim3(block_size), 0, stream, \
-            wq.data<uint8_t>(), scales.data<ScaleT>(), biases.data<ScaleT>(), \
+            wq.data<uint8_t>(), scales.data<ScaleT>(), biases ? biases->data<ScaleT>() : nullptr, \
             w.data<T>(), num_groups, group_size)
       
       #define DISPATCH_BITS(T, ScaleT) \

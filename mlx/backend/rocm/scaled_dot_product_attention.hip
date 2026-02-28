@@ -111,8 +111,13 @@ __global__ void kernel_sdpav_1pass(
     o[i] = 0.f;
   }
 
-  U max_score = -1e9f;
+  U max_score = -__int_as_float(0x7f7fffff); // -FLT_MAX
   U sum_exp_score = 0.f;
+
+  if (sinks && tile_idx == 0) {
+    max_score = 1.44269504089f * static_cast<U>(sinks[head_idx]); // M_LOG2E
+    sum_exp_score = 1.f;
+  }
 
   // Process keys
   for (int i = kv_seq_idx; i < params.kL; i += BN) {
@@ -287,6 +292,7 @@ void sdpa_vector(
   const void* v_ptr = gpu_ptr<void>(v);
   void* o_ptr = gpu_ptr<void>(o);
   const void* sinks_ptr = sinks ? gpu_ptr<void>(*sinks) : nullptr;
+  bool has_sinks = sinks.has_value();
 
   encoder.launch_kernel([
                            &,
@@ -294,7 +300,8 @@ void sdpa_vector(
                            k_ptr,
                            v_ptr,
                            o_ptr,
-                           sinks_ptr](hipStream_t stream) {
+                           sinks_ptr,
+                           has_sinks](hipStream_t stream) {
     dim3 grid_dim(H, qL, B);
     dim3 block_dim(1024, 1, 1);  // 32 tiles * 32 threads = 1024
 
@@ -310,7 +317,7 @@ void sdpa_vector(
           static_cast<const DataType*>(k_ptr),
           static_cast<const DataType*>(v_ptr),
           static_cast<DataType*>(o_ptr),
-          sinks ? static_cast<const DataType*>(sinks_ptr) : nullptr,
+          has_sinks ? static_cast<const DataType*>(sinks_ptr) : nullptr,
           params);
     };
 
