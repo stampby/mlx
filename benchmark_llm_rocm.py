@@ -226,57 +226,51 @@ def run_mlx(cfg: dict[str, str], variant: str, args: argparse.Namespace) -> RunS
 
         # Timed run
         print(f"  Running timed generation...")
-        prompt_tokens = tokenizer.encode(args.prompt)
-        num_prompt_tokens = len(prompt_tokens)
+
+        # Use stream_generate to get accurate per-token timings in a single pass
+        # This avoids running the prompt twice and eliminates tokenization overhead from the timing
+        from mlx_lm.generate import stream_generate
 
         start_time = time.perf_counter()
-        output_text = mlx_lm.generate(
+        final_stats = None
+        output_text = ""
+        for response in stream_generate(
             model,
             tokenizer,
             prompt=args.prompt,
             max_tokens=args.max_tokens,
-            verbose=False,
-        )
+            temp=args.temp,
+            top_p=args.top_p,
+            sampler=lambda x: (
+                mx.argmax(x, axis=-1) if args.temp == 0 else None
+            ),  # Use greedy if temp is 0
+        ):
+            output_text += response.text
+            final_stats = response
+
         mx.synchronize()
         total_time = time.perf_counter() - start_time
 
-        # The output_text is just the generated part, not including prompt
-        # Let's count the generated tokens directly
-        gen_tokens = len(tokenizer.encode(output_text)) - num_prompt_tokens
-        # If negative, output_text doesn't include prompt
-        if gen_tokens < 0:
-            gen_tokens = len(tokenizer.encode(output_text))
+        if final_stats is None:
+            raise RuntimeError("Generation produced no output.")
 
-        # We need separate prompt and generation timing
-        # Do another run to measure just prompt processing (time to first token)
-        start_time = time.perf_counter()
-        _ = mlx_lm.generate(
-            model,
-            tokenizer,
-            prompt=args.prompt,
-            max_tokens=1,
-            verbose=False,
-        )
-        mx.synchronize()
-        prompt_time = time.perf_counter() - start_time
-
-        # Estimate decode time (total - prompt)
-        # For more accurate measurement, we use the difference
-        gen_time = (
-            total_time - prompt_time
-            if total_time > prompt_time
-            else total_time * (gen_tokens / (gen_tokens + 1))
-        )
-
-        prompt_tps = num_prompt_tokens / prompt_time if prompt_time > 0 else 0
-        gen_tps = gen_tokens / gen_time if gen_time > 0 and gen_tokens > 0 else 0
+        num_prompt_tokens = final_stats.prompt_tokens
+        gen_tokens = final_stats.generation_tokens
+        prompt_tps = final_stats.prompt_tps
+        gen_tps = final_stats.generation_tps
 
         # Get peak memory
         peak_mem_gb = None
         try:
-            peak_mem_gb = mx.get_peak_memory() / (1024**3)
+            peak_mem_gb = mx.metal.get_peak_memory() / (1024**3)
         except:
-            pass
+            try:
+                peak_mem_gb = mx.gpu.get_peak_memory() / (1024**3)
+            except:
+                try:
+                    peak_mem_gb = mx.get_peak_memory() / (1024**3)
+                except:
+                    pass
 
         if args.show_raw_output:
             print(f"  Output: {output_text[:200]}...")
@@ -288,28 +282,6 @@ def run_mlx(cfg: dict[str, str], variant: str, args: argparse.Namespace) -> RunS
             backend="mlx",
             model=mlx_model,
             prompt_tokens=num_prompt_tokens,
-            prompt_tps=prompt_tps,
-            gen_tokens=gen_tokens,
-            gen_tps=gen_tps,
-            peak_mem_gb=peak_mem_gb,
-        )
-        # Try ROCm memory info
-        if peak_mem_gb is None:
-            try:
-                peak_mem_gb = mx.gpu.get_peak_memory() / (1024**3)
-            except:
-                pass
-
-        if args.show_raw_output:
-            print(f"  Output: {output_text[:200]}...")
-            print(f"  Prompt: {len(prompt_tokens)} tokens, {prompt_tps:.2f} tok/s")
-            print(f"  Generation: {gen_tokens} tokens, {gen_tps:.2f} tok/s")
-
-        return RunStats(
-            variant=variant,
-            backend="mlx",
-            model=mlx_model,
-            prompt_tokens=len(prompt_tokens),
             prompt_tps=prompt_tps,
             gen_tokens=gen_tokens,
             gen_tps=gen_tps,
@@ -359,9 +331,12 @@ def run_llama_cli(
         "--gpu-layers",
         str(args.llama_n_gpu_layers),
         "--simple-io",
+        "--no-mmap",
         "--no-display-prompt",
         "--no-conversation",
         "--perf",
+        "-fa",
+        "1",
     ]
 
     if args.llama_n_threads is not None:

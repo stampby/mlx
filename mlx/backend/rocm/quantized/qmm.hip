@@ -115,6 +115,18 @@ inline bool use_rocblas_dequant_path() {
   return enabled;
 }
 
+inline bool has_only_singleton_batch_dims(const array& x) {
+  if (x.ndim() <= 2) {
+    return true;
+  }
+  for (int i = 0; i < x.ndim() - 2; ++i) {
+    if (x.shape(i) != 1) {
+      return false;
+    }
+  }
+  return true;
+}
+
 inline int select_qmv_cols_per_block(int K, int N, int bits) {
   int env_cols = parse_cols_per_block_env("MLX_ROCM_QMV_COLS_PER_BLOCK");
   if (env_cols > 0) {
@@ -753,7 +765,6 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (has_bias) enc.set_input_array(biases.value());
   enc.set_output_array(out);
 
-  bool non_batched = (x.ndim() == 2 && w.ndim() == 2);
   int K = x.shape(-1);
   int M = out.shape(-2);
   int N = out.shape(-1);
@@ -767,12 +778,17 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
       w.size() /
       (static_cast<int64_t>(w.shape(-2)) * static_cast<int64_t>(w.shape(-1))));
 
+  bool x_singleton_batch = has_only_singleton_batch_dims(x);
+  bool w_singleton_batch = has_only_singleton_batch_dims(w);
+  bool non_batched = (batch_count == 1) && x_singleton_batch &&
+      w_singleton_batch;
+
   bool bits_supported_by_qmv =
       (bits_ == 2 || bits_ == 4 || bits_ == 8) ||
       (mode_ == QuantizationMode::Affine && (bits_ == 5 || bits_ == 6));
   bool force_dequant_gemm =
       !transpose_ || !bits_supported_by_qmv || (batch_count > 1) ||
-      (w.ndim() > 2);
+      (w.ndim() > 2 && !w_singleton_batch);
   bool dequant_gemm_supported_mode = (mode_ == QuantizationMode::Affine);
 
   // Dequant + rocBLAS GEMM path
