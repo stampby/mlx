@@ -27,17 +27,26 @@ inline array ensure_row_contiguous_matrix(
     const array& x,
     rocm::CommandEncoder& enc,
     const Stream& s) {
-  if (x.ndim() < 2) {
-    if (x.strides()[0] == 1) {
-      return x;
-    }
-  } else {
-    auto stride_0 = x.strides()[x.ndim() - 2];
-    auto stride_1 = x.strides()[x.ndim() - 1];
-    if (stride_0 == x.shape(-1) && stride_1 == 1) {
-      return x;
+  if (x.ndim() == 0) {
+    return x;
+  }
+
+  bool row_major_contiguous = true;
+  int64_t expected_stride = 1;
+  for (int i = x.ndim() - 1; i >= 0; --i) {
+    if (x.shape(i) > 1) {
+      if (x.strides()[i] != expected_stride) {
+        row_major_contiguous = false;
+        break;
+      }
+      expected_stride *= x.shape(i);
     }
   }
+
+  if (row_major_contiguous) {
+    return x;
+  }
+
   array x_copy = contiguous_copy_gpu(x, s);
   enc.add_temporary(x_copy);
   return x_copy;
@@ -758,7 +767,9 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
       w.size() /
       (static_cast<int64_t>(w.shape(-2)) * static_cast<int64_t>(w.shape(-1))));
 
-  bool bits_supported_by_qmv = (bits_ == 2 || bits_ == 4 || bits_ == 8);
+  bool bits_supported_by_qmv =
+      (bits_ == 2 || bits_ == 4 || bits_ == 8) ||
+      (mode_ == QuantizationMode::Affine && (bits_ == 5 || bits_ == 6));
   bool force_dequant_gemm =
       !transpose_ || !bits_supported_by_qmv || (batch_count > 1) ||
       (w.ndim() > 2);
@@ -914,6 +925,8 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     using bf16_id = local_type_identity<hip_bfloat16>;
     using bits2 = std::integral_constant<int, 2>;
     using bits4 = std::integral_constant<int, 4>;
+    using bits5 = std::integral_constant<int, 5>;
+    using bits6 = std::integral_constant<int, 6>;
     using bits8 = std::integral_constant<int, 8>;
     using gs32 = std::integral_constant<int, 32>;
     using gs64 = std::integral_constant<int, 64>;
@@ -932,16 +945,34 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 
     if (x.dtype() == float32) {
       if (bits_ == 8) DISPATCH_GROUP_SIZE(float_id{}, float_id{}, bits8{});
+      else if (bits_ == 5 && mode_ == QuantizationMode::Affine) {
+        DISPATCH_GROUP_SIZE(float_id{}, float_id{}, bits5{});
+      }
+      else if (bits_ == 6 && mode_ == QuantizationMode::Affine) {
+        DISPATCH_GROUP_SIZE(float_id{}, float_id{}, bits6{});
+      }
       else if (bits_ == 4) DISPATCH_GROUP_SIZE(float_id{}, float_id{}, bits4{});
       else if (bits_ == 2) DISPATCH_GROUP_SIZE(float_id{}, float_id{}, bits2{});
       else throw std::runtime_error("Unsupported bits for QuantizedMatmul float32: " + std::to_string(bits_));
     } else if (x.dtype() == float16) {
       if (bits_ == 8) DISPATCH_GROUP_SIZE(half_id{}, half_id{}, bits8{});
+      else if (bits_ == 5 && mode_ == QuantizationMode::Affine) {
+        DISPATCH_GROUP_SIZE(half_id{}, half_id{}, bits5{});
+      }
+      else if (bits_ == 6 && mode_ == QuantizationMode::Affine) {
+        DISPATCH_GROUP_SIZE(half_id{}, half_id{}, bits6{});
+      }
       else if (bits_ == 4) DISPATCH_GROUP_SIZE(half_id{}, half_id{}, bits4{});
       else if (bits_ == 2) DISPATCH_GROUP_SIZE(half_id{}, half_id{}, bits2{});
       else throw std::runtime_error("Unsupported bits for QuantizedMatmul float16: " + std::to_string(bits_));
     } else if (x.dtype() == bfloat16) {
       if (bits_ == 8) DISPATCH_GROUP_SIZE(bf16_id{}, bf16_id{}, bits8{});
+      else if (bits_ == 5 && mode_ == QuantizationMode::Affine) {
+        DISPATCH_GROUP_SIZE(bf16_id{}, bf16_id{}, bits5{});
+      }
+      else if (bits_ == 6 && mode_ == QuantizationMode::Affine) {
+        DISPATCH_GROUP_SIZE(bf16_id{}, bf16_id{}, bits6{});
+      }
       else if (bits_ == 4) DISPATCH_GROUP_SIZE(bf16_id{}, bf16_id{}, bits4{});
       else if (bits_ == 2) DISPATCH_GROUP_SIZE(bf16_id{}, bf16_id{}, bits2{});
       else throw std::runtime_error("Unsupported bits for QuantizedMatmul bfloat16: " + std::to_string(bits_));
@@ -969,12 +1000,31 @@ __global__ void gather_qmv_kernel(const T* __restrict__ x, const uint8_t* __rest
       elem /= batch_shape.data_[i];
     }
   }
-  uint32_t lhs_idx = lhs_indices[lhs_idx_loc]; uint32_t rhs_idx = rhs_indices[rhs_idx_loc];
-  int num_groups = (K + GROUP_SIZE - 1) / GROUP_SIZE; int row_bytes = (K * BITS + 7) / 8;
-  const T* x_ptr = x + lhs_idx * M * K + row * K;
-  const uint8_t* w_ptr = w + rhs_idx * N * row_bytes + col * row_bytes;
-  const ScaleT* scales_ptr = scales + rhs_idx * N * num_groups + col * num_groups;
-  const ScaleT* biases_ptr = has_bias ? biases + rhs_idx * N * num_groups + col * num_groups : nullptr;
+  uint32_t lhs_idx = lhs_indices[lhs_idx_loc];
+  uint32_t rhs_idx = rhs_indices[rhs_idx_loc];
+  if (rhs_idx >= static_cast<uint32_t>(E)) {
+    out[batch * M * N + row * N + col] = static_cast<T>(0);
+    return;
+  }
+
+  int num_groups = (K + GROUP_SIZE - 1) / GROUP_SIZE;
+  int row_bytes = (K * BITS + 7) / 8;
+  int64_t x_batch_stride = static_cast<int64_t>(M) * K;
+  int64_t w_batch_stride = static_cast<int64_t>(N) * row_bytes;
+  int64_t sb_batch_stride = static_cast<int64_t>(N) * num_groups;
+  int64_t col_w_offset = static_cast<int64_t>(col) * row_bytes;
+  int64_t col_sb_offset = static_cast<int64_t>(col) * num_groups;
+
+  const T* x_ptr = x + static_cast<int64_t>(lhs_idx) * x_batch_stride +
+      static_cast<int64_t>(row) * K;
+  const uint8_t* w_ptr = w + static_cast<int64_t>(rhs_idx) * w_batch_stride +
+      col_w_offset;
+  const ScaleT* scales_ptr =
+      scales + static_cast<int64_t>(rhs_idx) * sb_batch_stride + col_sb_offset;
+  const ScaleT* biases_ptr =
+      has_bias
+      ? biases + static_cast<int64_t>(rhs_idx) * sb_batch_stride + col_sb_offset
+      : nullptr;
   float acc = 0.0f;
   for (int g = 0; g < num_groups; ++g) {
     float scale = load_scale_value<ScaleT, GROUP_SIZE, AFFINE>(scales_ptr[g]);
@@ -1036,6 +1086,18 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         hipLaunchKernelGGL((rocm::gather_qmv_kernel<float, float, 8, 64, true>), grid, dim3(block_size), 0, stream, (const float*)x_ptr, (const uint8_t*)w_ptr, (const float*)scales_ptr, (const float*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (float*)out_ptr, B, M, N, K, E, has_bias);
       } else if (bits_ == 8 && group_size_ == 128) {
         hipLaunchKernelGGL((rocm::gather_qmv_kernel<float, float, 8, 128, true>), grid, dim3(block_size), 0, stream, (const float*)x_ptr, (const uint8_t*)w_ptr, (const float*)scales_ptr, (const float*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (float*)out_ptr, B, M, N, K, E, has_bias);
+      } else if (bits_ == 5 && group_size_ == 32) {
+        hipLaunchKernelGGL((rocm::gather_qmv_kernel<float, float, 5, 32, true>), grid, dim3(block_size), 0, stream, (const float*)x_ptr, (const uint8_t*)w_ptr, (const float*)scales_ptr, (const float*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (float*)out_ptr, B, M, N, K, E, has_bias);
+      } else if (bits_ == 5 && group_size_ == 64) {
+        hipLaunchKernelGGL((rocm::gather_qmv_kernel<float, float, 5, 64, true>), grid, dim3(block_size), 0, stream, (const float*)x_ptr, (const uint8_t*)w_ptr, (const float*)scales_ptr, (const float*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (float*)out_ptr, B, M, N, K, E, has_bias);
+      } else if (bits_ == 5 && group_size_ == 128) {
+        hipLaunchKernelGGL((rocm::gather_qmv_kernel<float, float, 5, 128, true>), grid, dim3(block_size), 0, stream, (const float*)x_ptr, (const uint8_t*)w_ptr, (const float*)scales_ptr, (const float*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (float*)out_ptr, B, M, N, K, E, has_bias);
+      } else if (bits_ == 6 && group_size_ == 32) {
+        hipLaunchKernelGGL((rocm::gather_qmv_kernel<float, float, 6, 32, true>), grid, dim3(block_size), 0, stream, (const float*)x_ptr, (const uint8_t*)w_ptr, (const float*)scales_ptr, (const float*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (float*)out_ptr, B, M, N, K, E, has_bias);
+      } else if (bits_ == 6 && group_size_ == 64) {
+        hipLaunchKernelGGL((rocm::gather_qmv_kernel<float, float, 6, 64, true>), grid, dim3(block_size), 0, stream, (const float*)x_ptr, (const uint8_t*)w_ptr, (const float*)scales_ptr, (const float*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (float*)out_ptr, B, M, N, K, E, has_bias);
+      } else if (bits_ == 6 && group_size_ == 128) {
+        hipLaunchKernelGGL((rocm::gather_qmv_kernel<float, float, 6, 128, true>), grid, dim3(block_size), 0, stream, (const float*)x_ptr, (const uint8_t*)w_ptr, (const float*)scales_ptr, (const float*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (float*)out_ptr, B, M, N, K, E, has_bias);
       } else if (bits_ == 4 && group_size_ == 32) {
         hipLaunchKernelGGL((rocm::gather_qmv_kernel<float, float, 4, 32, true>), grid, dim3(block_size), 0, stream, (const float*)x_ptr, (const uint8_t*)w_ptr, (const float*)scales_ptr, (const float*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (float*)out_ptr, B, M, N, K, E, has_bias);
       } else if (bits_ == 4 && group_size_ == 64) {
@@ -1058,6 +1120,18 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         hipLaunchKernelGGL((rocm::gather_qmv_kernel<__half, __half, 8, 64, true>), grid, dim3(block_size), 0, stream, (const __half*)x_ptr, (const uint8_t*)w_ptr, (const __half*)scales_ptr, (const __half*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (__half*)out_ptr, B, M, N, K, E, has_bias);
       } else if (bits_ == 8 && group_size_ == 128) {
         hipLaunchKernelGGL((rocm::gather_qmv_kernel<__half, __half, 8, 128, true>), grid, dim3(block_size), 0, stream, (const __half*)x_ptr, (const uint8_t*)w_ptr, (const __half*)scales_ptr, (const __half*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (__half*)out_ptr, B, M, N, K, E, has_bias);
+      } else if (bits_ == 5 && group_size_ == 32) {
+        hipLaunchKernelGGL((rocm::gather_qmv_kernel<__half, __half, 5, 32, true>), grid, dim3(block_size), 0, stream, (const __half*)x_ptr, (const uint8_t*)w_ptr, (const __half*)scales_ptr, (const __half*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (__half*)out_ptr, B, M, N, K, E, has_bias);
+      } else if (bits_ == 5 && group_size_ == 64) {
+        hipLaunchKernelGGL((rocm::gather_qmv_kernel<__half, __half, 5, 64, true>), grid, dim3(block_size), 0, stream, (const __half*)x_ptr, (const uint8_t*)w_ptr, (const __half*)scales_ptr, (const __half*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (__half*)out_ptr, B, M, N, K, E, has_bias);
+      } else if (bits_ == 5 && group_size_ == 128) {
+        hipLaunchKernelGGL((rocm::gather_qmv_kernel<__half, __half, 5, 128, true>), grid, dim3(block_size), 0, stream, (const __half*)x_ptr, (const uint8_t*)w_ptr, (const __half*)scales_ptr, (const __half*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (__half*)out_ptr, B, M, N, K, E, has_bias);
+      } else if (bits_ == 6 && group_size_ == 32) {
+        hipLaunchKernelGGL((rocm::gather_qmv_kernel<__half, __half, 6, 32, true>), grid, dim3(block_size), 0, stream, (const __half*)x_ptr, (const uint8_t*)w_ptr, (const __half*)scales_ptr, (const __half*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (__half*)out_ptr, B, M, N, K, E, has_bias);
+      } else if (bits_ == 6 && group_size_ == 64) {
+        hipLaunchKernelGGL((rocm::gather_qmv_kernel<__half, __half, 6, 64, true>), grid, dim3(block_size), 0, stream, (const __half*)x_ptr, (const uint8_t*)w_ptr, (const __half*)scales_ptr, (const __half*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (__half*)out_ptr, B, M, N, K, E, has_bias);
+      } else if (bits_ == 6 && group_size_ == 128) {
+        hipLaunchKernelGGL((rocm::gather_qmv_kernel<__half, __half, 6, 128, true>), grid, dim3(block_size), 0, stream, (const __half*)x_ptr, (const uint8_t*)w_ptr, (const __half*)scales_ptr, (const __half*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (__half*)out_ptr, B, M, N, K, E, has_bias);
       } else if (bits_ == 4 && group_size_ == 32) {
         hipLaunchKernelGGL((rocm::gather_qmv_kernel<__half, __half, 4, 32, true>), grid, dim3(block_size), 0, stream, (const __half*)x_ptr, (const uint8_t*)w_ptr, (const __half*)scales_ptr, (const __half*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (__half*)out_ptr, B, M, N, K, E, has_bias);
       } else if (bits_ == 4 && group_size_ == 64) {
@@ -1080,6 +1154,18 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         hipLaunchKernelGGL((rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 8, 64, true>), grid, dim3(block_size), 0, stream, (const hip_bfloat16*)x_ptr, (const uint8_t*)w_ptr, (const hip_bfloat16*)scales_ptr, (const hip_bfloat16*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (hip_bfloat16*)out_ptr, B, M, N, K, E, has_bias);
       } else if (bits_ == 8 && group_size_ == 128) {
         hipLaunchKernelGGL((rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 8, 128, true>), grid, dim3(block_size), 0, stream, (const hip_bfloat16*)x_ptr, (const uint8_t*)w_ptr, (const hip_bfloat16*)scales_ptr, (const hip_bfloat16*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (hip_bfloat16*)out_ptr, B, M, N, K, E, has_bias);
+      } else if (bits_ == 5 && group_size_ == 32) {
+        hipLaunchKernelGGL((rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 5, 32, true>), grid, dim3(block_size), 0, stream, (const hip_bfloat16*)x_ptr, (const uint8_t*)w_ptr, (const hip_bfloat16*)scales_ptr, (const hip_bfloat16*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (hip_bfloat16*)out_ptr, B, M, N, K, E, has_bias);
+      } else if (bits_ == 5 && group_size_ == 64) {
+        hipLaunchKernelGGL((rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 5, 64, true>), grid, dim3(block_size), 0, stream, (const hip_bfloat16*)x_ptr, (const uint8_t*)w_ptr, (const hip_bfloat16*)scales_ptr, (const hip_bfloat16*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (hip_bfloat16*)out_ptr, B, M, N, K, E, has_bias);
+      } else if (bits_ == 5 && group_size_ == 128) {
+        hipLaunchKernelGGL((rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 5, 128, true>), grid, dim3(block_size), 0, stream, (const hip_bfloat16*)x_ptr, (const uint8_t*)w_ptr, (const hip_bfloat16*)scales_ptr, (const hip_bfloat16*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (hip_bfloat16*)out_ptr, B, M, N, K, E, has_bias);
+      } else if (bits_ == 6 && group_size_ == 32) {
+        hipLaunchKernelGGL((rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 6, 32, true>), grid, dim3(block_size), 0, stream, (const hip_bfloat16*)x_ptr, (const uint8_t*)w_ptr, (const hip_bfloat16*)scales_ptr, (const hip_bfloat16*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (hip_bfloat16*)out_ptr, B, M, N, K, E, has_bias);
+      } else if (bits_ == 6 && group_size_ == 64) {
+        hipLaunchKernelGGL((rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 6, 64, true>), grid, dim3(block_size), 0, stream, (const hip_bfloat16*)x_ptr, (const uint8_t*)w_ptr, (const hip_bfloat16*)scales_ptr, (const hip_bfloat16*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (hip_bfloat16*)out_ptr, B, M, N, K, E, has_bias);
+      } else if (bits_ == 6 && group_size_ == 128) {
+        hipLaunchKernelGGL((rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 6, 128, true>), grid, dim3(block_size), 0, stream, (const hip_bfloat16*)x_ptr, (const uint8_t*)w_ptr, (const hip_bfloat16*)scales_ptr, (const hip_bfloat16*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (hip_bfloat16*)out_ptr, B, M, N, K, E, has_bias);
       } else if (bits_ == 4 && group_size_ == 32) {
         hipLaunchKernelGGL((rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 4, 32, true>), grid, dim3(block_size), 0, stream, (const hip_bfloat16*)x_ptr, (const uint8_t*)w_ptr, (const hip_bfloat16*)scales_ptr, (const hip_bfloat16*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (hip_bfloat16*)out_ptr, B, M, N, K, E, has_bias);
       } else if (bits_ == 4 && group_size_ == 64) {
