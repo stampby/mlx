@@ -351,7 +351,6 @@ def run_llama_cli(
         "--no-display-prompt",
         "--no-conversation",
         "--perf",
-        "--no-warmup",
     ]
 
     if args.llama_n_threads is not None:
