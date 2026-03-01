@@ -744,29 +744,107 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (has_bias) enc.set_input_array(biases.value());
   enc.set_output_array(out);
 
-  bool non_batched = w.ndim() == 2 && x.flags().row_contiguous;
+  bool non_batched = (x.ndim() == 2 && w.ndim() == 2);
   int K = x.shape(-1);
-  int M = non_batched ? x.size() / K : x.shape(-2);
+  int M = out.shape(-2);
   int N = out.shape(-1);
+
+  int64_t matrix_size = static_cast<int64_t>(M) * N;
+  int batch_count = static_cast<int>(out.size() / matrix_size);
+  int x_batch_count = static_cast<int>(
+      x.size() /
+      (static_cast<int64_t>(x.shape(-2)) * static_cast<int64_t>(x.shape(-1))));
+  int w_batch_count = static_cast<int>(
+      w.size() /
+      (static_cast<int64_t>(w.shape(-2)) * static_cast<int64_t>(w.shape(-1))));
+
+  bool bits_supported_by_qmv = (bits_ == 2 || bits_ == 4 || bits_ == 8);
+  bool force_dequant_gemm =
+      !transpose_ || !bits_supported_by_qmv || (batch_count > 1) ||
+      (w.ndim() > 2);
+  bool dequant_gemm_supported_mode = (mode_ == QuantizationMode::Affine);
 
   // Dequant + rocBLAS GEMM path
   // Disable with MLX_ROCM_QMM_DEQUANT_GEMM=0 if needed
-  if (M > 16 && d.is_rocblas_available() && non_batched && use_rocblas_dequant_path()) {
-    // Create the dequantized weight array with proper shape
-    // Note: use (nullptr, {}) to avoid creating an initializer_list<int> array!
+  if (dequant_gemm_supported_mode && d.is_rocblas_available() &&
+      use_rocblas_dequant_path() &&
+      (force_dequant_gemm || (non_batched && M > 16))) {
+    if (!((x_batch_count == 1) || (x_batch_count == batch_count))) {
+      throw std::runtime_error(
+          "Unsupported x batch shape for dequant GEMM fallback");
+    }
+    if (!((w_batch_count == 1) || (w_batch_count == batch_count))) {
+      throw std::runtime_error(
+          "Unsupported w batch shape for dequant GEMM fallback");
+    }
+
     int dequant_rows = transpose_ ? N : K;
     int dequant_cols = transpose_ ? K : N;
-    array w_dequant({dequant_rows, dequant_cols}, x.dtype(), nullptr, {});
+
+    Shape w_dequant_shape = w.shape();
+    w_dequant_shape[w_dequant_shape.size() - 2] = dequant_rows;
+    w_dequant_shape[w_dequant_shape.size() - 1] = dequant_cols;
+    array w_dequant(w_dequant_shape, x.dtype(), nullptr, {});
     w_dequant.set_data(allocator::malloc(w_dequant.nbytes()));
     enc.add_temporary(w_dequant);
-    
+
     if (mode_ == QuantizationMode::Affine) {
-      affine_dequantize(w, scales, biases, w_dequant, group_size_, bits_, enc, s);
+      affine_dequantize(
+          w, scales, biases, w_dequant, group_size_, bits_, enc, s);
     } else {
       fp_dequantize(w, scales, w_dequant, group_size_, bits_, enc, s);
     }
-    
-    rocm::rocblas_gemm(enc, false, transpose_, M, N, K, 1.0f, x, K, w_dequant, transpose_ ? K : N, 0.0f, out, N, x.dtype());
+
+    int lda = K;
+    int ldb = transpose_ ? K : N;
+
+    if (batch_count == 1 && x_batch_count == 1 && w_batch_count == 1) {
+      rocm::rocblas_gemm(
+          enc,
+          false,
+          transpose_,
+          M,
+          N,
+          K,
+          1.0f,
+          x,
+          lda,
+          w_dequant,
+          ldb,
+          0.0f,
+          out,
+          N,
+          x.dtype());
+    } else {
+      int64_t stride_a =
+          (x_batch_count == 1) ? 0 : static_cast<int64_t>(x.shape(-2)) * K;
+      int64_t stride_b =
+          (w_batch_count == 1)
+          ? 0
+          : static_cast<int64_t>(dequant_rows) * dequant_cols;
+      int64_t stride_c = static_cast<int64_t>(M) * N;
+
+      rocm::rocblas_gemm_batched(
+          enc,
+          false,
+          transpose_,
+          M,
+          N,
+          K,
+          1.0f,
+          x,
+          lda,
+          stride_a,
+          w_dequant,
+          ldb,
+          stride_b,
+          0.0f,
+          out,
+          N,
+          stride_c,
+          batch_count,
+          x.dtype());
+    }
     return;
   }
 

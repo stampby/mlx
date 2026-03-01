@@ -4,10 +4,13 @@
 #include "mlx/backend/rocm/device.h"
 #include "mlx/backend/rocm/gemms/naive_gemm.h"
 #include "mlx/backend/rocm/kernel_utils.hpp"
+#include "mlx/types/half_types.h"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <rocblas/rocblas.h>
+
+#include <cstring>
 
 namespace mlx::core::rocm {
 
@@ -101,11 +104,11 @@ void rocblas_gemm(
         break;
       }
       case float16: {
-        rocblas_half alpha_h;
-        rocblas_half beta_h;
-        // Convert float to half
-        alpha_h = rocblas_half(alpha);
-        beta_h = rocblas_half(beta);
+        rocblas_half alpha_h, beta_h;
+        float16_t alpha_f16 = static_cast<float16_t>(alpha);
+        float16_t beta_f16 = static_cast<float16_t>(beta);
+        std::memcpy(&alpha_h, &alpha_f16, sizeof(rocblas_half));
+        std::memcpy(&beta_h, &beta_f16, sizeof(rocblas_half));
         rocblas_hgemm(
             handle,
             op_b,
@@ -242,10 +245,11 @@ void rocblas_gemm_batched(
         break;
       }
       case float16: {
-        rocblas_half alpha_h;
-        rocblas_half beta_h;
-        alpha_h = rocblas_half(alpha);
-        beta_h = rocblas_half(beta);
+        rocblas_half alpha_h, beta_h;
+        float16_t alpha_f16 = static_cast<float16_t>(alpha);
+        float16_t beta_f16 = static_cast<float16_t>(beta);
+        std::memcpy(&alpha_h, &alpha_f16, sizeof(rocblas_half));
+        std::memcpy(&beta_h, &beta_f16, sizeof(rocblas_half));
         rocblas_hgemm_strided_batched(
             handle,
             op_b,
