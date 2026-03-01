@@ -515,7 +515,7 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
-    parser.add_argument("--max-tokens", type=int, default=100)
+    parser.add_argument("--max-tokens", type=int, default=1000)
 
     parser.add_argument("--temp", type=float, default=0.0)
     parser.add_argument("--top-k", type=int, default=1)
