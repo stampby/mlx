@@ -504,6 +504,7 @@ void gemm_and_bias(
                                out_ptr_base](hipStream_t stream) {
           auto& device = encoder.device();
           device.set_rocblas_stream(stream);
+          rocblas_handle handle = device.get_rocblas_handle();
 
           rocblas_operation trans_a = b_transposed ? rocblas_operation_transpose
                                                    : rocblas_operation_none;

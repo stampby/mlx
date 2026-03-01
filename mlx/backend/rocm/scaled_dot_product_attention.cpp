@@ -45,6 +45,7 @@ void sdpa_flash(
     float scale,
     array& o,
     bool do_causal,
+    const std::optional<array>& mask,
     const std::optional<array>& sinks,
     Stream s);
 
@@ -120,9 +121,9 @@ void ScaledDotProductAttention::eval_gpu(
                  do_causal_,
                  output_logsumexp_)) {
     if (has_sinks_) {
-      sdpa_flash(q, k, v, scale_, out, do_causal_, inputs.back(), s);
+      sdpa_flash(q, k, v, scale_, out, do_causal_, mask_arr, inputs.back(), s);
     } else {
-      sdpa_flash(q, k, v, scale_, out, do_causal_, std::nullopt, s);
+      sdpa_flash(q, k, v, scale_, out, do_causal_, mask_arr, std::nullopt, s);
     }
   } else {
     // Fallback: compute attention manually
