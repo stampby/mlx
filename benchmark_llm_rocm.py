@@ -95,7 +95,18 @@ class RunStats:
 
 
 def run_command(cmd: list[str]) -> str:
-    print(f"\n$ {shlex.join(cmd)}")
+    # Redact prompt from printed command to reduce clutter
+    printed_cmd = []
+    skip_next = False
+    for arg in cmd:
+        if skip_next:
+            printed_cmd.append("<prompt>")
+            skip_next = False
+        else:
+            printed_cmd.append(arg)
+            if arg == "--prompt":
+                skip_next = True
+    print(f"\n$ {shlex.join(printed_cmd)}")
     proc = subprocess.run(cmd, capture_output=True, text=True)
     output = (proc.stdout or "") + (proc.stderr or "")
     if proc.returncode != 0:
@@ -605,7 +616,8 @@ def main() -> int:
         return 2
 
     print("Running benchmark with shared decode settings:")
-    print(f"- prompt: {args.prompt!r}")
+    prompt_summary = args.prompt[:50] + "..." if len(args.prompt) > 50 else args.prompt
+    print(f"- prompt: {prompt_summary!r} (total {len(args.prompt)} chars)")
     print(f"- max_tokens: {args.max_tokens}")
     print(
         f"- sampling: temp={args.temp}, top_k={args.top_k}, "
