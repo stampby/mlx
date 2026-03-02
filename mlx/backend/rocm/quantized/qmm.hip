@@ -399,6 +399,75 @@ __global__ void __launch_bounds__(1024) qmv_warp_shared_kernel(
               qx_acc = fmaf(x_val, w_val, qx_acc);
               if (has_bias) x_group_sum += x_val;
             }
+          } else if constexpr (BITS == 4) {
+            int k_local = lane * 8;
+            int step = THREADS_PER_COL * 8;
+            for (; k_start + k_local + 7 < k_end_g; k_local += step) {
+              int k = k_start + k_local;
+              uint32_t w_packed = *reinterpret_cast<const uint32_t*>(&w_row[k / 2]);
+              float w0 = static_cast<float>(w_packed & 0xF);
+              float w1 = static_cast<float>((w_packed >> 4) & 0xF);
+              float w2 = static_cast<float>((w_packed >> 8) & 0xF);
+              float w3 = static_cast<float>((w_packed >> 12) & 0xF);
+              float w4 = static_cast<float>((w_packed >> 16) & 0xF);
+              float w5 = static_cast<float>((w_packed >> 20) & 0xF);
+              float w6 = static_cast<float>((w_packed >> 24) & 0xF);
+              float w7 = static_cast<float>((w_packed >> 28) & 0xF);
+              float x0 = shared_x[k - chunk_start];
+              float x1 = shared_x[k - chunk_start + 1];
+              float x2 = shared_x[k - chunk_start + 2];
+              float x3 = shared_x[k - chunk_start + 3];
+              float x4 = shared_x[k - chunk_start + 4];
+              float x5 = shared_x[k - chunk_start + 5];
+              float x6 = shared_x[k - chunk_start + 6];
+              float x7 = shared_x[k - chunk_start + 7];
+              qx_acc = fmaf(x0, w0, qx_acc);
+              qx_acc = fmaf(x1, w1, qx_acc);
+              qx_acc = fmaf(x2, w2, qx_acc);
+              qx_acc = fmaf(x3, w3, qx_acc);
+              qx_acc = fmaf(x4, w4, qx_acc);
+              qx_acc = fmaf(x5, w5, qx_acc);
+              qx_acc = fmaf(x6, w6, qx_acc);
+              qx_acc = fmaf(x7, w7, qx_acc);
+              if (has_bias) x_group_sum += x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7;
+            }
+            for (; k_start + k_local < k_end_g; k_local++) {
+              int k = k_start + k_local;
+              float x_val = shared_x[k - chunk_start];
+              uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              qx_acc = fmaf(x_val, static_cast<float>(quant_val), qx_acc);
+              if (has_bias) x_group_sum += x_val;
+            }
+          } else if constexpr (BITS == 6) {
+            int k_local = lane * 4;
+            int step = THREADS_PER_COL * 4;
+            for (; k_start + k_local + 3 < k_end_g; k_local += step) {
+              int k = k_start + k_local;
+              int byte_idx = (k * 6) / 8;
+              uint32_t w_packed = w_row[byte_idx];
+              if (byte_idx + 1 < row_bytes) w_packed |= static_cast<uint32_t>(w_row[byte_idx + 1]) << 8;
+              if (byte_idx + 2 < row_bytes) w_packed |= static_cast<uint32_t>(w_row[byte_idx + 2]) << 16;
+              float w0 = static_cast<float>(w_packed & 0x3F);
+              float w1 = static_cast<float>((w_packed >> 6) & 0x3F);
+              float w2 = static_cast<float>((w_packed >> 12) & 0x3F);
+              float w3 = static_cast<float>((w_packed >> 18) & 0x3F);
+              float x0 = shared_x[k - chunk_start];
+              float x1 = shared_x[k - chunk_start + 1];
+              float x2 = shared_x[k - chunk_start + 2];
+              float x3 = shared_x[k - chunk_start + 3];
+              qx_acc = fmaf(x0, w0, qx_acc);
+              qx_acc = fmaf(x1, w1, qx_acc);
+              qx_acc = fmaf(x2, w2, qx_acc);
+              qx_acc = fmaf(x3, w3, qx_acc);
+              if (has_bias) x_group_sum += x0 + x1 + x2 + x3;
+            }
+            for (; k_start + k_local < k_end_g; k_local++) {
+              int k = k_start + k_local;
+              float x_val = shared_x[k - chunk_start];
+              uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              qx_acc = fmaf(x_val, static_cast<float>(quant_val), qx_acc);
+              if (has_bias) x_group_sum += x_val;
+            }
           } else {
             for (int k_local = lane; k_start + k_local < k_end_g; k_local += THREADS_PER_COL) {
               int k = k_start + k_local;
@@ -440,6 +509,20 @@ __global__ void __launch_bounds__(1024) qmv_warp_shared_kernel(
               float x_val = shared_x[k - chunk_start];
               float w_val = fp8_e4m3_to_float(w_row[k]);
               qx_acc = fmaf(x_val, w_val, qx_acc);
+            }
+          } else if constexpr (BITS == 4) {
+            for (int k_local = lane; k_start + k_local < k_end_g; k_local += THREADS_PER_COL) {
+              int k = k_start + k_local;
+              float x_val = shared_x[k - chunk_start];
+              uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              qx_acc = fmaf(x_val, dequantize_value<BITS, false>(quant_val, 1.0f, 0.0f), qx_acc);
+            }
+          } else if constexpr (BITS == 6) {
+            for (int k_local = lane; k_start + k_local < k_end_g; k_local += THREADS_PER_COL) {
+              int k = k_start + k_local;
+              float x_val = shared_x[k - chunk_start];
+              uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              qx_acc = fmaf(x_val, dequantize_value<BITS, false>(quant_val, 1.0f, 0.0f), qx_acc);
             }
           } else {
             for (int k_local = lane; k_start + k_local < k_end_g; k_local += THREADS_PER_COL) {
@@ -587,6 +670,83 @@ __global__ void __launch_bounds__(1024) qmv_warp_shared_batched_kernel(
                 x_group_sum += x_val;
               }
             }
+          } else if constexpr (BITS == 4) {
+            int k_local = lane * 8;
+            int step = THREADS_PER_COL * 8;
+            for (; k_start + k_local + 7 < k_end_g; k_local += step) {
+              int k = k_start + k_local;
+              uint32_t w_packed = *reinterpret_cast<const uint32_t*>(&w_row[k / 2]);
+              float w0 = static_cast<float>(w_packed & 0xF);
+              float w1 = static_cast<float>((w_packed >> 4) & 0xF);
+              float w2 = static_cast<float>((w_packed >> 8) & 0xF);
+              float w3 = static_cast<float>((w_packed >> 12) & 0xF);
+              float w4 = static_cast<float>((w_packed >> 16) & 0xF);
+              float w5 = static_cast<float>((w_packed >> 20) & 0xF);
+              float w6 = static_cast<float>((w_packed >> 24) & 0xF);
+              float w7 = static_cast<float>((w_packed >> 28) & 0xF);
+              float x0 = shared_x[k - chunk_start];
+              float x1 = shared_x[k - chunk_start + 1];
+              float x2 = shared_x[k - chunk_start + 2];
+              float x3 = shared_x[k - chunk_start + 3];
+              float x4 = shared_x[k - chunk_start + 4];
+              float x5 = shared_x[k - chunk_start + 5];
+              float x6 = shared_x[k - chunk_start + 6];
+              float x7 = shared_x[k - chunk_start + 7];
+              qx_acc = fmaf(x0, w0, qx_acc);
+              qx_acc = fmaf(x1, w1, qx_acc);
+              qx_acc = fmaf(x2, w2, qx_acc);
+              qx_acc = fmaf(x3, w3, qx_acc);
+              qx_acc = fmaf(x4, w4, qx_acc);
+              qx_acc = fmaf(x5, w5, qx_acc);
+              qx_acc = fmaf(x6, w6, qx_acc);
+              qx_acc = fmaf(x7, w7, qx_acc);
+              if (has_bias) {
+                x_group_sum += x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7;
+              }
+            }
+            for (; k_start + k_local < k_end_g; k_local++) {
+              int k = k_start + k_local;
+              float x_val = shared_x[k - chunk_start];
+              uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              qx_acc = fmaf(x_val, static_cast<float>(quant_val), qx_acc);
+              if (has_bias) {
+                x_group_sum += x_val;
+              }
+            }
+          } else if constexpr (BITS == 6) {
+            int k_local = lane * 4;
+            int step = THREADS_PER_COL * 4;
+            for (; k_start + k_local + 3 < k_end_g; k_local += step) {
+              int k = k_start + k_local;
+              int byte_idx = (k * 6) / 8;
+              uint32_t w_packed = w_row[byte_idx];
+              if (byte_idx + 1 < row_bytes) w_packed |= static_cast<uint32_t>(w_row[byte_idx + 1]) << 8;
+              if (byte_idx + 2 < row_bytes) w_packed |= static_cast<uint32_t>(w_row[byte_idx + 2]) << 16;
+              float w0 = static_cast<float>(w_packed & 0x3F);
+              float w1 = static_cast<float>((w_packed >> 6) & 0x3F);
+              float w2 = static_cast<float>((w_packed >> 12) & 0x3F);
+              float w3 = static_cast<float>((w_packed >> 18) & 0x3F);
+              float x0 = shared_x[k - chunk_start];
+              float x1 = shared_x[k - chunk_start + 1];
+              float x2 = shared_x[k - chunk_start + 2];
+              float x3 = shared_x[k - chunk_start + 3];
+              qx_acc = fmaf(x0, w0, qx_acc);
+              qx_acc = fmaf(x1, w1, qx_acc);
+              qx_acc = fmaf(x2, w2, qx_acc);
+              qx_acc = fmaf(x3, w3, qx_acc);
+              if (has_bias) {
+                x_group_sum += x0 + x1 + x2 + x3;
+              }
+            }
+            for (; k_start + k_local < k_end_g; k_local++) {
+              int k = k_start + k_local;
+              float x_val = shared_x[k - chunk_start];
+              uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              qx_acc = fmaf(x_val, static_cast<float>(quant_val), qx_acc);
+              if (has_bias) {
+                x_group_sum += x_val;
+              }
+            }
           } else {
             for (int k_local = lane; k_start + k_local < k_end_g;
                  k_local += THREADS_PER_COL) {
@@ -637,6 +797,71 @@ __global__ void __launch_bounds__(1024) qmv_warp_shared_batched_kernel(
               float x_val = shared_x[k - chunk_start];
               float w_val = fp8_e4m3_to_float(w_row[k]);
               qx_acc = fmaf(x_val, w_val, qx_acc);
+            }
+          } else if constexpr (BITS == 4) {
+            int k_local = lane * 8;
+            int step = THREADS_PER_COL * 8;
+            for (; k_start + k_local + 7 < k_end_g; k_local += step) {
+              int k = k_start + k_local;
+              uint32_t w_packed = *reinterpret_cast<const uint32_t*>(&w_row[k / 2]);
+              float w0 = dequantize_value<4, false>(w_packed & 0xF, 1.0f, 0.0f);
+              float w1 = dequantize_value<4, false>((w_packed >> 4) & 0xF, 1.0f, 0.0f);
+              float w2 = dequantize_value<4, false>((w_packed >> 8) & 0xF, 1.0f, 0.0f);
+              float w3 = dequantize_value<4, false>((w_packed >> 12) & 0xF, 1.0f, 0.0f);
+              float w4 = dequantize_value<4, false>((w_packed >> 16) & 0xF, 1.0f, 0.0f);
+              float w5 = dequantize_value<4, false>((w_packed >> 20) & 0xF, 1.0f, 0.0f);
+              float w6 = dequantize_value<4, false>((w_packed >> 24) & 0xF, 1.0f, 0.0f);
+              float w7 = dequantize_value<4, false>((w_packed >> 28) & 0xF, 1.0f, 0.0f);
+              float x0 = shared_x[k - chunk_start];
+              float x1 = shared_x[k - chunk_start + 1];
+              float x2 = shared_x[k - chunk_start + 2];
+              float x3 = shared_x[k - chunk_start + 3];
+              float x4 = shared_x[k - chunk_start + 4];
+              float x5 = shared_x[k - chunk_start + 5];
+              float x6 = shared_x[k - chunk_start + 6];
+              float x7 = shared_x[k - chunk_start + 7];
+              qx_acc = fmaf(x0, w0, qx_acc);
+              qx_acc = fmaf(x1, w1, qx_acc);
+              qx_acc = fmaf(x2, w2, qx_acc);
+              qx_acc = fmaf(x3, w3, qx_acc);
+              qx_acc = fmaf(x4, w4, qx_acc);
+              qx_acc = fmaf(x5, w5, qx_acc);
+              qx_acc = fmaf(x6, w6, qx_acc);
+              qx_acc = fmaf(x7, w7, qx_acc);
+            }
+            for (; k_start + k_local < k_end_g; k_local++) {
+              int k = k_start + k_local;
+              float x_val = shared_x[k - chunk_start];
+              uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              qx_acc = fmaf(x_val, dequantize_value<BITS, false>(quant_val, 1.0f, 0.0f), qx_acc);
+            }
+          } else if constexpr (BITS == 6) {
+            int k_local = lane * 4;
+            int step = THREADS_PER_COL * 4;
+            for (; k_start + k_local + 3 < k_end_g; k_local += step) {
+              int k = k_start + k_local;
+              int byte_idx = (k * 6) / 8;
+              uint32_t w_packed = w_row[byte_idx];
+              if (byte_idx + 1 < row_bytes) w_packed |= static_cast<uint32_t>(w_row[byte_idx + 1]) << 8;
+              if (byte_idx + 2 < row_bytes) w_packed |= static_cast<uint32_t>(w_row[byte_idx + 2]) << 16;
+              float w0 = dequantize_value<6, false>(w_packed & 0x3F, 1.0f, 0.0f);
+              float w1 = dequantize_value<6, false>((w_packed >> 6) & 0x3F, 1.0f, 0.0f);
+              float w2 = dequantize_value<6, false>((w_packed >> 12) & 0x3F, 1.0f, 0.0f);
+              float w3 = dequantize_value<6, false>((w_packed >> 18) & 0x3F, 1.0f, 0.0f);
+              float x0 = shared_x[k - chunk_start];
+              float x1 = shared_x[k - chunk_start + 1];
+              float x2 = shared_x[k - chunk_start + 2];
+              float x3 = shared_x[k - chunk_start + 3];
+              qx_acc = fmaf(x0, w0, qx_acc);
+              qx_acc = fmaf(x1, w1, qx_acc);
+              qx_acc = fmaf(x2, w2, qx_acc);
+              qx_acc = fmaf(x3, w3, qx_acc);
+            }
+            for (; k_start + k_local < k_end_g; k_local++) {
+              int k = k_start + k_local;
+              float x_val = shared_x[k - chunk_start];
+              uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              qx_acc = fmaf(x_val, dequantize_value<BITS, false>(quant_val, 1.0f, 0.0f), qx_acc);
             }
           } else {
             for (int k_local = lane; k_start + k_local < k_end_g;
@@ -1505,6 +1730,83 @@ __global__ void __launch_bounds__(1024) gather_qmv_warp_shared_kernel(
                 x_group_sum += x_val;
               }
             }
+          } else if constexpr (BITS == 4) {
+            int k_local = lane * 8;
+            int step = THREADS_PER_COL * 8;
+            for (; k_start + k_local + 7 < k_end_g; k_local += step) {
+              int k = k_start + k_local;
+              uint32_t w_packed = *reinterpret_cast<const uint32_t*>(&w_row[k / 2]);
+              float w0 = static_cast<float>(w_packed & 0xF);
+              float w1 = static_cast<float>((w_packed >> 4) & 0xF);
+              float w2 = static_cast<float>((w_packed >> 8) & 0xF);
+              float w3 = static_cast<float>((w_packed >> 12) & 0xF);
+              float w4 = static_cast<float>((w_packed >> 16) & 0xF);
+              float w5 = static_cast<float>((w_packed >> 20) & 0xF);
+              float w6 = static_cast<float>((w_packed >> 24) & 0xF);
+              float w7 = static_cast<float>((w_packed >> 28) & 0xF);
+              float x0 = shared_x[k - chunk_start];
+              float x1 = shared_x[k - chunk_start + 1];
+              float x2 = shared_x[k - chunk_start + 2];
+              float x3 = shared_x[k - chunk_start + 3];
+              float x4 = shared_x[k - chunk_start + 4];
+              float x5 = shared_x[k - chunk_start + 5];
+              float x6 = shared_x[k - chunk_start + 6];
+              float x7 = shared_x[k - chunk_start + 7];
+              qx_acc = fmaf(x0, w0, qx_acc);
+              qx_acc = fmaf(x1, w1, qx_acc);
+              qx_acc = fmaf(x2, w2, qx_acc);
+              qx_acc = fmaf(x3, w3, qx_acc);
+              qx_acc = fmaf(x4, w4, qx_acc);
+              qx_acc = fmaf(x5, w5, qx_acc);
+              qx_acc = fmaf(x6, w6, qx_acc);
+              qx_acc = fmaf(x7, w7, qx_acc);
+              if (has_bias) {
+                x_group_sum += x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7;
+              }
+            }
+            for (; k_start + k_local < k_end_g; k_local++) {
+              int k = k_start + k_local;
+              float x_val = shared_x[k - chunk_start];
+              uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              qx_acc = fmaf(x_val, static_cast<float>(quant_val), qx_acc);
+              if (has_bias) {
+                x_group_sum += x_val;
+              }
+            }
+          } else if constexpr (BITS == 6) {
+            int k_local = lane * 4;
+            int step = THREADS_PER_COL * 4;
+            for (; k_start + k_local + 3 < k_end_g; k_local += step) {
+              int k = k_start + k_local;
+              int byte_idx = (k * 6) / 8;
+              uint32_t w_packed = w_row[byte_idx];
+              if (byte_idx + 1 < row_bytes) w_packed |= static_cast<uint32_t>(w_row[byte_idx + 1]) << 8;
+              if (byte_idx + 2 < row_bytes) w_packed |= static_cast<uint32_t>(w_row[byte_idx + 2]) << 16;
+              float w0 = static_cast<float>(w_packed & 0x3F);
+              float w1 = static_cast<float>((w_packed >> 6) & 0x3F);
+              float w2 = static_cast<float>((w_packed >> 12) & 0x3F);
+              float w3 = static_cast<float>((w_packed >> 18) & 0x3F);
+              float x0 = shared_x[k - chunk_start];
+              float x1 = shared_x[k - chunk_start + 1];
+              float x2 = shared_x[k - chunk_start + 2];
+              float x3 = shared_x[k - chunk_start + 3];
+              qx_acc = fmaf(x0, w0, qx_acc);
+              qx_acc = fmaf(x1, w1, qx_acc);
+              qx_acc = fmaf(x2, w2, qx_acc);
+              qx_acc = fmaf(x3, w3, qx_acc);
+              if (has_bias) {
+                x_group_sum += x0 + x1 + x2 + x3;
+              }
+            }
+            for (; k_start + k_local < k_end_g; k_local++) {
+              int k = k_start + k_local;
+              float x_val = shared_x[k - chunk_start];
+              uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              qx_acc = fmaf(x_val, static_cast<float>(quant_val), qx_acc);
+              if (has_bias) {
+                x_group_sum += x_val;
+              }
+            }
           } else {
             for (int k_local = lane; k_start + k_local < k_end_g;
                  k_local += THREADS_PER_COL) {
@@ -1555,6 +1857,71 @@ __global__ void __launch_bounds__(1024) gather_qmv_warp_shared_kernel(
               float x_val = shared_x[k - chunk_start];
               float w_val = fp8_e4m3_to_float(w_row[k]);
               qx_acc = fmaf(x_val, w_val, qx_acc);
+            }
+          } else if constexpr (BITS == 4) {
+            int k_local = lane * 8;
+            int step = THREADS_PER_COL * 8;
+            for (; k_start + k_local + 7 < k_end_g; k_local += step) {
+              int k = k_start + k_local;
+              uint32_t w_packed = *reinterpret_cast<const uint32_t*>(&w_row[k / 2]);
+              float w0 = dequantize_value<4, false>(w_packed & 0xF, 1.0f, 0.0f);
+              float w1 = dequantize_value<4, false>((w_packed >> 4) & 0xF, 1.0f, 0.0f);
+              float w2 = dequantize_value<4, false>((w_packed >> 8) & 0xF, 1.0f, 0.0f);
+              float w3 = dequantize_value<4, false>((w_packed >> 12) & 0xF, 1.0f, 0.0f);
+              float w4 = dequantize_value<4, false>((w_packed >> 16) & 0xF, 1.0f, 0.0f);
+              float w5 = dequantize_value<4, false>((w_packed >> 20) & 0xF, 1.0f, 0.0f);
+              float w6 = dequantize_value<4, false>((w_packed >> 24) & 0xF, 1.0f, 0.0f);
+              float w7 = dequantize_value<4, false>((w_packed >> 28) & 0xF, 1.0f, 0.0f);
+              float x0 = shared_x[k - chunk_start];
+              float x1 = shared_x[k - chunk_start + 1];
+              float x2 = shared_x[k - chunk_start + 2];
+              float x3 = shared_x[k - chunk_start + 3];
+              float x4 = shared_x[k - chunk_start + 4];
+              float x5 = shared_x[k - chunk_start + 5];
+              float x6 = shared_x[k - chunk_start + 6];
+              float x7 = shared_x[k - chunk_start + 7];
+              qx_acc = fmaf(x0, w0, qx_acc);
+              qx_acc = fmaf(x1, w1, qx_acc);
+              qx_acc = fmaf(x2, w2, qx_acc);
+              qx_acc = fmaf(x3, w3, qx_acc);
+              qx_acc = fmaf(x4, w4, qx_acc);
+              qx_acc = fmaf(x5, w5, qx_acc);
+              qx_acc = fmaf(x6, w6, qx_acc);
+              qx_acc = fmaf(x7, w7, qx_acc);
+            }
+            for (; k_start + k_local < k_end_g; k_local++) {
+              int k = k_start + k_local;
+              float x_val = shared_x[k - chunk_start];
+              uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              qx_acc = fmaf(x_val, dequantize_value<BITS, false>(quant_val, 1.0f, 0.0f), qx_acc);
+            }
+          } else if constexpr (BITS == 6) {
+            int k_local = lane * 4;
+            int step = THREADS_PER_COL * 4;
+            for (; k_start + k_local + 3 < k_end_g; k_local += step) {
+              int k = k_start + k_local;
+              int byte_idx = (k * 6) / 8;
+              uint32_t w_packed = w_row[byte_idx];
+              if (byte_idx + 1 < row_bytes) w_packed |= static_cast<uint32_t>(w_row[byte_idx + 1]) << 8;
+              if (byte_idx + 2 < row_bytes) w_packed |= static_cast<uint32_t>(w_row[byte_idx + 2]) << 16;
+              float w0 = dequantize_value<6, false>(w_packed & 0x3F, 1.0f, 0.0f);
+              float w1 = dequantize_value<6, false>((w_packed >> 6) & 0x3F, 1.0f, 0.0f);
+              float w2 = dequantize_value<6, false>((w_packed >> 12) & 0x3F, 1.0f, 0.0f);
+              float w3 = dequantize_value<6, false>((w_packed >> 18) & 0x3F, 1.0f, 0.0f);
+              float x0 = shared_x[k - chunk_start];
+              float x1 = shared_x[k - chunk_start + 1];
+              float x2 = shared_x[k - chunk_start + 2];
+              float x3 = shared_x[k - chunk_start + 3];
+              qx_acc = fmaf(x0, w0, qx_acc);
+              qx_acc = fmaf(x1, w1, qx_acc);
+              qx_acc = fmaf(x2, w2, qx_acc);
+              qx_acc = fmaf(x3, w3, qx_acc);
+            }
+            for (; k_start + k_local < k_end_g; k_local++) {
+              int k = k_start + k_local;
+              float x_val = shared_x[k - chunk_start];
+              uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              qx_acc = fmaf(x_val, dequantize_value<BITS, false>(quant_val, 1.0f, 0.0f), qx_acc);
             }
           } else {
             for (int k_local = lane; k_start + k_local < k_end_g;
