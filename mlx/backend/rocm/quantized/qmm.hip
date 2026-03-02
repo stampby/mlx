@@ -1315,10 +1315,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   int block_size = 256;
   dim3 grid(M, (N + block_size - 1) / block_size);
 
-  int fast_threads_per_col = (group_size_ <= 16) ? 16 : WARP_SIZE;
-  if (bits_ == 8 && group_size_ == 64) {
-    fast_threads_per_col = 16;
-  }
+  int fast_threads_per_col = 16;
   int fast_threads_env = parse_threads_per_col_env("MLX_ROCM_QMV_THREADS_PER_COL");
   if (fast_threads_env > 0) fast_threads_per_col = fast_threads_env;
   
@@ -2042,10 +2039,7 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   int block_size = 256;
   dim3 grid(M, (N + block_size - 1) / block_size, B);
 
-  int fast_threads_per_col = (group_size_ <= 16) ? 16 : WARP_SIZE;
-  if (bits_ == 8 && group_size_ == 64) {
-    fast_threads_per_col = 16;
-  }
+  int fast_threads_per_col = 16;
   int fast_threads_env = parse_threads_per_col_env(
       "MLX_ROCM_GATHER_QMV_THREADS_PER_COL");
   if (fast_threads_env <= 0) {
