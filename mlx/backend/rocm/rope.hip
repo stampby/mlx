@@ -27,10 +27,10 @@ __device__ void rope_single_impl(
     uint2 dims) {
   float L = scale * static_cast<float>(offset);
 
-  // Compute costheta, sintheta
+  // Compute costheta, sintheta using sincosf for better performance
   float theta = L * inv_freq;
-  float costheta = cosf(theta);
-  float sintheta = sinf(theta);
+  float sintheta, costheta;
+  sincosf(theta, &sintheta, &costheta);
 
   // Compute the input and output indices
   uint32_t index_1, index_2;
@@ -80,6 +80,111 @@ __global__ void rope_single(
       in, out, *offset, inv_freq, scale, stride, pos, dims);
 }
 
+// Optimized 1D kernel for single-token decode case
+// Uses flat indexing for better occupancy with small workloads
+template <typename T, bool traditional, bool forward>
+__global__ void rope_single_1d(
+    const T* in,
+    T* out,
+    const int32_t* offset,
+    float scale,
+    float base,
+    int64_t stride,
+    uint32_t half_dims,  // dims.x = dims_ / 2
+    uint32_t n_heads) {  // dims.y = N
+  uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  uint32_t total = half_dims * n_heads;
+  if (tid >= total) {
+    return;
+  }
+
+  // Convert flat index to 2D position
+  uint32_t pos_x = tid % half_dims;  // position within dimension
+  uint32_t pos_y = tid / half_dims;  // head index
+
+  float d = static_cast<float>(pos_x) / static_cast<float>(half_dims);
+  float inv_freq = exp2f(-d * base);
+
+  // Inline the implementation for better performance
+  float L = scale * static_cast<float>(*offset);
+  float theta = L * inv_freq;
+  float sintheta, costheta;
+  sincosf(theta, &sintheta, &costheta);
+
+  uint32_t index_1, index_2;
+  if (traditional) {
+    index_1 = 2 * pos_x + pos_y * stride;
+    index_2 = index_1 + 1;
+  } else {
+    index_1 = pos_x + pos_y * stride;
+    index_2 = index_1 + half_dims;
+  }
+
+  float x1 = static_cast<float>(in[index_1]);
+  float x2 = static_cast<float>(in[index_2]);
+  float rx1, rx2;
+  if (forward) {
+    rx1 = x1 * costheta - x2 * sintheta;
+    rx2 = x1 * sintheta + x2 * costheta;
+  } else {
+    rx1 = x2 * sintheta + x1 * costheta;
+    rx2 = x2 * costheta - x1 * sintheta;
+  }
+  out[index_1] = static_cast<T>(rx1);
+  out[index_2] = static_cast<T>(rx2);
+}
+
+// Optimized 1D kernel for single-token decode with custom frequencies
+template <typename T, bool traditional, bool forward>
+__global__ void rope_single_freqs_1d(
+    const T* in,
+    T* out,
+    const int32_t* offset,
+    const float* freqs,
+    float scale,
+    int64_t stride,
+    uint32_t half_dims,
+    uint32_t n_heads,
+    int64_t freq_stride) {
+  uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  uint32_t total = half_dims * n_heads;
+  if (tid >= total) {
+    return;
+  }
+
+  uint32_t pos_x = tid % half_dims;
+  uint32_t pos_y = tid / half_dims;
+
+  float inv_freq = 1.0f / freqs[freq_stride * pos_x];
+
+  float L = scale * static_cast<float>(*offset);
+  float theta = L * inv_freq;
+  float sintheta, costheta;
+  sincosf(theta, &sintheta, &costheta);
+
+  uint32_t index_1, index_2;
+  if (traditional) {
+    index_1 = 2 * pos_x + pos_y * stride;
+    index_2 = index_1 + 1;
+  } else {
+    index_1 = pos_x + pos_y * stride;
+    index_2 = index_1 + half_dims;
+  }
+
+  float x1 = static_cast<float>(in[index_1]);
+  float x2 = static_cast<float>(in[index_2]);
+  float rx1, rx2;
+  if (forward) {
+    rx1 = x1 * costheta - x2 * sintheta;
+    rx2 = x1 * sintheta + x2 * costheta;
+  } else {
+    rx1 = x2 * sintheta + x1 * costheta;
+    rx2 = x2 * costheta - x1 * sintheta;
+  }
+  out[index_1] = static_cast<T>(rx1);
+  out[index_2] = static_cast<T>(rx2);
+}
+
 template <typename T, bool traditional, bool forward>
 __global__ void rope_single_freqs(
     const T* in,
@@ -123,10 +228,10 @@ __device__ void rope_impl(
   float L = scale * static_cast<float>(pos.y + batch_offset);
   auto mat_idx = batch_idx * n_head + head_idx;
 
-  // Compute costheta, sintheta
+  // Compute costheta, sintheta using sincosf for better performance
   float theta = L * inv_freq;
-  float costheta = cosf(theta);
-  float sintheta = sinf(theta);
+  float sintheta, costheta;
+  sincosf(theta, &sintheta, &costheta);
 
   // Compute the input and output indices
   size_t in_index_1, in_index_2;
@@ -250,6 +355,19 @@ inline std::pair<dim3, dim3> get_grid_and_block(uint32_t x, uint32_t y, uint32_t
   return {grid, block};
 }
 
+// Optimized grid/block for single-token decode case
+// Uses 1D blocks for better coalescing when y (n_heads) is small
+inline std::pair<dim3, dim3> get_grid_and_block_single(uint32_t x, uint32_t y) {
+  // For decode: x = dims/2 (e.g., 64), y = n_heads (e.g., 40)
+  // Total elements = x * y (e.g., 2560)
+  // Use 1D layout for better occupancy with small workloads
+  constexpr uint32_t BLOCK_SIZE = 256;
+  uint32_t total = x * y;
+  dim3 block(BLOCK_SIZE, 1, 1);
+  dim3 grid((total + BLOCK_SIZE - 1) / BLOCK_SIZE, 1, 1);
+  return {grid, block};
+}
+
 } // namespace rocm
 
 namespace fast {
@@ -362,15 +480,17 @@ void RoPE::eval_gpu(
     
     // Get grid/block dimensions outside the lambda to avoid C++20 structured binding capture
     if (single && !with_freqs) {
-      uint2 dims2 = make_uint2(dims_ / 2, N);
-      std::pair<dim3, dim3> gb = rocm::get_grid_and_block(dims2.x, dims2.y, 1);
+      // Use optimized 1D kernel for single-token decode
+      uint32_t half_dims = dims_ / 2;
+      uint32_t n_heads = N;
+      std::pair<dim3, dim3> gb = rocm::get_grid_and_block_single(half_dims, n_heads);
       dim3 grid = gb.first;
       dim3 block = gb.second;
       
       encoder.launch_kernel([=, &encoder, &out, &in, &offset, this](hipStream_t stream) {
         if (traditional_ && forward_) {
           hipLaunchKernelGGL(
-              (rocm::rope_single<DataType, true, true>),
+              (rocm::rope_single_1d<DataType, true, true>),
               grid, block, 0, stream,
               gpu_ptr<DataType>(donated ? out : in),
               gpu_ptr<DataType>(out),
@@ -378,10 +498,11 @@ void RoPE::eval_gpu(
               scale_,
               std::log2(base_),
               mat_size,
-              dims2);
+              half_dims,
+              n_heads);
         } else if (traditional_ && !forward_) {
           hipLaunchKernelGGL(
-              (rocm::rope_single<DataType, true, false>),
+              (rocm::rope_single_1d<DataType, true, false>),
               grid, block, 0, stream,
               gpu_ptr<DataType>(donated ? out : in),
               gpu_ptr<DataType>(out),
@@ -389,10 +510,11 @@ void RoPE::eval_gpu(
               scale_,
               std::log2(base_),
               mat_size,
-              dims2);
+              half_dims,
+              n_heads);
         } else if (!traditional_ && forward_) {
           hipLaunchKernelGGL(
-              (rocm::rope_single<DataType, false, true>),
+              (rocm::rope_single_1d<DataType, false, true>),
               grid, block, 0, stream,
               gpu_ptr<DataType>(donated ? out : in),
               gpu_ptr<DataType>(out),
@@ -400,10 +522,11 @@ void RoPE::eval_gpu(
               scale_,
               std::log2(base_),
               mat_size,
-              dims2);
+              half_dims,
+              n_heads);
         } else {
           hipLaunchKernelGGL(
-              (rocm::rope_single<DataType, false, false>),
+              (rocm::rope_single_1d<DataType, false, false>),
               grid, block, 0, stream,
               gpu_ptr<DataType>(donated ? out : in),
               gpu_ptr<DataType>(out),
@@ -411,12 +534,15 @@ void RoPE::eval_gpu(
               scale_,
               std::log2(base_),
               mat_size,
-              dims2);
+              half_dims,
+              n_heads);
         }
       });
     } else if (single) {
-      uint2 dims2 = make_uint2(dims_ / 2, N);
-      std::pair<dim3, dim3> gb = rocm::get_grid_and_block(dims2.x, dims2.y, 1);
+      // Use optimized 1D kernel for single-token decode with freqs
+      uint32_t half_dims = dims_ / 2;
+      uint32_t n_heads = N;
+      std::pair<dim3, dim3> gb = rocm::get_grid_and_block_single(half_dims, n_heads);
       dim3 grid = gb.first;
       dim3 block = gb.second;
       int64_t freq_stride = inputs[2].strides(0);
@@ -424,7 +550,7 @@ void RoPE::eval_gpu(
       encoder.launch_kernel([=, &encoder, &out, &in, &offset, &inputs, this](hipStream_t stream) {
         if (traditional_ && forward_) {
           hipLaunchKernelGGL(
-              (rocm::rope_single_freqs<DataType, true, true>),
+              (rocm::rope_single_freqs_1d<DataType, true, true>),
               grid, block, 0, stream,
               gpu_ptr<DataType>(donated ? out : in),
               gpu_ptr<DataType>(out),
@@ -432,11 +558,12 @@ void RoPE::eval_gpu(
               gpu_ptr<float>(inputs[2]),
               scale_,
               mat_size,
-              dims2,
+              half_dims,
+              n_heads,
               freq_stride);
         } else if (traditional_ && !forward_) {
           hipLaunchKernelGGL(
-              (rocm::rope_single_freqs<DataType, true, false>),
+              (rocm::rope_single_freqs_1d<DataType, true, false>),
               grid, block, 0, stream,
               gpu_ptr<DataType>(donated ? out : in),
               gpu_ptr<DataType>(out),
@@ -444,11 +571,12 @@ void RoPE::eval_gpu(
               gpu_ptr<float>(inputs[2]),
               scale_,
               mat_size,
-              dims2,
+              half_dims,
+              n_heads,
               freq_stride);
         } else if (!traditional_ && forward_) {
           hipLaunchKernelGGL(
-              (rocm::rope_single_freqs<DataType, false, true>),
+              (rocm::rope_single_freqs_1d<DataType, false, true>),
               grid, block, 0, stream,
               gpu_ptr<DataType>(donated ? out : in),
               gpu_ptr<DataType>(out),
@@ -456,11 +584,12 @@ void RoPE::eval_gpu(
               gpu_ptr<float>(inputs[2]),
               scale_,
               mat_size,
-              dims2,
+              half_dims,
+              n_heads,
               freq_stride);
         } else {
           hipLaunchKernelGGL(
-              (rocm::rope_single_freqs<DataType, false, false>),
+              (rocm::rope_single_freqs_1d<DataType, false, false>),
               grid, block, 0, stream,
               gpu_ptr<DataType>(donated ? out : in),
               gpu_ptr<DataType>(out),
@@ -468,7 +597,8 @@ void RoPE::eval_gpu(
               gpu_ptr<float>(inputs[2]),
               scale_,
               mat_size,
-              dims2,
+              half_dims,
+              n_heads,
               freq_stride);
         }
       });
