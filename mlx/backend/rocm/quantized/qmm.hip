@@ -340,6 +340,70 @@ inline bool should_use_tiny_k_qmv_path(
   return tiny_k && decode_like && width_enough;
 }
 
+inline bool is_aligned_ptr(const void* ptr, size_t align) {
+  if (ptr == nullptr || align == 0) {
+    return false;
+  }
+  auto addr = reinterpret_cast<std::uintptr_t>(ptr);
+  return (addr % align) == 0;
+}
+
+inline bool has_packed_layout_compatibility_for_aligned_qmv(int K, int bits) {
+  switch (bits) {
+    case 8:
+      return (K % 16) == 0;
+    case 6:
+      return (K % 64) == 0;
+    case 4:
+      return (K % 32) == 0;
+    case 2:
+      return (K % 64) == 0;
+    default:
+      return false;
+  }
+}
+
+inline bool should_use_alignment_qmv_noshared_path(
+    int M,
+    int N,
+    int K,
+    int batch_count,
+    bool transpose,
+    bool can_use_batched_qmv,
+    int bits,
+    QuantizationMode mode,
+    const void* x_ptr,
+    const void* w_ptr,
+    const void* scales_ptr,
+    const void* biases_ptr,
+    bool has_bias) {
+  if (!transpose || can_use_batched_qmv || batch_count != 1) {
+    return false;
+  }
+
+  bool bits_supported = (bits == 2 || bits == 4 || bits == 8) ||
+      (mode == QuantizationMode::Affine && bits == 6);
+  if (!bits_supported) {
+    return false;
+  }
+  if (!has_packed_layout_compatibility_for_aligned_qmv(K, bits)) {
+    return false;
+  }
+
+  bool decode_like = (M <= 8);
+  bool width_enough = (N >= 1024);
+  if (!decode_like || !width_enough) {
+    return false;
+  }
+
+  bool pointers_aligned = is_aligned_ptr(x_ptr, 16) &&
+      is_aligned_ptr(w_ptr, 16) && is_aligned_ptr(scales_ptr, 16);
+  if (has_bias) {
+    pointers_aligned = pointers_aligned && is_aligned_ptr(biases_ptr, 16);
+  }
+  return pointers_aligned;
+}
+
 inline bool should_use_dequant_gemm_path(
     int M,
     int N,
@@ -2498,6 +2562,35 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   const void* biases_ptr = has_bias ? gpu_ptr<void>(*biases) : nullptr;
   void* out_ptr = gpu_ptr<void>(out);
 
+  bool use_alignment_qmv = should_use_alignment_qmv_noshared_path(
+      M,
+      N,
+      K,
+      batch_count,
+      transpose_,
+      can_use_batched_qmv,
+      bits_,
+      mode_,
+      x_ptr,
+      w_ptr,
+      scales_ptr,
+      biases_ptr,
+      has_bias);
+  bool use_noshared_qmv_variant = use_tiny_k_qmv || use_alignment_qmv;
+
+  if (use_alignment_qmv) {
+    fast_cols_per_block = std::max(fast_cols_per_block, 64);
+    while (fast_cols_per_block > max_cols_per_block) {
+      fast_cols_per_block /= 2;
+    }
+    while (fast_cols_per_block > 1 && (N % fast_cols_per_block) != 0 &&
+           fast_cols_per_block > 8) {
+      fast_cols_per_block /= 2;
+    }
+    fast_block = dim3(fast_threads_per_col, fast_cols_per_block);
+    fast_grid = dim3((N + fast_cols_per_block - 1) / fast_cols_per_block, M);
+  }
+
   enc.launch_kernel([&,
                      x_ptr,
                      w_ptr,
@@ -2505,7 +2598,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
                      biases_ptr,
                      out_ptr,
                      fast_threads_per_col,
-                     use_tiny_k_qmv,
+                     use_noshared_qmv_variant,
                      x_batch_stride,
                      w_batch_stride,
                      sb_batch_stride,
@@ -2574,7 +2667,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
                       has_bias);
                 }
               } else {
-                if (use_tiny_k_qmv) {
+                if (use_noshared_qmv_variant) {
                   if (fast_threads_per_col == 16) {
                     hipLaunchKernelGGL(
                         (rocm::qmv_warp_noshared_kernel<
@@ -2758,7 +2851,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
                       has_bias);
                 }
               } else {
-                if (use_tiny_k_qmv) {
+                if (use_noshared_qmv_variant) {
                   if (fast_threads_per_col == 16) {
                     hipLaunchKernelGGL(
                         (rocm::qmv_warp_noshared_kernel<

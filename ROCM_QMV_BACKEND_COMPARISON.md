@@ -55,7 +55,7 @@ Compared with Metal (and partially CUDA), ROCm gaps are mostly scheduling/dispat
    - Fast route for common decode small-inner-dimension cases to reduce overhead.
    - Target file: `mlx/backend/rocm/quantized/qmm.hip`.
 
-4. **Add alignment-aware ROCm QMV variant selection**
+4. **[DONE] Add alignment-aware ROCm QMV variant selection**
    - Select specialized variants based on pointer alignment and packed layout compatibility.
    - Target file: `mlx/backend/rocm/quantized/qmm.hip`.
 
