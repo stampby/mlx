@@ -3460,6 +3460,8 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
       return;
     }
 
+#define has_bias has_bias, use_sorted_rhs_schedule, implicit_x_batch_stride
+
     if (x.dtype() == float32) {
       if (bits_ == 8 && group_size_ == 32) {
         hipLaunchKernelGGL(
@@ -4559,6 +4561,8 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
             std::to_string(bits_) + " gs=" + std::to_string(group_size_));
       }
     }
+
+#undef has_bias
   });
 }
 
