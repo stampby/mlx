@@ -16,7 +16,7 @@ namespace mlx::core::rocm {
 namespace {
 
 // Can be tuned with MLX_MAX_OPS_PER_BUFFER
-constexpr int default_max_ops_per_buffer = 1000;
+constexpr int default_max_ops_per_buffer = 2000;
 
 } // namespace
 
@@ -147,6 +147,14 @@ CommandEncoder::CommandEncoder(Device& d)
 
 CommandEncoder::~CommandEncoder() = default;
 
+void CommandEncoder::add_temporary(const array& arr) {
+  auto data = arr.data_shared_ptr();
+  const array::Data* ptr = data.get();
+  if (temporary_ptrs_.insert(ptr).second) {
+    temporaries_.push_back(std::move(data));
+  }
+}
+
 void CommandEncoder::add_completed_handler(std::function<void()> task) {
   worker_->add_task(std::move(task));
 }
@@ -169,6 +177,7 @@ void CommandEncoder::commit() {
   if (!temporaries_.empty()) {
     add_completed_handler([temporaries = std::move(temporaries_)]() {});
   }
+  temporary_ptrs_.clear();
   node_count_ = 0;
 
   // Put completion handlers in a batch.

@@ -18,6 +18,7 @@
 #include <functional>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace mlx::core::rocm {
@@ -40,9 +41,7 @@ class CommandEncoder {
   template <typename F>
   void launch_kernel(F&& func);
 
-  void add_temporary(const array& arr) {
-    temporaries_.push_back(arr.data_shared_ptr());
-  }
+  void add_temporary(const array& arr);
 
   void add_completed_handler(std::function<void()> task);
   void maybe_commit();
@@ -65,6 +64,7 @@ class CommandEncoder {
   std::unique_ptr<Worker> worker_;
   int node_count_{0};
   std::vector<std::shared_ptr<array::Data>> temporaries_;
+  std::unordered_set<const array::Data*> temporary_ptrs_;
 };
 
 class Device {
