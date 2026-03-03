@@ -13,6 +13,9 @@
 #include <hip/hip_runtime.h>
 #include <rocblas/rocblas.h>
 #include <cstring>
+#include <list>
+#include <mutex>
+#include <unordered_map>
 
 namespace mlx::core {
 
@@ -100,6 +103,36 @@ inline bool parse_warp_kernel_env(const char* env_name, bool default_value) {
   return default_value;
 }
 
+inline int parse_positive_int_env(const char* env_name, int default_value) {
+  const char* raw = std::getenv(env_name);
+  if (raw == nullptr || *raw == '\0') {
+    return default_value;
+  }
+
+  char* end = nullptr;
+  long value = std::strtol(raw, &end, 10);
+  if (end == raw || *end != '\0' || value <= 0) {
+    return default_value;
+  }
+  return static_cast<int>(value);
+}
+
+inline size_t parse_non_negative_size_t_env(
+    const char* env_name,
+    size_t default_value) {
+  const char* raw = std::getenv(env_name);
+  if (raw == nullptr || *raw == '\0') {
+    return default_value;
+  }
+
+  char* end = nullptr;
+  unsigned long long value = std::strtoull(raw, &end, 10);
+  if (end == raw || *end != '\0') {
+    return default_value;
+  }
+  return static_cast<size_t>(value);
+}
+
 // Check if rocBLAS dequant fast path should be used
 // Default ON
 inline bool use_rocblas_dequant_path() {
@@ -138,6 +171,9 @@ inline int select_qmv_cols_per_block(int K, int N, int bits) {
   if (N < 256) {
     return 4;
   }
+  if (K <= 1024) {
+    return (N < 1024) ? 8 : 16;
+  }
   if (bits == 8) {
     if (N < 1024) {
       return 8;
@@ -151,6 +187,353 @@ inline int select_qmv_cols_per_block(int K, int N, int bits) {
     return 8;
   }
   return 16;
+}
+
+inline bool should_use_dequant_gemm_path(
+    int M,
+    int N,
+    int K,
+    int batch_count,
+    bool non_batched,
+    bool can_use_batched_qmv) {
+  int env_threshold =
+      parse_positive_int_env("MLX_ROCM_QMM_DEQUANT_M_THRESHOLD", -1);
+  if (env_threshold > 0) {
+    return M >= env_threshold;
+  }
+
+  if (batch_count > 1) {
+    if (!can_use_batched_qmv) {
+      return true;
+    }
+    if (M <= 4) {
+      return false;
+    }
+    if (M >= 32) {
+      return true;
+    }
+    return (N >= 4096 && K >= 2048) || (N >= 8192 && M >= 8);
+  }
+
+  if (!non_batched) {
+    return M >= 24;
+  }
+
+  if (M <= 8) {
+    return false;
+  }
+  if (M >= 64) {
+    return true;
+  }
+  if (K <= 1024 && N <= 2048) {
+    return false;
+  }
+  if (N >= 8192 && K >= 2048) {
+    return M >= 16;
+  }
+  return M >= 24;
+}
+
+struct DequantCacheKey {
+  std::uintptr_t w_id;
+  std::uintptr_t scales_id;
+  std::uintptr_t biases_id;
+  int group_size;
+  int bits;
+  int stream_index;
+  bool transpose;
+  Dtype dtype;
+
+  bool operator==(const DequantCacheKey& other) const {
+    return w_id == other.w_id && scales_id == other.scales_id &&
+        biases_id == other.biases_id && group_size == other.group_size &&
+        bits == other.bits && stream_index == other.stream_index &&
+        transpose == other.transpose && dtype == other.dtype;
+  }
+};
+
+struct DequantCacheKeyHasher {
+  size_t operator()(const DequantCacheKey& key) const {
+    size_t h = std::hash<std::uintptr_t>{}(key.w_id);
+    h ^= std::hash<std::uintptr_t>{}(key.scales_id) + 0x9e3779b9 + (h << 6) +
+        (h >> 2);
+    h ^= std::hash<std::uintptr_t>{}(key.biases_id) + 0x9e3779b9 + (h << 6) +
+        (h >> 2);
+    h ^= std::hash<int>{}(key.group_size) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    h ^= std::hash<int>{}(key.bits) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    h ^= std::hash<int>{}(key.stream_index) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    h ^= std::hash<int>{}(static_cast<int>(key.transpose)) + 0x9e3779b9 +
+        (h << 6) + (h >> 2);
+    h ^= std::hash<int>{}(static_cast<int>(key.dtype.val())) + 0x9e3779b9 +
+        (h << 6) + (h >> 2);
+    return h;
+  }
+};
+
+struct DequantCacheEntry {
+  array weight;
+  array w_source;
+  array scales_source;
+  std::optional<array> biases_source;
+  size_t bytes;
+  std::list<DequantCacheKey>::iterator lru_it;
+};
+
+inline int dequant_cache_capacity() {
+  static int capacity = []() {
+    const char* raw = std::getenv("MLX_ROCM_QMM_DEQUANT_CACHE_SIZE");
+    if (raw == nullptr || *raw == '\0') {
+      return 8;
+    }
+    char* end = nullptr;
+    long value = std::strtol(raw, &end, 10);
+    if (end == raw || *end != '\0' || value < 0) {
+      return 8;
+    }
+    return static_cast<int>(value);
+  }();
+  return capacity;
+}
+
+inline size_t dequant_cache_max_bytes() {
+  static size_t max_bytes = parse_non_negative_size_t_env(
+      "MLX_ROCM_QMM_DEQUANT_CACHE_MAX_BYTES", 256ULL * 1024ULL * 1024ULL);
+  return max_bytes;
+}
+
+inline rocblas_operation to_rocblas_op(bool transpose) {
+  return transpose ? rocblas_operation_transpose : rocblas_operation_none;
+}
+
+void dequant_rocblas_gemm(
+    rocm::CommandEncoder& enc,
+    bool transpose_a,
+    bool transpose_b,
+    int M,
+    int N,
+    int K,
+    float alpha,
+    const array& a,
+    int lda,
+    const array& b,
+    int ldb,
+    float beta,
+    array& c,
+    int ldc,
+    Dtype dtype) {
+  const void* a_ptr = gpu_ptr<void>(a);
+  const void* b_ptr = gpu_ptr<void>(b);
+  void* c_ptr = gpu_ptr<void>(c);
+
+  enc.launch_kernel([&, a_ptr, b_ptr, c_ptr](hipStream_t stream) {
+    enc.device().set_rocblas_stream(stream);
+    rocblas_handle handle = enc.device().get_rocblas_handle();
+
+    rocblas_operation op_a = to_rocblas_op(transpose_a);
+    rocblas_operation op_b = to_rocblas_op(transpose_b);
+
+    switch (dtype) {
+      case float32: {
+        float alpha_f = alpha;
+        float beta_f = beta;
+        rocblas_sgemm(
+            handle,
+            op_b,
+            op_a,
+            N,
+            M,
+            K,
+            &alpha_f,
+            static_cast<const float*>(b_ptr),
+            ldb,
+            static_cast<const float*>(a_ptr),
+            lda,
+            &beta_f,
+            static_cast<float*>(c_ptr),
+            ldc);
+        break;
+      }
+      case float16: {
+        rocblas_half alpha_h, beta_h;
+        __half alpha_f16 = static_cast<__half>(alpha);
+        __half beta_f16 = static_cast<__half>(beta);
+        std::memcpy(&alpha_h, &alpha_f16, sizeof(rocblas_half));
+        std::memcpy(&beta_h, &beta_f16, sizeof(rocblas_half));
+        rocblas_hgemm(
+            handle,
+            op_b,
+            op_a,
+            N,
+            M,
+            K,
+            &alpha_h,
+            reinterpret_cast<const rocblas_half*>(b_ptr),
+            ldb,
+            reinterpret_cast<const rocblas_half*>(a_ptr),
+            lda,
+            &beta_h,
+            reinterpret_cast<rocblas_half*>(c_ptr),
+            ldc);
+        break;
+      }
+      case bfloat16: {
+        float alpha_f = alpha;
+        float beta_f = beta;
+        rocblas_gemm_ex(
+            handle,
+            op_b,
+            op_a,
+            N,
+            M,
+            K,
+            &alpha_f,
+            b_ptr,
+            rocblas_datatype_bf16_r,
+            ldb,
+            a_ptr,
+            rocblas_datatype_bf16_r,
+            lda,
+            &beta_f,
+            c_ptr,
+            rocblas_datatype_bf16_r,
+            ldc,
+            c_ptr,
+            rocblas_datatype_bf16_r,
+            ldc,
+            rocblas_datatype_f32_r,
+            rocblas_gemm_algo_standard,
+            0,
+            0);
+        break;
+      }
+      default:
+        throw std::runtime_error("Unsupported dtype for rocBLAS GEMM");
+    }
+  });
+}
+
+void dequant_rocblas_gemm_batched(
+    rocm::CommandEncoder& enc,
+    bool transpose_a,
+    bool transpose_b,
+    int M,
+    int N,
+    int K,
+    float alpha,
+    const array& a,
+    int lda,
+    int64_t stride_a,
+    const array& b,
+    int ldb,
+    int64_t stride_b,
+    float beta,
+    array& c,
+    int ldc,
+    int64_t stride_c,
+    int batch_count,
+    Dtype dtype) {
+  const void* a_ptr = gpu_ptr<void>(a);
+  const void* b_ptr = gpu_ptr<void>(b);
+  void* c_ptr = gpu_ptr<void>(c);
+
+  enc.launch_kernel([&, a_ptr, b_ptr, c_ptr](hipStream_t stream) {
+    enc.device().set_rocblas_stream(stream);
+    rocblas_handle handle = enc.device().get_rocblas_handle();
+
+    rocblas_operation op_a = to_rocblas_op(transpose_a);
+    rocblas_operation op_b = to_rocblas_op(transpose_b);
+
+    switch (dtype) {
+      case float32: {
+        float alpha_f = alpha;
+        float beta_f = beta;
+        rocblas_sgemm_strided_batched(
+            handle,
+            op_b,
+            op_a,
+            N,
+            M,
+            K,
+            &alpha_f,
+            static_cast<const float*>(b_ptr),
+            ldb,
+            stride_b,
+            static_cast<const float*>(a_ptr),
+            lda,
+            stride_a,
+            &beta_f,
+            static_cast<float*>(c_ptr),
+            ldc,
+            stride_c,
+            batch_count);
+        break;
+      }
+      case float16: {
+        rocblas_half alpha_h, beta_h;
+        __half alpha_f16 = static_cast<__half>(alpha);
+        __half beta_f16 = static_cast<__half>(beta);
+        std::memcpy(&alpha_h, &alpha_f16, sizeof(rocblas_half));
+        std::memcpy(&beta_h, &beta_f16, sizeof(rocblas_half));
+        rocblas_hgemm_strided_batched(
+            handle,
+            op_b,
+            op_a,
+            N,
+            M,
+            K,
+            &alpha_h,
+            reinterpret_cast<const rocblas_half*>(b_ptr),
+            ldb,
+            stride_b,
+            reinterpret_cast<const rocblas_half*>(a_ptr),
+            lda,
+            stride_a,
+            &beta_h,
+            reinterpret_cast<rocblas_half*>(c_ptr),
+            ldc,
+            stride_c,
+            batch_count);
+        break;
+      }
+      case bfloat16: {
+        float alpha_f = alpha;
+        float beta_f = beta;
+        rocblas_gemm_strided_batched_ex(
+            handle,
+            op_b,
+            op_a,
+            N,
+            M,
+            K,
+            &alpha_f,
+            b_ptr,
+            rocblas_datatype_bf16_r,
+            ldb,
+            stride_b,
+            a_ptr,
+            rocblas_datatype_bf16_r,
+            lda,
+            stride_a,
+            &beta_f,
+            c_ptr,
+            rocblas_datatype_bf16_r,
+            ldc,
+            stride_c,
+            c_ptr,
+            rocblas_datatype_bf16_r,
+            ldc,
+            stride_c,
+            batch_count,
+            rocblas_datatype_f32_r,
+            rocblas_gemm_algo_standard,
+            0,
+            0);
+        break;
+      }
+      default:
+        throw std::runtime_error("Unsupported dtype for rocBLAS batched GEMM");
+    }
+  });
 }
 
 } // namespace
@@ -217,23 +600,40 @@ __device__ __forceinline__ T warp_reduce_sum_qmm(T val) {
 
 __device__ inline float fp4_e2m1_to_float(uint8_t val) {
   switch (val & 0xF) {
-    case 0x0: return 0.0f;
-    case 0x1: return 0.5f;
-    case 0x2: return 1.0f;
-    case 0x3: return 1.5f;
-    case 0x4: return 2.0f;
-    case 0x5: return 3.0f;
-    case 0x6: return 4.0f;
-    case 0x7: return 6.0f;
-    case 0x8: return -0.0f;
-    case 0x9: return -0.5f;
-    case 0xA: return -1.0f;
-    case 0xB: return -1.5f;
-    case 0xC: return -2.0f;
-    case 0xD: return -3.0f;
-    case 0xE: return -4.0f;
-    case 0xF: return -6.0f;
-    default: return 0.0f;
+    case 0x0:
+      return 0.0f;
+    case 0x1:
+      return 0.5f;
+    case 0x2:
+      return 1.0f;
+    case 0x3:
+      return 1.5f;
+    case 0x4:
+      return 2.0f;
+    case 0x5:
+      return 3.0f;
+    case 0x6:
+      return 4.0f;
+    case 0x7:
+      return 6.0f;
+    case 0x8:
+      return -0.0f;
+    case 0x9:
+      return -0.5f;
+    case 0xA:
+      return -1.0f;
+    case 0xB:
+      return -1.5f;
+    case 0xC:
+      return -2.0f;
+    case 0xD:
+      return -3.0f;
+    case 0xE:
+      return -4.0f;
+    case 0xF:
+      return -6.0f;
+    default:
+      return 0.0f;
   }
 }
 
@@ -241,7 +641,7 @@ __device__ __forceinline__ float fp8_e4m3_to_float(uint8_t val) {
   // Use a simple array lookup or bit manipulation.
   // Actually, MI300 supports hardware fp8 conversion:
   // But we can just use a fast bit manipulation without branches.
-  
+
   uint32_t sign = (val >> 7) & 0x1;
   uint32_t exp = (val >> 3) & 0xF;
   uint32_t mant = val & 0x7;
@@ -251,7 +651,7 @@ __device__ __forceinline__ float fp8_e4m3_to_float(uint8_t val) {
   }
 
   uint32_t float_exp = exp == 0 ? 0 : exp - 7 + 127;
-  // Handle subnormals approximately or cleanly if needed, 
+  // Handle subnormals approximately or cleanly if needed,
   // but for performance, we can just do:
   if (exp == 0) {
     float subnormal = static_cast<float>(mant) * 0.001953125f; // 2^-9
@@ -331,7 +731,8 @@ __global__ void __launch_bounds__(1024) qmv_warp_shared_kernel(
   const T* x_row = (row < M) ? (x + row * K) : nullptr;
   const uint8_t* w_row = valid ? (w + col * row_bytes) : nullptr;
   const ScaleT* scales_row = valid ? (scales + col * num_groups) : nullptr;
-  const ScaleT* biases_row = (valid && has_bias) ? (biases + col * num_groups) : nullptr;
+  const ScaleT* biases_row =
+      (valid && has_bias) ? (biases + col * num_groups) : nullptr;
 
   float acc = 0.0f;
 
@@ -359,7 +760,8 @@ __global__ void __launch_bounds__(1024) qmv_warp_shared_kernel(
         int k_start = max(g * GROUP_SIZE, chunk_start);
         int k_end_g = min((g + 1) * GROUP_SIZE, chunk_end);
 
-        float scale = load_scale_value<ScaleT, GROUP_SIZE, AFFINE>(scales_row[g]);
+        float scale =
+            load_scale_value<ScaleT, GROUP_SIZE, AFFINE>(scales_row[g]);
         float bias_val = has_bias ? static_cast<float>(biases_row[g]) : 0.0f;
 
         if constexpr (AFFINE) {
@@ -372,24 +774,25 @@ __global__ void __launch_bounds__(1024) qmv_warp_shared_kernel(
             int step = THREADS_PER_COL * 4;
             for (; k_start + k_local + 3 < k_end_g; k_local += step) {
               int k = k_start + k_local;
-              
+
               uint32_t w_packed = *reinterpret_cast<const uint32_t*>(&w_row[k]);
               float w0 = static_cast<float>(w_packed & 0xFF);
               float w1 = static_cast<float>((w_packed >> 8) & 0xFF);
               float w2 = static_cast<float>((w_packed >> 16) & 0xFF);
               float w3 = static_cast<float>((w_packed >> 24) & 0xFF);
-              
+
               float x0 = shared_x[k - chunk_start];
               float x1 = shared_x[k - chunk_start + 1];
               float x2 = shared_x[k - chunk_start + 2];
               float x3 = shared_x[k - chunk_start + 3];
-              
+
               qx_acc0 = fmaf(x0, w0, qx_acc0);
               qx_acc1 = fmaf(x1, w1, qx_acc1);
               qx_acc2 = fmaf(x2, w2, qx_acc2);
               qx_acc3 = fmaf(x3, w3, qx_acc3);
-              
-              if (has_bias) x_group_sum += x0 + x1 + x2 + x3;
+
+              if (has_bias)
+                x_group_sum += x0 + x1 + x2 + x3;
             }
             qx_acc = qx_acc0 + qx_acc1 + qx_acc2 + qx_acc3;
             for (; k_start + k_local < k_end_g; k_local++) {
@@ -397,14 +800,16 @@ __global__ void __launch_bounds__(1024) qmv_warp_shared_kernel(
               float x_val = shared_x[k - chunk_start];
               float w_val = static_cast<float>(w_row[k]);
               qx_acc = fmaf(x_val, w_val, qx_acc);
-              if (has_bias) x_group_sum += x_val;
+              if (has_bias)
+                x_group_sum += x_val;
             }
           } else if constexpr (BITS == 4) {
             int k_local = lane * 8;
             int step = THREADS_PER_COL * 8;
             for (; k_start + k_local + 7 < k_end_g; k_local += step) {
               int k = k_start + k_local;
-              uint32_t w_packed = *reinterpret_cast<const uint32_t*>(&w_row[k / 2]);
+              uint32_t w_packed =
+                  *reinterpret_cast<const uint32_t*>(&w_row[k / 2]);
               float w0 = static_cast<float>(w_packed & 0xF);
               float w1 = static_cast<float>((w_packed >> 4) & 0xF);
               float w2 = static_cast<float>((w_packed >> 8) & 0xF);
@@ -429,14 +834,17 @@ __global__ void __launch_bounds__(1024) qmv_warp_shared_kernel(
               qx_acc = fmaf(x5, w5, qx_acc);
               qx_acc = fmaf(x6, w6, qx_acc);
               qx_acc = fmaf(x7, w7, qx_acc);
-              if (has_bias) x_group_sum += x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7;
+              if (has_bias)
+                x_group_sum += x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7;
             }
             for (; k_start + k_local < k_end_g; k_local++) {
               int k = k_start + k_local;
               float x_val = shared_x[k - chunk_start];
-              uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              uint8_t quant_val =
+                  unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
               qx_acc = fmaf(x_val, static_cast<float>(quant_val), qx_acc);
-              if (has_bias) x_group_sum += x_val;
+              if (has_bias)
+                x_group_sum += x_val;
             }
           } else if constexpr (BITS == 6) {
             // Process 8 weights at a time (48 bits = 6 bytes)
@@ -444,8 +852,11 @@ __global__ void __launch_bounds__(1024) qmv_warp_shared_kernel(
             int step = THREADS_PER_COL * 8;
             // Need at least 7 bytes of room after byte_idx for safe 8-byte load
             // row_bytes = (K * 6 + 7) / 8, so we need byte_idx + 7 < row_bytes
-            int max_safe_k = ((row_bytes - 7) * 8) / 6;  // Max k where 8-byte load is safe
-            for (; k_start + k_local + 7 < k_end_g && k_start + k_local < max_safe_k; k_local += step) {
+            int max_safe_k =
+                ((row_bytes - 7) * 8) / 6; // Max k where 8-byte load is safe
+            for (; k_start + k_local + 7 < k_end_g &&
+                 k_start + k_local < max_safe_k;
+                 k_local += step) {
               int k = k_start + k_local;
               // 8 weights * 6 bits = 48 bits, starting at bit position k*6
               int byte_idx = (k * 6) / 8;
@@ -479,26 +890,33 @@ __global__ void __launch_bounds__(1024) qmv_warp_shared_kernel(
               qx_acc = fmaf(x5, w5, qx_acc);
               qx_acc = fmaf(x6, w6, qx_acc);
               qx_acc = fmaf(x7, w7, qx_acc);
-              if (has_bias) x_group_sum += x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7;
+              if (has_bias)
+                x_group_sum += x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7;
             }
             for (; k_start + k_local < k_end_g; k_local++) {
               int k = k_start + k_local;
               float x_val = shared_x[k - chunk_start];
-              uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              uint8_t quant_val =
+                  unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
               qx_acc = fmaf(x_val, static_cast<float>(quant_val), qx_acc);
-              if (has_bias) x_group_sum += x_val;
+              if (has_bias)
+                x_group_sum += x_val;
             }
           } else {
-            for (int k_local = lane; k_start + k_local < k_end_g; k_local += THREADS_PER_COL) {
+            for (int k_local = lane; k_start + k_local < k_end_g;
+                 k_local += THREADS_PER_COL) {
               int k = k_start + k_local;
               float x_val = shared_x[k - chunk_start];
-              uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              uint8_t quant_val =
+                  unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
               qx_acc = fmaf(x_val, static_cast<float>(quant_val), qx_acc);
-              if (has_bias) x_group_sum += x_val;
+              if (has_bias)
+                x_group_sum += x_val;
             }
           }
           acc += scale * qx_acc;
-          if (has_bias) acc += bias_val * x_group_sum;
+          if (has_bias)
+            acc += bias_val * x_group_sum;
         } else {
           float qx_acc0 = 0.0f, qx_acc1 = 0.0f, qx_acc2 = 0.0f, qx_acc3 = 0.0f;
           float qx_acc = 0.0f;
@@ -512,12 +930,12 @@ __global__ void __launch_bounds__(1024) qmv_warp_shared_kernel(
               float w1 = fp8_e4m3_to_float((w_packed >> 8) & 0xFF);
               float w2 = fp8_e4m3_to_float((w_packed >> 16) & 0xFF);
               float w3 = fp8_e4m3_to_float((w_packed >> 24) & 0xFF);
-              
+
               float x0 = shared_x[k - chunk_start];
               float x1 = shared_x[k - chunk_start + 1];
               float x2 = shared_x[k - chunk_start + 2];
               float x3 = shared_x[k - chunk_start + 3];
-              
+
               qx_acc0 = fmaf(x0, w0, qx_acc0);
               qx_acc1 = fmaf(x1, w1, qx_acc1);
               qx_acc2 = fmaf(x2, w2, qx_acc2);
@@ -531,18 +949,23 @@ __global__ void __launch_bounds__(1024) qmv_warp_shared_kernel(
               qx_acc = fmaf(x_val, w_val, qx_acc);
             }
           } else if constexpr (BITS == 4) {
-            for (int k_local = lane; k_start + k_local < k_end_g; k_local += THREADS_PER_COL) {
+            for (int k_local = lane; k_start + k_local < k_end_g;
+                 k_local += THREADS_PER_COL) {
               int k = k_start + k_local;
               float x_val = shared_x[k - chunk_start];
-              uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
-              qx_acc = fmaf(x_val, dequantize_value<BITS, false>(quant_val, 1.0f, 0.0f), qx_acc);
+              uint8_t quant_val =
+                  unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              qx_acc = fmaf(
+                  x_val,
+                  dequantize_value<BITS, false>(quant_val, 1.0f, 0.0f),
+                  qx_acc);
             }
           } else if constexpr (BITS == 6) {
             int k_local = lane * 8;
             int step = THREADS_PER_COL * 8;
             int max_safe_k = ((row_bytes - 7) * 8) / 6;
             for (; k_start + k_local + 7 < k_end_g &&
-                   k_start + k_local < max_safe_k;
+                 k_start + k_local < max_safe_k;
                  k_local += step) {
               int k = k_start + k_local;
               int byte_idx = (k * 6) / 8;
@@ -550,14 +973,22 @@ __global__ void __launch_bounds__(1024) qmv_warp_shared_kernel(
               uint64_t w_packed = 0;
               memcpy(&w_packed, &w_row[byte_idx], 8);
               w_packed >>= bit_offset;
-              float w0 = dequantize_value<6, false>(w_packed & 0x3F, 1.0f, 0.0f);
-              float w1 = dequantize_value<6, false>((w_packed >> 6) & 0x3F, 1.0f, 0.0f);
-              float w2 = dequantize_value<6, false>((w_packed >> 12) & 0x3F, 1.0f, 0.0f);
-              float w3 = dequantize_value<6, false>((w_packed >> 18) & 0x3F, 1.0f, 0.0f);
-              float w4 = dequantize_value<6, false>((w_packed >> 24) & 0x3F, 1.0f, 0.0f);
-              float w5 = dequantize_value<6, false>((w_packed >> 30) & 0x3F, 1.0f, 0.0f);
-              float w6 = dequantize_value<6, false>((w_packed >> 36) & 0x3F, 1.0f, 0.0f);
-              float w7 = dequantize_value<6, false>((w_packed >> 42) & 0x3F, 1.0f, 0.0f);
+              float w0 =
+                  dequantize_value<6, false>(w_packed & 0x3F, 1.0f, 0.0f);
+              float w1 = dequantize_value<6, false>(
+                  (w_packed >> 6) & 0x3F, 1.0f, 0.0f);
+              float w2 = dequantize_value<6, false>(
+                  (w_packed >> 12) & 0x3F, 1.0f, 0.0f);
+              float w3 = dequantize_value<6, false>(
+                  (w_packed >> 18) & 0x3F, 1.0f, 0.0f);
+              float w4 = dequantize_value<6, false>(
+                  (w_packed >> 24) & 0x3F, 1.0f, 0.0f);
+              float w5 = dequantize_value<6, false>(
+                  (w_packed >> 30) & 0x3F, 1.0f, 0.0f);
+              float w6 = dequantize_value<6, false>(
+                  (w_packed >> 36) & 0x3F, 1.0f, 0.0f);
+              float w7 = dequantize_value<6, false>(
+                  (w_packed >> 42) & 0x3F, 1.0f, 0.0f);
               float x0 = shared_x[k - chunk_start];
               float x1 = shared_x[k - chunk_start + 1];
               float x2 = shared_x[k - chunk_start + 2];
@@ -579,15 +1010,24 @@ __global__ void __launch_bounds__(1024) qmv_warp_shared_kernel(
             for (; k_start + k_local < k_end_g; k_local++) {
               int k = k_start + k_local;
               float x_val = shared_x[k - chunk_start];
-              uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
-              qx_acc = fmaf(x_val, dequantize_value<BITS, false>(quant_val, 1.0f, 0.0f), qx_acc);
+              uint8_t quant_val =
+                  unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              qx_acc = fmaf(
+                  x_val,
+                  dequantize_value<BITS, false>(quant_val, 1.0f, 0.0f),
+                  qx_acc);
             }
           } else {
-            for (int k_local = lane; k_start + k_local < k_end_g; k_local += THREADS_PER_COL) {
+            for (int k_local = lane; k_start + k_local < k_end_g;
+                 k_local += THREADS_PER_COL) {
               int k = k_start + k_local;
               float x_val = shared_x[k - chunk_start];
-              uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
-              qx_acc = fmaf(x_val, dequantize_value<BITS, false>(quant_val, 1.0f, 0.0f), qx_acc);
+              uint8_t quant_val =
+                  unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              qx_acc = fmaf(
+                  x_val,
+                  dequantize_value<BITS, false>(quant_val, 1.0f, 0.0f),
+                  qx_acc);
             }
           }
           acc += scale * qx_acc;
@@ -636,25 +1076,22 @@ __global__ void __launch_bounds__(1024) qmv_warp_shared_batched_kernel(
   const int row_bytes = (K * BITS + 7) / 8;
 
   const T* x_batch_ptr = x + static_cast<int64_t>(batch) * x_batch_stride;
-  const uint8_t* w_batch_ptr =
-      w + static_cast<int64_t>(batch) * w_batch_stride;
+  const uint8_t* w_batch_ptr = w + static_cast<int64_t>(batch) * w_batch_stride;
   const ScaleT* scales_batch_ptr =
       scales + static_cast<int64_t>(batch) * sb_batch_stride;
-  const ScaleT* biases_batch_ptr =
-      has_bias
+  const ScaleT* biases_batch_ptr = has_bias
       ? (biases + static_cast<int64_t>(batch) * sb_batch_stride)
       : nullptr;
   T* out_batch_ptr = out + static_cast<int64_t>(batch) * out_batch_stride;
 
-  const T* x_row = (row < M) ? (x_batch_ptr + static_cast<int64_t>(row) * K)
-                             : nullptr;
+  const T* x_row =
+      (row < M) ? (x_batch_ptr + static_cast<int64_t>(row) * K) : nullptr;
   const uint8_t* w_row =
       valid ? (w_batch_ptr + static_cast<int64_t>(col) * row_bytes) : nullptr;
-  const ScaleT* scales_row =
-      valid ? (scales_batch_ptr + static_cast<int64_t>(col) * num_groups)
-            : nullptr;
-  const ScaleT* biases_row =
-      (valid && has_bias)
+  const ScaleT* scales_row = valid
+      ? (scales_batch_ptr + static_cast<int64_t>(col) * num_groups)
+      : nullptr;
+  const ScaleT* biases_row = (valid && has_bias)
       ? (biases_batch_ptr + static_cast<int64_t>(col) * num_groups)
       : nullptr;
 
@@ -681,7 +1118,8 @@ __global__ void __launch_bounds__(1024) qmv_warp_shared_batched_kernel(
         int k_start = max(g * GROUP_SIZE, chunk_start);
         int k_end_g = min((g + 1) * GROUP_SIZE, chunk_end);
 
-        float scale = load_scale_value<ScaleT, GROUP_SIZE, AFFINE>(scales_row[g]);
+        float scale =
+            load_scale_value<ScaleT, GROUP_SIZE, AFFINE>(scales_row[g]);
         float bias_val = has_bias ? static_cast<float>(biases_row[g]) : 0.0f;
 
         if constexpr (AFFINE) {
@@ -733,7 +1171,8 @@ __global__ void __launch_bounds__(1024) qmv_warp_shared_batched_kernel(
             int step = THREADS_PER_COL * 8;
             for (; k_start + k_local + 7 < k_end_g; k_local += step) {
               int k = k_start + k_local;
-              uint32_t w_packed = *reinterpret_cast<const uint32_t*>(&w_row[k / 2]);
+              uint32_t w_packed =
+                  *reinterpret_cast<const uint32_t*>(&w_row[k / 2]);
               float w0 = static_cast<float>(w_packed & 0xF);
               float w1 = static_cast<float>((w_packed >> 4) & 0xF);
               float w2 = static_cast<float>((w_packed >> 8) & 0xF);
@@ -765,7 +1204,8 @@ __global__ void __launch_bounds__(1024) qmv_warp_shared_batched_kernel(
             for (; k_start + k_local < k_end_g; k_local++) {
               int k = k_start + k_local;
               float x_val = shared_x[k - chunk_start];
-              uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              uint8_t quant_val =
+                  unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
               qx_acc = fmaf(x_val, static_cast<float>(quant_val), qx_acc);
               if (has_bias) {
                 x_group_sum += x_val;
@@ -776,7 +1216,7 @@ __global__ void __launch_bounds__(1024) qmv_warp_shared_batched_kernel(
             int step = THREADS_PER_COL * 8;
             int max_safe_k = ((row_bytes - 7) * 8) / 6;
             for (; k_start + k_local + 7 < k_end_g &&
-                   k_start + k_local < max_safe_k;
+                 k_start + k_local < max_safe_k;
                  k_local += step) {
               int k = k_start + k_local;
               int byte_idx = (k * 6) / 8;
@@ -815,7 +1255,8 @@ __global__ void __launch_bounds__(1024) qmv_warp_shared_batched_kernel(
             for (; k_start + k_local < k_end_g; k_local++) {
               int k = k_start + k_local;
               float x_val = shared_x[k - chunk_start];
-              uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              uint8_t quant_val =
+                  unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
               qx_acc = fmaf(x_val, static_cast<float>(quant_val), qx_acc);
               if (has_bias) {
                 x_group_sum += x_val;
@@ -826,7 +1267,8 @@ __global__ void __launch_bounds__(1024) qmv_warp_shared_batched_kernel(
                  k_local += THREADS_PER_COL) {
               int k = k_start + k_local;
               float x_val = shared_x[k - chunk_start];
-              uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              uint8_t quant_val =
+                  unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
               qx_acc = fmaf(x_val, static_cast<float>(quant_val), qx_acc);
               if (has_bias) {
                 x_group_sum += x_val;
@@ -877,15 +1319,23 @@ __global__ void __launch_bounds__(1024) qmv_warp_shared_batched_kernel(
             int step = THREADS_PER_COL * 8;
             for (; k_start + k_local + 7 < k_end_g; k_local += step) {
               int k = k_start + k_local;
-              uint32_t w_packed = *reinterpret_cast<const uint32_t*>(&w_row[k / 2]);
+              uint32_t w_packed =
+                  *reinterpret_cast<const uint32_t*>(&w_row[k / 2]);
               float w0 = dequantize_value<4, false>(w_packed & 0xF, 1.0f, 0.0f);
-              float w1 = dequantize_value<4, false>((w_packed >> 4) & 0xF, 1.0f, 0.0f);
-              float w2 = dequantize_value<4, false>((w_packed >> 8) & 0xF, 1.0f, 0.0f);
-              float w3 = dequantize_value<4, false>((w_packed >> 12) & 0xF, 1.0f, 0.0f);
-              float w4 = dequantize_value<4, false>((w_packed >> 16) & 0xF, 1.0f, 0.0f);
-              float w5 = dequantize_value<4, false>((w_packed >> 20) & 0xF, 1.0f, 0.0f);
-              float w6 = dequantize_value<4, false>((w_packed >> 24) & 0xF, 1.0f, 0.0f);
-              float w7 = dequantize_value<4, false>((w_packed >> 28) & 0xF, 1.0f, 0.0f);
+              float w1 =
+                  dequantize_value<4, false>((w_packed >> 4) & 0xF, 1.0f, 0.0f);
+              float w2 =
+                  dequantize_value<4, false>((w_packed >> 8) & 0xF, 1.0f, 0.0f);
+              float w3 = dequantize_value<4, false>(
+                  (w_packed >> 12) & 0xF, 1.0f, 0.0f);
+              float w4 = dequantize_value<4, false>(
+                  (w_packed >> 16) & 0xF, 1.0f, 0.0f);
+              float w5 = dequantize_value<4, false>(
+                  (w_packed >> 20) & 0xF, 1.0f, 0.0f);
+              float w6 = dequantize_value<4, false>(
+                  (w_packed >> 24) & 0xF, 1.0f, 0.0f);
+              float w7 = dequantize_value<4, false>(
+                  (w_packed >> 28) & 0xF, 1.0f, 0.0f);
               float x0 = shared_x[k - chunk_start];
               float x1 = shared_x[k - chunk_start + 1];
               float x2 = shared_x[k - chunk_start + 2];
@@ -906,15 +1356,19 @@ __global__ void __launch_bounds__(1024) qmv_warp_shared_batched_kernel(
             for (; k_start + k_local < k_end_g; k_local++) {
               int k = k_start + k_local;
               float x_val = shared_x[k - chunk_start];
-              uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
-              qx_acc = fmaf(x_val, dequantize_value<BITS, false>(quant_val, 1.0f, 0.0f), qx_acc);
+              uint8_t quant_val =
+                  unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              qx_acc = fmaf(
+                  x_val,
+                  dequantize_value<BITS, false>(quant_val, 1.0f, 0.0f),
+                  qx_acc);
             }
           } else if constexpr (BITS == 6) {
             int k_local = lane * 8;
             int step = THREADS_PER_COL * 8;
             int max_safe_k = ((row_bytes - 7) * 8) / 6;
             for (; k_start + k_local + 7 < k_end_g &&
-                   k_start + k_local < max_safe_k;
+                 k_start + k_local < max_safe_k;
                  k_local += step) {
               int k = k_start + k_local;
               int byte_idx = (k * 6) / 8;
@@ -922,14 +1376,22 @@ __global__ void __launch_bounds__(1024) qmv_warp_shared_batched_kernel(
               uint64_t w_packed = 0;
               memcpy(&w_packed, &w_row[byte_idx], 8);
               w_packed >>= bit_offset;
-              float w0 = dequantize_value<6, false>(w_packed & 0x3F, 1.0f, 0.0f);
-              float w1 = dequantize_value<6, false>((w_packed >> 6) & 0x3F, 1.0f, 0.0f);
-              float w2 = dequantize_value<6, false>((w_packed >> 12) & 0x3F, 1.0f, 0.0f);
-              float w3 = dequantize_value<6, false>((w_packed >> 18) & 0x3F, 1.0f, 0.0f);
-              float w4 = dequantize_value<6, false>((w_packed >> 24) & 0x3F, 1.0f, 0.0f);
-              float w5 = dequantize_value<6, false>((w_packed >> 30) & 0x3F, 1.0f, 0.0f);
-              float w6 = dequantize_value<6, false>((w_packed >> 36) & 0x3F, 1.0f, 0.0f);
-              float w7 = dequantize_value<6, false>((w_packed >> 42) & 0x3F, 1.0f, 0.0f);
+              float w0 =
+                  dequantize_value<6, false>(w_packed & 0x3F, 1.0f, 0.0f);
+              float w1 = dequantize_value<6, false>(
+                  (w_packed >> 6) & 0x3F, 1.0f, 0.0f);
+              float w2 = dequantize_value<6, false>(
+                  (w_packed >> 12) & 0x3F, 1.0f, 0.0f);
+              float w3 = dequantize_value<6, false>(
+                  (w_packed >> 18) & 0x3F, 1.0f, 0.0f);
+              float w4 = dequantize_value<6, false>(
+                  (w_packed >> 24) & 0x3F, 1.0f, 0.0f);
+              float w5 = dequantize_value<6, false>(
+                  (w_packed >> 30) & 0x3F, 1.0f, 0.0f);
+              float w6 = dequantize_value<6, false>(
+                  (w_packed >> 36) & 0x3F, 1.0f, 0.0f);
+              float w7 = dequantize_value<6, false>(
+                  (w_packed >> 42) & 0x3F, 1.0f, 0.0f);
               float x0 = shared_x[k - chunk_start];
               float x1 = shared_x[k - chunk_start + 1];
               float x2 = shared_x[k - chunk_start + 2];
@@ -950,15 +1412,20 @@ __global__ void __launch_bounds__(1024) qmv_warp_shared_batched_kernel(
             for (; k_start + k_local < k_end_g; k_local++) {
               int k = k_start + k_local;
               float x_val = shared_x[k - chunk_start];
-              uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
-              qx_acc = fmaf(x_val, dequantize_value<BITS, false>(quant_val, 1.0f, 0.0f), qx_acc);
+              uint8_t quant_val =
+                  unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              qx_acc = fmaf(
+                  x_val,
+                  dequantize_value<BITS, false>(quant_val, 1.0f, 0.0f),
+                  qx_acc);
             }
           } else {
             for (int k_local = lane; k_start + k_local < k_end_g;
                  k_local += THREADS_PER_COL) {
               int k = k_start + k_local;
               float x_val = shared_x[k - chunk_start];
-              uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              uint8_t quant_val =
+                  unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
               qx_acc = fmaf(
                   x_val,
                   dequantize_value<BITS, false>(quant_val, 1.0f, 0.0f),
@@ -1026,52 +1493,56 @@ __global__ void qmv_warp_noshared_kernel(
         float qx_acc0 = 0.0f, qx_acc1 = 0.0f, qx_acc2 = 0.0f, qx_acc3 = 0.0f;
         float x_group_sum = 0.0f;
         float qx_acc = 0.0f;
-        
+
         if constexpr (BITS == 8) {
           int k_local = lane * 4;
           int step = kThreadsPerCol * 4;
           for (; k_start + k_local + 3 < k_end; k_local += step) {
             int k = k_start + k_local;
-            
+
             // Read 4 weights at once
             uint32_t w_packed = *reinterpret_cast<const uint32_t*>(&w_row[k]);
             float w0 = static_cast<float>(w_packed & 0xFF);
             float w1 = static_cast<float>((w_packed >> 8) & 0xFF);
             float w2 = static_cast<float>((w_packed >> 16) & 0xFF);
             float w3 = static_cast<float>((w_packed >> 24) & 0xFF);
-            
+
             float x0 = static_cast<float>(x_row[k]);
             float x1 = static_cast<float>(x_row[k + 1]);
             float x2 = static_cast<float>(x_row[k + 2]);
             float x3 = static_cast<float>(x_row[k + 3]);
-            
+
             qx_acc0 = fmaf(x0, w0, qx_acc0);
             qx_acc1 = fmaf(x1, w1, qx_acc1);
             qx_acc2 = fmaf(x2, w2, qx_acc2);
             qx_acc3 = fmaf(x3, w3, qx_acc3);
-            
+
             if (has_bias) {
               x_group_sum += x0 + x1 + x2 + x3;
             }
           }
-          
+
           float qx_acc = qx_acc0 + qx_acc1 + qx_acc2 + qx_acc3;
-          
+
           // Tail loop
           for (; k_start + k_local < k_end; k_local++) {
             int k = k_start + k_local;
             float x_val = static_cast<float>(x_row[k]);
             float w_val = static_cast<float>(w_row[k]);
             qx_acc = fmaf(x_val, w_val, qx_acc);
-            if (has_bias) x_group_sum += x_val;
+            if (has_bias)
+              x_group_sum += x_val;
           }
         } else {
-          for (int k_local = lane; k_start + k_local < k_end; k_local += kThreadsPerCol) {
+          for (int k_local = lane; k_start + k_local < k_end;
+               k_local += kThreadsPerCol) {
             int k = k_start + k_local;
             float x_val = static_cast<float>(x_row[k]);
-            uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+            uint8_t quant_val =
+                unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
             qx_acc = fmaf(x_val, static_cast<float>(quant_val), qx_acc);
-            if (has_bias) x_group_sum += x_val;
+            if (has_bias)
+              x_group_sum += x_val;
           }
         }
 
@@ -1083,33 +1554,33 @@ __global__ void qmv_warp_noshared_kernel(
       } else {
         float qx_acc0 = 0.0f, qx_acc1 = 0.0f, qx_acc2 = 0.0f, qx_acc3 = 0.0f;
         float qx_acc = 0.0f;
-        
+
         if constexpr (BITS == 8) {
           int k_local = lane * 4;
           int step = kThreadsPerCol * 4;
           for (; k_start + k_local + 3 < k_end; k_local += step) {
             int k = k_start + k_local;
-            
+
             // Read 4 weights at once
             uint32_t w_packed = *reinterpret_cast<const uint32_t*>(&w_row[k]);
             float w0 = fp8_e4m3_to_float(w_packed & 0xFF);
             float w1 = fp8_e4m3_to_float((w_packed >> 8) & 0xFF);
             float w2 = fp8_e4m3_to_float((w_packed >> 16) & 0xFF);
             float w3 = fp8_e4m3_to_float((w_packed >> 24) & 0xFF);
-            
+
             float x0 = static_cast<float>(x_row[k]);
             float x1 = static_cast<float>(x_row[k + 1]);
             float x2 = static_cast<float>(x_row[k + 2]);
             float x3 = static_cast<float>(x_row[k + 3]);
-            
+
             qx_acc0 = fmaf(x0, w0, qx_acc0);
             qx_acc1 = fmaf(x1, w1, qx_acc1);
             qx_acc2 = fmaf(x2, w2, qx_acc2);
             qx_acc3 = fmaf(x3, w3, qx_acc3);
           }
-          
+
           float qx_acc = qx_acc0 + qx_acc1 + qx_acc2 + qx_acc3;
-          
+
           for (; k_start + k_local < k_end; k_local++) {
             int k = k_start + k_local;
             float x_val = static_cast<float>(x_row[k]);
@@ -1119,11 +1590,16 @@ __global__ void qmv_warp_noshared_kernel(
           acc += scale * qx_acc;
         } else {
           float qx_acc = 0.0f;
-          for (int k_local = lane; k_start + k_local < k_end; k_local += kThreadsPerCol) {
+          for (int k_local = lane; k_start + k_local < k_end;
+               k_local += kThreadsPerCol) {
             int k = k_start + k_local;
             float x_val = static_cast<float>(x_row[k]);
-            uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
-            qx_acc = fmaf(x_val, dequantize_value<BITS, false>(quant_val, 1.0f, 0.0f), qx_acc);
+            uint8_t quant_val =
+                unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+            qx_acc = fmaf(
+                x_val,
+                dequantize_value<BITS, false>(quant_val, 1.0f, 0.0f),
+                qx_acc);
           }
           acc += scale * qx_acc;
         }
@@ -1151,7 +1627,8 @@ __global__ void qmv_kernel(
   const int row = blockIdx.x;
   const int col = blockIdx.y * blockDim.x + threadIdx.x;
 
-  if (row >= M || col >= N) return;
+  if (row >= M || col >= N)
+    return;
 
   float acc = 0.0f;
   int num_groups = (K + GROUP_SIZE - 1) / GROUP_SIZE;
@@ -1159,8 +1636,10 @@ __global__ void qmv_kernel(
   const uint8_t* w_row = w + col * row_bytes;
 
   for (int g = 0; g < num_groups; ++g) {
-    float scale = load_scale_value<ScaleT, GROUP_SIZE, AFFINE>(scales[col * num_groups + g]);
-    float bias = has_bias ? static_cast<float>(biases[col * num_groups + g]) : 0.0f;
+    float scale = load_scale_value<ScaleT, GROUP_SIZE, AFFINE>(
+        scales[col * num_groups + g]);
+    float bias =
+        has_bias ? static_cast<float>(biases[col * num_groups + g]) : 0.0f;
 
     int k_start = g * GROUP_SIZE;
     int k_end = min(k_start + GROUP_SIZE, K);
@@ -1171,10 +1650,13 @@ __global__ void qmv_kernel(
       for (; k + 3 < k_end; k += 4) {
         uint32_t w_packed = *reinterpret_cast<const uint32_t*>(&w_row[k]);
         float w0 = dequantize_value<8, AFFINE>(w_packed & 0xFF, scale, bias);
-        float w1 = dequantize_value<8, AFFINE>((w_packed >> 8) & 0xFF, scale, bias);
-        float w2 = dequantize_value<8, AFFINE>((w_packed >> 16) & 0xFF, scale, bias);
-        float w3 = dequantize_value<8, AFFINE>((w_packed >> 24) & 0xFF, scale, bias);
-        
+        float w1 =
+            dequantize_value<8, AFFINE>((w_packed >> 8) & 0xFF, scale, bias);
+        float w2 =
+            dequantize_value<8, AFFINE>((w_packed >> 16) & 0xFF, scale, bias);
+        float w3 =
+            dequantize_value<8, AFFINE>((w_packed >> 24) & 0xFF, scale, bias);
+
         qx_acc += static_cast<float>(x[row * K + k]) * w0;
         qx_acc += static_cast<float>(x[row * K + k + 1]) * w1;
         qx_acc += static_cast<float>(x[row * K + k + 2]) * w2;
@@ -1251,7 +1733,8 @@ __global__ void qmv_t_kernel(
   const int row = blockIdx.x;
   const int col = blockIdx.y * blockDim.x + threadIdx.x;
 
-  if (row >= M || col >= N) return;
+  if (row >= M || col >= N)
+    return;
 
   float acc = 0.0f;
   int num_groups = (K + GROUP_SIZE - 1) / GROUP_SIZE;
@@ -1259,8 +1742,10 @@ __global__ void qmv_t_kernel(
   const uint8_t* w_row = w + col * row_bytes;
 
   for (int g = 0; g < num_groups; ++g) {
-    float scale = load_scale_value<ScaleT, GROUP_SIZE, AFFINE>(scales[col * num_groups + g]);
-    float bias = has_bias ? static_cast<float>(biases[col * num_groups + g]) : 0.0f;
+    float scale = load_scale_value<ScaleT, GROUP_SIZE, AFFINE>(
+        scales[col * num_groups + g]);
+    float bias =
+        has_bias ? static_cast<float>(biases[col * num_groups + g]) : 0.0f;
 
     int k_start = g * GROUP_SIZE;
     int k_end = min(k_start + GROUP_SIZE, K);
@@ -1271,10 +1756,13 @@ __global__ void qmv_t_kernel(
       for (; k + 3 < k_end; k += 4) {
         uint32_t w_packed = *reinterpret_cast<const uint32_t*>(&w_row[k]);
         float w0 = dequantize_value<8, AFFINE>(w_packed & 0xFF, scale, bias);
-        float w1 = dequantize_value<8, AFFINE>((w_packed >> 8) & 0xFF, scale, bias);
-        float w2 = dequantize_value<8, AFFINE>((w_packed >> 16) & 0xFF, scale, bias);
-        float w3 = dequantize_value<8, AFFINE>((w_packed >> 24) & 0xFF, scale, bias);
-        
+        float w1 =
+            dequantize_value<8, AFFINE>((w_packed >> 8) & 0xFF, scale, bias);
+        float w2 =
+            dequantize_value<8, AFFINE>((w_packed >> 16) & 0xFF, scale, bias);
+        float w3 =
+            dequantize_value<8, AFFINE>((w_packed >> 24) & 0xFF, scale, bias);
+
         qx_acc += static_cast<float>(x[row * K + k]) * w0;
         qx_acc += static_cast<float>(x[row * K + k + 1]) * w1;
         qx_acc += static_cast<float>(x[row * K + k + 2]) * w2;
@@ -1358,7 +1846,8 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   enc.set_input_array(x);
   enc.set_input_array(w);
   enc.set_input_array(scales);
-  if (has_bias) enc.set_input_array(biases.value());
+  if (has_bias)
+    enc.set_input_array(biases.value());
   enc.set_output_array(out);
 
   int K = x.shape(-1);
@@ -1376,27 +1865,27 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   bool x_singleton_batch = has_only_singleton_batch_dims(x);
   bool w_singleton_batch = has_only_singleton_batch_dims(w);
-  bool non_batched = (batch_count == 1) && x_singleton_batch &&
-      w_singleton_batch;
+  bool non_batched =
+      (batch_count == 1) && x_singleton_batch && w_singleton_batch;
 
-  bool bits_supported_by_qmv =
-      (bits_ == 2 || bits_ == 4 || bits_ == 8) ||
+  bool bits_supported_by_qmv = (bits_ == 2 || bits_ == 4 || bits_ == 8) ||
       (mode_ == QuantizationMode::Affine && (bits_ == 5 || bits_ == 6));
   bool valid_x_batch = (x_batch_count == 1) || (x_batch_count == batch_count);
   bool valid_w_batch = (w_batch_count == 1) || (w_batch_count == batch_count);
   bool can_use_batched_qmv = transpose_ && bits_supported_by_qmv &&
       (batch_count > 1) && valid_x_batch && valid_w_batch;
-  bool force_dequant_gemm =
-      !transpose_ || !bits_supported_by_qmv ||
+  bool force_dequant_gemm = !transpose_ || !bits_supported_by_qmv ||
       ((batch_count > 1) && !can_use_batched_qmv) ||
       (w.ndim() > 2 && !w_singleton_batch && !can_use_batched_qmv);
   bool dequant_gemm_supported_mode = (mode_ == QuantizationMode::Affine);
+  bool should_prefer_dequant = should_use_dequant_gemm_path(
+      M, N, K, batch_count, non_batched, can_use_batched_qmv);
 
   // Dequant + rocBLAS GEMM path
   // Disable with MLX_ROCM_QMM_DEQUANT_GEMM=0 if needed
   if (dequant_gemm_supported_mode && d.is_rocblas_available() &&
       use_rocblas_dequant_path() &&
-      (force_dequant_gemm || (non_batched && M > 16))) {
+      (force_dequant_gemm || should_prefer_dequant)) {
     if (!((x_batch_count == 1) || (x_batch_count == batch_count))) {
       throw std::runtime_error(
           "Unsupported x batch shape for dequant GEMM fallback");
@@ -1412,22 +1901,129 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     Shape w_dequant_shape = w.shape();
     w_dequant_shape[w_dequant_shape.size() - 2] = dequant_rows;
     w_dequant_shape[w_dequant_shape.size() - 1] = dequant_cols;
-    array w_dequant(w_dequant_shape, x.dtype(), nullptr, {});
-    w_dequant.set_data(allocator::malloc(w_dequant.nbytes()));
-    enc.add_temporary(w_dequant);
 
-    if (mode_ == QuantizationMode::Affine) {
-      affine_dequantize(
-          w, scales, biases, w_dequant, group_size_, bits_, enc, s);
+    array w_dequant(w_dequant_shape, x.dtype(), nullptr, {});
+    bool cache_hit = false;
+    int cache_cap = dequant_cache_capacity();
+    size_t cache_max_bytes = dequant_cache_max_bytes();
+    if (cache_cap > 0 && cache_max_bytes > 0) {
+      static std::mutex cache_mutex;
+      static std::list<DequantCacheKey> lru;
+      static size_t cached_bytes = 0;
+      static std::unordered_map<
+          DequantCacheKey,
+          DequantCacheEntry,
+          DequantCacheKeyHasher>
+          cache;
+
+      DequantCacheKey key{
+          w.id(),
+          scales.id(),
+          has_bias ? biases->id() : 0,
+          group_size_,
+          bits_,
+          s.index,
+          transpose_,
+          x.dtype()};
+
+      {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        auto it = cache.find(key);
+        if (it != cache.end() && it->second.weight.shape() == w_dequant_shape) {
+          lru.splice(lru.begin(), lru, it->second.lru_it);
+          w_dequant = it->second.weight;
+          cache_hit = true;
+        }
+      }
+
+      if (!cache_hit) {
+        w_dequant.set_data(allocator::malloc(w_dequant.nbytes()));
+
+        if (mode_ == QuantizationMode::Affine) {
+          affine_dequantize(
+              w, scales, biases, w_dequant, group_size_, bits_, enc, s);
+        } else {
+          fp_dequantize(w, scales, w_dequant, group_size_, bits_, enc, s);
+        }
+
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        auto it = cache.find(key);
+        if (it == cache.end()) {
+          size_t entry_bytes = w_dequant.nbytes();
+          if (entry_bytes <= cache_max_bytes) {
+            lru.push_front(key);
+            cache.emplace(
+                key,
+                DequantCacheEntry{
+                    w_dequant,
+                    w,
+                    scales,
+                    has_bias ? std::optional<array>(*biases) : std::nullopt,
+                    entry_bytes,
+                    lru.begin()});
+            cached_bytes += entry_bytes;
+
+            while (static_cast<int>(cache.size()) > cache_cap ||
+                   cached_bytes > cache_max_bytes) {
+              auto evict = lru.back();
+              auto evict_it = cache.find(evict);
+              if (evict_it != cache.end()) {
+                cached_bytes -= evict_it->second.bytes;
+                cache.erase(evict_it);
+              }
+              lru.pop_back();
+            }
+          }
+        } else {
+          size_t entry_bytes = w_dequant.nbytes();
+          if (entry_bytes > cache_max_bytes) {
+            cached_bytes -= it->second.bytes;
+            lru.erase(it->second.lru_it);
+            cache.erase(it);
+          } else {
+            cached_bytes -= it->second.bytes;
+            it->second.w_source = w;
+            it->second.scales_source = scales;
+            it->second.biases_source =
+                has_bias ? std::optional<array>(*biases) : std::nullopt;
+            it->second.weight = w_dequant;
+            it->second.bytes = entry_bytes;
+            cached_bytes += it->second.bytes;
+            lru.splice(lru.begin(), lru, it->second.lru_it);
+
+            while (static_cast<int>(cache.size()) > cache_cap ||
+                   cached_bytes > cache_max_bytes) {
+              auto evict = lru.back();
+              auto evict_it = cache.find(evict);
+              if (evict_it != cache.end()) {
+                cached_bytes -= evict_it->second.bytes;
+                cache.erase(evict_it);
+              }
+              lru.pop_back();
+            }
+          }
+        }
+      }
     } else {
-      fp_dequantize(w, scales, w_dequant, group_size_, bits_, enc, s);
+      w_dequant.set_data(allocator::malloc(w_dequant.nbytes()));
+
+      if (mode_ == QuantizationMode::Affine) {
+        affine_dequantize(
+            w, scales, biases, w_dequant, group_size_, bits_, enc, s);
+      } else {
+        fp_dequantize(w, scales, w_dequant, group_size_, bits_, enc, s);
+      }
+    }
+
+    if (!cache_hit) {
+      enc.add_temporary(w_dequant);
     }
 
     int lda = K;
     int ldb = transpose_ ? K : N;
 
     if (batch_count == 1 && x_batch_count == 1 && w_batch_count == 1) {
-      rocm::rocblas_gemm(
+      dequant_rocblas_gemm(
           enc,
           false,
           transpose_,
@@ -1446,13 +2042,12 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     } else {
       int64_t stride_a =
           (x_batch_count == 1) ? 0 : static_cast<int64_t>(x.shape(-2)) * K;
-      int64_t stride_b =
-          (w_batch_count == 1)
+      int64_t stride_b = (w_batch_count == 1)
           ? 0
           : static_cast<int64_t>(dequant_rows) * dequant_cols;
       int64_t stride_c = static_cast<int64_t>(M) * N;
 
-      rocm::rocblas_gemm_batched(
+      dequant_rocblas_gemm_batched(
           enc,
           false,
           transpose_,
@@ -1486,24 +2081,29 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   dim3 grid(M, (N + block_size - 1) / block_size);
 
   int fast_threads_per_col = 16;
-  int fast_threads_env = parse_threads_per_col_env("MLX_ROCM_QMV_THREADS_PER_COL");
-  if (fast_threads_env > 0) fast_threads_per_col = fast_threads_env;
-  
-  int fast_cols_per_block = 32;
+  int fast_threads_env =
+      parse_threads_per_col_env("MLX_ROCM_QMV_THREADS_PER_COL");
+  if (fast_threads_env > 0)
+    fast_threads_per_col = fast_threads_env;
+
+  int fast_cols_per_block = select_qmv_cols_per_block(K, N, bits_);
   int max_cols_per_block = rocm::kMaxThreadsPerBlock / fast_threads_per_col;
-  while (fast_cols_per_block > max_cols_per_block) fast_cols_per_block /= 2;
-  
+  while (fast_cols_per_block > max_cols_per_block)
+    fast_cols_per_block /= 2;
+  while (fast_cols_per_block > 1 && (N % fast_cols_per_block) != 0 &&
+         fast_cols_per_block > 8) {
+    fast_cols_per_block /= 2;
+  }
+
   dim3 fast_block(fast_threads_per_col, fast_cols_per_block);
   dim3 fast_grid((N + fast_cols_per_block - 1) / fast_cols_per_block, M);
   dim3 fast_grid_batched(
-      (N + fast_cols_per_block - 1) / fast_cols_per_block,
-      M,
-      batch_count);
+      (N + fast_cols_per_block - 1) / fast_cols_per_block, M, batch_count);
 
   int64_t x_matrix_stride =
       static_cast<int64_t>(x.shape(-2)) * static_cast<int64_t>(x.shape(-1));
-  int64_t w_matrix_stride =
-      static_cast<int64_t>(w.shape(-2)) * static_cast<int64_t>(w.shape(-1)) *
+  int64_t w_matrix_stride = static_cast<int64_t>(w.shape(-2)) *
+      static_cast<int64_t>(w.shape(-1)) *
       static_cast<int64_t>(size_of(w.dtype()));
   int num_groups = (K + group_size_ - 1) / group_size_;
   int64_t sb_matrix_stride =
@@ -1520,38 +2120,132 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   const void* biases_ptr = has_bias ? gpu_ptr<void>(*biases) : nullptr;
   void* out_ptr = gpu_ptr<void>(out);
 
-  enc.launch_kernel([
-                        &,
-                        x_ptr,
-                        w_ptr,
-                        scales_ptr,
-                        biases_ptr,
-                        out_ptr,
-                        fast_threads_per_col,
-                        x_batch_stride,
-                        w_batch_stride,
-                        sb_batch_stride,
-                        out_matrix_stride](hipStream_t stream) {
-    auto launch_qmv = [&](auto type_tag, auto scale_tag, auto bits_tag, auto gs_tag) {
-      using T = typename decltype(type_tag)::type;
-      using ScaleT = typename decltype(scale_tag)::type;
-      constexpr int BITS = bits_tag.value;
-      constexpr int GROUP_SIZE = gs_tag.value;
-      
-      if (mode_ == QuantizationMode::Affine) {
-        if (use_fast_qmv) {
-          if (can_use_batched_qmv) {
-            if (fast_threads_per_col == 16) {
+  enc.launch_kernel([&,
+                     x_ptr,
+                     w_ptr,
+                     scales_ptr,
+                     biases_ptr,
+                     out_ptr,
+                     fast_threads_per_col,
+                     x_batch_stride,
+                     w_batch_stride,
+                     sb_batch_stride,
+                     out_matrix_stride](hipStream_t stream) {
+    auto launch_qmv =
+        [&](auto type_tag, auto scale_tag, auto bits_tag, auto gs_tag) {
+          using T = typename decltype(type_tag)::type;
+          using ScaleT = typename decltype(scale_tag)::type;
+          constexpr int BITS = bits_tag.value;
+          constexpr int GROUP_SIZE = gs_tag.value;
+
+          if (mode_ == QuantizationMode::Affine) {
+            if (use_fast_qmv) {
+              if (can_use_batched_qmv) {
+                if (fast_threads_per_col == 16) {
+                  hipLaunchKernelGGL(
+                      (rocm::qmv_warp_shared_batched_kernel<
+                          T,
+                          ScaleT,
+                          BITS,
+                          GROUP_SIZE,
+                          true,
+                          16>),
+                      fast_grid_batched,
+                      fast_block,
+                      0,
+                      stream,
+                      (const T*)x_ptr,
+                      w_ptr,
+                      (const ScaleT*)scales_ptr,
+                      (const ScaleT*)biases_ptr,
+                      (T*)out_ptr,
+                      M,
+                      N,
+                      K,
+                      x_batch_stride,
+                      w_batch_stride,
+                      sb_batch_stride,
+                      out_matrix_stride,
+                      has_bias);
+                } else {
+                  hipLaunchKernelGGL(
+                      (rocm::qmv_warp_shared_batched_kernel<
+                          T,
+                          ScaleT,
+                          BITS,
+                          GROUP_SIZE,
+                          true,
+                          WARP_SIZE>),
+                      fast_grid_batched,
+                      fast_block,
+                      0,
+                      stream,
+                      (const T*)x_ptr,
+                      w_ptr,
+                      (const ScaleT*)scales_ptr,
+                      (const ScaleT*)biases_ptr,
+                      (T*)out_ptr,
+                      M,
+                      N,
+                      K,
+                      x_batch_stride,
+                      w_batch_stride,
+                      sb_batch_stride,
+                      out_matrix_stride,
+                      has_bias);
+                }
+              } else {
+                if (fast_threads_per_col == 16) {
+                  hipLaunchKernelGGL(
+                      (rocm::qmv_warp_shared_kernel<
+                          T,
+                          ScaleT,
+                          BITS,
+                          GROUP_SIZE,
+                          true,
+                          16>),
+                      fast_grid,
+                      fast_block,
+                      0,
+                      stream,
+                      (const T*)x_ptr,
+                      w_ptr,
+                      (const ScaleT*)scales_ptr,
+                      (const ScaleT*)biases_ptr,
+                      (T*)out_ptr,
+                      M,
+                      N,
+                      K,
+                      has_bias);
+                } else {
+                  hipLaunchKernelGGL(
+                      (rocm::qmv_warp_shared_kernel<
+                          T,
+                          ScaleT,
+                          BITS,
+                          GROUP_SIZE,
+                          true,
+                          WARP_SIZE>),
+                      fast_grid,
+                      fast_block,
+                      0,
+                      stream,
+                      (const T*)x_ptr,
+                      w_ptr,
+                      (const ScaleT*)scales_ptr,
+                      (const ScaleT*)biases_ptr,
+                      (T*)out_ptr,
+                      M,
+                      N,
+                      K,
+                      has_bias);
+                }
+              }
+            } else if (transpose_) {
               hipLaunchKernelGGL(
-                  (rocm::qmv_warp_shared_batched_kernel<
-                      T,
-                      ScaleT,
-                      BITS,
-                      GROUP_SIZE,
-                      true,
-                      16>),
-                  fast_grid_batched,
-                  fast_block,
+                  (rocm::qmv_t_kernel<T, ScaleT, BITS, GROUP_SIZE, true>),
+                  grid,
+                  dim3(block_size),
                   0,
                   stream,
                   (const T*)x_ptr,
@@ -1562,22 +2256,12 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
                   M,
                   N,
                   K,
-                  x_batch_stride,
-                  w_batch_stride,
-                  sb_batch_stride,
-                  out_matrix_stride,
                   has_bias);
             } else {
               hipLaunchKernelGGL(
-                  (rocm::qmv_warp_shared_batched_kernel<
-                      T,
-                      ScaleT,
-                      BITS,
-                      GROUP_SIZE,
-                      true,
-                      WARP_SIZE>),
-                  fast_grid_batched,
-                  fast_block,
+                  (rocm::qmv_kernel<T, ScaleT, BITS, GROUP_SIZE, true>),
+                  grid,
+                  dim3(block_size),
                   0,
                   stream,
                   (const T*)x_ptr,
@@ -1588,38 +2272,116 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
                   M,
                   N,
                   K,
-                  x_batch_stride,
-                  w_batch_stride,
-                  sb_batch_stride,
-                  out_matrix_stride,
                   has_bias);
             }
           } else {
-            if (fast_threads_per_col == 16) {
-              hipLaunchKernelGGL((rocm::qmv_warp_shared_kernel<T, ScaleT, BITS, GROUP_SIZE, true, 16>), fast_grid, fast_block, 0, stream, (const T*)x_ptr, w_ptr, (const ScaleT*)scales_ptr, (const ScaleT*)biases_ptr, (T*)out_ptr, M, N, K, has_bias);
-            } else {
-              hipLaunchKernelGGL((rocm::qmv_warp_shared_kernel<T, ScaleT, BITS, GROUP_SIZE, true, WARP_SIZE>), fast_grid, fast_block, 0, stream, (const T*)x_ptr, w_ptr, (const ScaleT*)scales_ptr, (const ScaleT*)biases_ptr, (T*)out_ptr, M, N, K, has_bias);
-            }
-          }
-        } else if (transpose_) {
-          hipLaunchKernelGGL((rocm::qmv_t_kernel<T, ScaleT, BITS, GROUP_SIZE, true>), grid, dim3(block_size), 0, stream, (const T*)x_ptr, w_ptr, (const ScaleT*)scales_ptr, (const ScaleT*)biases_ptr, (T*)out_ptr, M, N, K, has_bias);
-        } else {
-          hipLaunchKernelGGL((rocm::qmv_kernel<T, ScaleT, BITS, GROUP_SIZE, true>), grid, dim3(block_size), 0, stream, (const T*)x_ptr, w_ptr, (const ScaleT*)scales_ptr, (const ScaleT*)biases_ptr, (T*)out_ptr, M, N, K, has_bias);
-        }
-      } else {
-        if (use_fast_qmv) {
-          if (can_use_batched_qmv) {
-            if (fast_threads_per_col == 16) {
+            if (use_fast_qmv) {
+              if (can_use_batched_qmv) {
+                if (fast_threads_per_col == 16) {
+                  hipLaunchKernelGGL(
+                      (rocm::qmv_warp_shared_batched_kernel<
+                          T,
+                          ScaleT,
+                          BITS,
+                          GROUP_SIZE,
+                          false,
+                          16>),
+                      fast_grid_batched,
+                      fast_block,
+                      0,
+                      stream,
+                      (const T*)x_ptr,
+                      w_ptr,
+                      (const ScaleT*)scales_ptr,
+                      (const ScaleT*)biases_ptr,
+                      (T*)out_ptr,
+                      M,
+                      N,
+                      K,
+                      x_batch_stride,
+                      w_batch_stride,
+                      sb_batch_stride,
+                      out_matrix_stride,
+                      has_bias);
+                } else {
+                  hipLaunchKernelGGL(
+                      (rocm::qmv_warp_shared_batched_kernel<
+                          T,
+                          ScaleT,
+                          BITS,
+                          GROUP_SIZE,
+                          false,
+                          WARP_SIZE>),
+                      fast_grid_batched,
+                      fast_block,
+                      0,
+                      stream,
+                      (const T*)x_ptr,
+                      w_ptr,
+                      (const ScaleT*)scales_ptr,
+                      (const ScaleT*)biases_ptr,
+                      (T*)out_ptr,
+                      M,
+                      N,
+                      K,
+                      x_batch_stride,
+                      w_batch_stride,
+                      sb_batch_stride,
+                      out_matrix_stride,
+                      has_bias);
+                }
+              } else {
+                if (fast_threads_per_col == 16) {
+                  hipLaunchKernelGGL(
+                      (rocm::qmv_warp_shared_kernel<
+                          T,
+                          ScaleT,
+                          BITS,
+                          GROUP_SIZE,
+                          false,
+                          16>),
+                      fast_grid,
+                      fast_block,
+                      0,
+                      stream,
+                      (const T*)x_ptr,
+                      w_ptr,
+                      (const ScaleT*)scales_ptr,
+                      (const ScaleT*)biases_ptr,
+                      (T*)out_ptr,
+                      M,
+                      N,
+                      K,
+                      has_bias);
+                } else {
+                  hipLaunchKernelGGL(
+                      (rocm::qmv_warp_shared_kernel<
+                          T,
+                          ScaleT,
+                          BITS,
+                          GROUP_SIZE,
+                          false,
+                          WARP_SIZE>),
+                      fast_grid,
+                      fast_block,
+                      0,
+                      stream,
+                      (const T*)x_ptr,
+                      w_ptr,
+                      (const ScaleT*)scales_ptr,
+                      (const ScaleT*)biases_ptr,
+                      (T*)out_ptr,
+                      M,
+                      N,
+                      K,
+                      has_bias);
+                }
+              }
+            } else if (transpose_) {
               hipLaunchKernelGGL(
-                  (rocm::qmv_warp_shared_batched_kernel<
-                      T,
-                      ScaleT,
-                      BITS,
-                      GROUP_SIZE,
-                      false,
-                      16>),
-                  fast_grid_batched,
-                  fast_block,
+                  (rocm::qmv_t_kernel<T, ScaleT, BITS, GROUP_SIZE, false>),
+                  grid,
+                  dim3(block_size),
                   0,
                   stream,
                   (const T*)x_ptr,
@@ -1630,22 +2392,12 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
                   M,
                   N,
                   K,
-                  x_batch_stride,
-                  w_batch_stride,
-                  sb_batch_stride,
-                  out_matrix_stride,
                   has_bias);
             } else {
               hipLaunchKernelGGL(
-                  (rocm::qmv_warp_shared_batched_kernel<
-                      T,
-                      ScaleT,
-                      BITS,
-                      GROUP_SIZE,
-                      false,
-                      WARP_SIZE>),
-                  fast_grid_batched,
-                  fast_block,
+                  (rocm::qmv_kernel<T, ScaleT, BITS, GROUP_SIZE, false>),
+                  grid,
+                  dim3(block_size),
                   0,
                   stream,
                   (const T*)x_ptr,
@@ -1656,26 +2408,10 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
                   M,
                   N,
                   K,
-                  x_batch_stride,
-                  w_batch_stride,
-                  sb_batch_stride,
-                  out_matrix_stride,
                   has_bias);
             }
-          } else {
-            if (fast_threads_per_col == 16) {
-              hipLaunchKernelGGL((rocm::qmv_warp_shared_kernel<T, ScaleT, BITS, GROUP_SIZE, false, 16>), fast_grid, fast_block, 0, stream, (const T*)x_ptr, w_ptr, (const ScaleT*)scales_ptr, (const ScaleT*)biases_ptr, (T*)out_ptr, M, N, K, has_bias);
-            } else {
-              hipLaunchKernelGGL((rocm::qmv_warp_shared_kernel<T, ScaleT, BITS, GROUP_SIZE, false, WARP_SIZE>), fast_grid, fast_block, 0, stream, (const T*)x_ptr, w_ptr, (const ScaleT*)scales_ptr, (const ScaleT*)biases_ptr, (T*)out_ptr, M, N, K, has_bias);
-            }
           }
-        } else if (transpose_) {
-          hipLaunchKernelGGL((rocm::qmv_t_kernel<T, ScaleT, BITS, GROUP_SIZE, false>), grid, dim3(block_size), 0, stream, (const T*)x_ptr, w_ptr, (const ScaleT*)scales_ptr, (const ScaleT*)biases_ptr, (T*)out_ptr, M, N, K, has_bias);
-        } else {
-          hipLaunchKernelGGL((rocm::qmv_kernel<T, ScaleT, BITS, GROUP_SIZE, false>), grid, dim3(block_size), 0, stream, (const T*)x_ptr, w_ptr, (const ScaleT*)scales_ptr, (const ScaleT*)biases_ptr, (T*)out_ptr, M, N, K, has_bias);
-        }
-      }
-    };
+        };
 
     // Type aliases to avoid template angle brackets in macro args
     using float_id = local_type_identity<float>;
@@ -1690,55 +2426,76 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     using gs64 = std::integral_constant<int, 64>;
     using gs128 = std::integral_constant<int, 128>;
 
-    // Helper macro to dispatch group_size
-    #define DISPATCH_GROUP_SIZE(type_tag, scale_tag, bits_tag) \
-      do { \
-        switch (group_size_) { \
-          case 32: launch_qmv(type_tag, scale_tag, bits_tag, gs32{}); break; \
-          case 64: launch_qmv(type_tag, scale_tag, bits_tag, gs64{}); break; \
-          case 128: launch_qmv(type_tag, scale_tag, bits_tag, gs128{}); break; \
-          default: throw std::runtime_error("Unsupported group_size for QuantizedMatmul: " + std::to_string(group_size_)); \
-        } \
-      } while(0)
+// Helper macro to dispatch group_size
+#define DISPATCH_GROUP_SIZE(type_tag, scale_tag, bits_tag)   \
+  do {                                                       \
+    switch (group_size_) {                                   \
+      case 32:                                               \
+        launch_qmv(type_tag, scale_tag, bits_tag, gs32{});   \
+        break;                                               \
+      case 64:                                               \
+        launch_qmv(type_tag, scale_tag, bits_tag, gs64{});   \
+        break;                                               \
+      case 128:                                              \
+        launch_qmv(type_tag, scale_tag, bits_tag, gs128{});  \
+        break;                                               \
+      default:                                               \
+        throw std::runtime_error(                            \
+            "Unsupported group_size for QuantizedMatmul: " + \
+            std::to_string(group_size_));                    \
+    }                                                        \
+  } while (0)
 
     if (x.dtype() == float32) {
-      if (bits_ == 8) DISPATCH_GROUP_SIZE(float_id{}, float_id{}, bits8{});
+      if (bits_ == 8)
+        DISPATCH_GROUP_SIZE(float_id{}, float_id{}, bits8{});
       else if (bits_ == 5 && mode_ == QuantizationMode::Affine) {
         DISPATCH_GROUP_SIZE(float_id{}, float_id{}, bits5{});
-      }
-      else if (bits_ == 6 && mode_ == QuantizationMode::Affine) {
+      } else if (bits_ == 6 && mode_ == QuantizationMode::Affine) {
         DISPATCH_GROUP_SIZE(float_id{}, float_id{}, bits6{});
-      }
-      else if (bits_ == 4) DISPATCH_GROUP_SIZE(float_id{}, float_id{}, bits4{});
-      else if (bits_ == 2) DISPATCH_GROUP_SIZE(float_id{}, float_id{}, bits2{});
-      else throw std::runtime_error("Unsupported bits for QuantizedMatmul float32: " + std::to_string(bits_));
+      } else if (bits_ == 4)
+        DISPATCH_GROUP_SIZE(float_id{}, float_id{}, bits4{});
+      else if (bits_ == 2)
+        DISPATCH_GROUP_SIZE(float_id{}, float_id{}, bits2{});
+      else
+        throw std::runtime_error(
+            "Unsupported bits for QuantizedMatmul float32: " +
+            std::to_string(bits_));
     } else if (x.dtype() == float16) {
-      if (bits_ == 8) DISPATCH_GROUP_SIZE(half_id{}, half_id{}, bits8{});
+      if (bits_ == 8)
+        DISPATCH_GROUP_SIZE(half_id{}, half_id{}, bits8{});
       else if (bits_ == 5 && mode_ == QuantizationMode::Affine) {
         DISPATCH_GROUP_SIZE(half_id{}, half_id{}, bits5{});
-      }
-      else if (bits_ == 6 && mode_ == QuantizationMode::Affine) {
+      } else if (bits_ == 6 && mode_ == QuantizationMode::Affine) {
         DISPATCH_GROUP_SIZE(half_id{}, half_id{}, bits6{});
-      }
-      else if (bits_ == 4) DISPATCH_GROUP_SIZE(half_id{}, half_id{}, bits4{});
-      else if (bits_ == 2) DISPATCH_GROUP_SIZE(half_id{}, half_id{}, bits2{});
-      else throw std::runtime_error("Unsupported bits for QuantizedMatmul float16: " + std::to_string(bits_));
+      } else if (bits_ == 4)
+        DISPATCH_GROUP_SIZE(half_id{}, half_id{}, bits4{});
+      else if (bits_ == 2)
+        DISPATCH_GROUP_SIZE(half_id{}, half_id{}, bits2{});
+      else
+        throw std::runtime_error(
+            "Unsupported bits for QuantizedMatmul float16: " +
+            std::to_string(bits_));
     } else if (x.dtype() == bfloat16) {
-      if (bits_ == 8) DISPATCH_GROUP_SIZE(bf16_id{}, bf16_id{}, bits8{});
+      if (bits_ == 8)
+        DISPATCH_GROUP_SIZE(bf16_id{}, bf16_id{}, bits8{});
       else if (bits_ == 5 && mode_ == QuantizationMode::Affine) {
         DISPATCH_GROUP_SIZE(bf16_id{}, bf16_id{}, bits5{});
-      }
-      else if (bits_ == 6 && mode_ == QuantizationMode::Affine) {
+      } else if (bits_ == 6 && mode_ == QuantizationMode::Affine) {
         DISPATCH_GROUP_SIZE(bf16_id{}, bf16_id{}, bits6{});
-      }
-      else if (bits_ == 4) DISPATCH_GROUP_SIZE(bf16_id{}, bf16_id{}, bits4{});
-      else if (bits_ == 2) DISPATCH_GROUP_SIZE(bf16_id{}, bf16_id{}, bits2{});
-      else throw std::runtime_error("Unsupported bits for QuantizedMatmul bfloat16: " + std::to_string(bits_));
+      } else if (bits_ == 4)
+        DISPATCH_GROUP_SIZE(bf16_id{}, bf16_id{}, bits4{});
+      else if (bits_ == 2)
+        DISPATCH_GROUP_SIZE(bf16_id{}, bf16_id{}, bits2{});
+      else
+        throw std::runtime_error(
+            "Unsupported bits for QuantizedMatmul bfloat16: " +
+            std::to_string(bits_));
     } else {
       throw std::runtime_error("Unsupported dtype for QuantizedMatmul");
     }
-    
-    #undef DISPATCH_GROUP_SIZE
+
+#undef DISPATCH_GROUP_SIZE
   });
 }
 
@@ -1809,20 +2566,16 @@ __global__ void __launch_bounds__(1024) gather_qmv_warp_shared_kernel(
   int64_t col_w_offset = static_cast<int64_t>(col) * row_bytes;
   int64_t col_sb_offset = static_cast<int64_t>(col) * num_groups;
 
-  const T* x_row =
-      x + static_cast<int64_t>(lhs_idx) * x_batch_stride +
+  const T* x_row = x + static_cast<int64_t>(lhs_idx) * x_batch_stride +
       static_cast<int64_t>(row) * K;
-  const uint8_t* w_row =
-      valid
+  const uint8_t* w_row = valid
       ? (w + static_cast<int64_t>(rhs_idx) * w_batch_stride + col_w_offset)
       : nullptr;
-  const ScaleT* scales_row =
-      valid
+  const ScaleT* scales_row = valid
       ? (scales + static_cast<int64_t>(rhs_idx) * sb_batch_stride +
          col_sb_offset)
       : nullptr;
-  const ScaleT* biases_row =
-      (valid && has_bias)
+  const ScaleT* biases_row = (valid && has_bias)
       ? (biases + static_cast<int64_t>(rhs_idx) * sb_batch_stride +
          col_sb_offset)
       : nullptr;
@@ -1850,7 +2603,8 @@ __global__ void __launch_bounds__(1024) gather_qmv_warp_shared_kernel(
         int k_start = max(g * GROUP_SIZE, chunk_start);
         int k_end_g = min((g + 1) * GROUP_SIZE, chunk_end);
 
-        float scale = load_scale_value<ScaleT, GROUP_SIZE, AFFINE>(scales_row[g]);
+        float scale =
+            load_scale_value<ScaleT, GROUP_SIZE, AFFINE>(scales_row[g]);
         float bias_val = has_bias ? static_cast<float>(biases_row[g]) : 0.0f;
 
         if constexpr (AFFINE) {
@@ -1902,7 +2656,8 @@ __global__ void __launch_bounds__(1024) gather_qmv_warp_shared_kernel(
             int step = THREADS_PER_COL * 8;
             for (; k_start + k_local + 7 < k_end_g; k_local += step) {
               int k = k_start + k_local;
-              uint32_t w_packed = *reinterpret_cast<const uint32_t*>(&w_row[k / 2]);
+              uint32_t w_packed =
+                  *reinterpret_cast<const uint32_t*>(&w_row[k / 2]);
               float w0 = static_cast<float>(w_packed & 0xF);
               float w1 = static_cast<float>((w_packed >> 4) & 0xF);
               float w2 = static_cast<float>((w_packed >> 8) & 0xF);
@@ -1934,7 +2689,8 @@ __global__ void __launch_bounds__(1024) gather_qmv_warp_shared_kernel(
             for (; k_start + k_local < k_end_g; k_local++) {
               int k = k_start + k_local;
               float x_val = shared_x[k - chunk_start];
-              uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              uint8_t quant_val =
+                  unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
               qx_acc = fmaf(x_val, static_cast<float>(quant_val), qx_acc);
               if (has_bias) {
                 x_group_sum += x_val;
@@ -1945,7 +2701,7 @@ __global__ void __launch_bounds__(1024) gather_qmv_warp_shared_kernel(
             int step = THREADS_PER_COL * 8;
             int max_safe_k = ((row_bytes - 7) * 8) / 6;
             for (; k_start + k_local + 7 < k_end_g &&
-                   k_start + k_local < max_safe_k;
+                 k_start + k_local < max_safe_k;
                  k_local += step) {
               int k = k_start + k_local;
               int byte_idx = (k * 6) / 8;
@@ -1984,7 +2740,8 @@ __global__ void __launch_bounds__(1024) gather_qmv_warp_shared_kernel(
             for (; k_start + k_local < k_end_g; k_local++) {
               int k = k_start + k_local;
               float x_val = shared_x[k - chunk_start];
-              uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              uint8_t quant_val =
+                  unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
               qx_acc = fmaf(x_val, static_cast<float>(quant_val), qx_acc);
               if (has_bias) {
                 x_group_sum += x_val;
@@ -1995,7 +2752,8 @@ __global__ void __launch_bounds__(1024) gather_qmv_warp_shared_kernel(
                  k_local += THREADS_PER_COL) {
               int k = k_start + k_local;
               float x_val = shared_x[k - chunk_start];
-              uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              uint8_t quant_val =
+                  unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
               qx_acc = fmaf(x_val, static_cast<float>(quant_val), qx_acc);
               if (has_bias) {
                 x_group_sum += x_val;
@@ -2046,15 +2804,23 @@ __global__ void __launch_bounds__(1024) gather_qmv_warp_shared_kernel(
             int step = THREADS_PER_COL * 8;
             for (; k_start + k_local + 7 < k_end_g; k_local += step) {
               int k = k_start + k_local;
-              uint32_t w_packed = *reinterpret_cast<const uint32_t*>(&w_row[k / 2]);
+              uint32_t w_packed =
+                  *reinterpret_cast<const uint32_t*>(&w_row[k / 2]);
               float w0 = dequantize_value<4, false>(w_packed & 0xF, 1.0f, 0.0f);
-              float w1 = dequantize_value<4, false>((w_packed >> 4) & 0xF, 1.0f, 0.0f);
-              float w2 = dequantize_value<4, false>((w_packed >> 8) & 0xF, 1.0f, 0.0f);
-              float w3 = dequantize_value<4, false>((w_packed >> 12) & 0xF, 1.0f, 0.0f);
-              float w4 = dequantize_value<4, false>((w_packed >> 16) & 0xF, 1.0f, 0.0f);
-              float w5 = dequantize_value<4, false>((w_packed >> 20) & 0xF, 1.0f, 0.0f);
-              float w6 = dequantize_value<4, false>((w_packed >> 24) & 0xF, 1.0f, 0.0f);
-              float w7 = dequantize_value<4, false>((w_packed >> 28) & 0xF, 1.0f, 0.0f);
+              float w1 =
+                  dequantize_value<4, false>((w_packed >> 4) & 0xF, 1.0f, 0.0f);
+              float w2 =
+                  dequantize_value<4, false>((w_packed >> 8) & 0xF, 1.0f, 0.0f);
+              float w3 = dequantize_value<4, false>(
+                  (w_packed >> 12) & 0xF, 1.0f, 0.0f);
+              float w4 = dequantize_value<4, false>(
+                  (w_packed >> 16) & 0xF, 1.0f, 0.0f);
+              float w5 = dequantize_value<4, false>(
+                  (w_packed >> 20) & 0xF, 1.0f, 0.0f);
+              float w6 = dequantize_value<4, false>(
+                  (w_packed >> 24) & 0xF, 1.0f, 0.0f);
+              float w7 = dequantize_value<4, false>(
+                  (w_packed >> 28) & 0xF, 1.0f, 0.0f);
               float x0 = shared_x[k - chunk_start];
               float x1 = shared_x[k - chunk_start + 1];
               float x2 = shared_x[k - chunk_start + 2];
@@ -2075,15 +2841,19 @@ __global__ void __launch_bounds__(1024) gather_qmv_warp_shared_kernel(
             for (; k_start + k_local < k_end_g; k_local++) {
               int k = k_start + k_local;
               float x_val = shared_x[k - chunk_start];
-              uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
-              qx_acc = fmaf(x_val, dequantize_value<BITS, false>(quant_val, 1.0f, 0.0f), qx_acc);
+              uint8_t quant_val =
+                  unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              qx_acc = fmaf(
+                  x_val,
+                  dequantize_value<BITS, false>(quant_val, 1.0f, 0.0f),
+                  qx_acc);
             }
           } else if constexpr (BITS == 6) {
             int k_local = lane * 8;
             int step = THREADS_PER_COL * 8;
             int max_safe_k = ((row_bytes - 7) * 8) / 6;
             for (; k_start + k_local + 7 < k_end_g &&
-                   k_start + k_local < max_safe_k;
+                 k_start + k_local < max_safe_k;
                  k_local += step) {
               int k = k_start + k_local;
               int byte_idx = (k * 6) / 8;
@@ -2091,14 +2861,22 @@ __global__ void __launch_bounds__(1024) gather_qmv_warp_shared_kernel(
               uint64_t w_packed = 0;
               memcpy(&w_packed, &w_row[byte_idx], 8);
               w_packed >>= bit_offset;
-              float w0 = dequantize_value<6, false>(w_packed & 0x3F, 1.0f, 0.0f);
-              float w1 = dequantize_value<6, false>((w_packed >> 6) & 0x3F, 1.0f, 0.0f);
-              float w2 = dequantize_value<6, false>((w_packed >> 12) & 0x3F, 1.0f, 0.0f);
-              float w3 = dequantize_value<6, false>((w_packed >> 18) & 0x3F, 1.0f, 0.0f);
-              float w4 = dequantize_value<6, false>((w_packed >> 24) & 0x3F, 1.0f, 0.0f);
-              float w5 = dequantize_value<6, false>((w_packed >> 30) & 0x3F, 1.0f, 0.0f);
-              float w6 = dequantize_value<6, false>((w_packed >> 36) & 0x3F, 1.0f, 0.0f);
-              float w7 = dequantize_value<6, false>((w_packed >> 42) & 0x3F, 1.0f, 0.0f);
+              float w0 =
+                  dequantize_value<6, false>(w_packed & 0x3F, 1.0f, 0.0f);
+              float w1 = dequantize_value<6, false>(
+                  (w_packed >> 6) & 0x3F, 1.0f, 0.0f);
+              float w2 = dequantize_value<6, false>(
+                  (w_packed >> 12) & 0x3F, 1.0f, 0.0f);
+              float w3 = dequantize_value<6, false>(
+                  (w_packed >> 18) & 0x3F, 1.0f, 0.0f);
+              float w4 = dequantize_value<6, false>(
+                  (w_packed >> 24) & 0x3F, 1.0f, 0.0f);
+              float w5 = dequantize_value<6, false>(
+                  (w_packed >> 30) & 0x3F, 1.0f, 0.0f);
+              float w6 = dequantize_value<6, false>(
+                  (w_packed >> 36) & 0x3F, 1.0f, 0.0f);
+              float w7 = dequantize_value<6, false>(
+                  (w_packed >> 42) & 0x3F, 1.0f, 0.0f);
               float x0 = shared_x[k - chunk_start];
               float x1 = shared_x[k - chunk_start + 1];
               float x2 = shared_x[k - chunk_start + 2];
@@ -2119,15 +2897,20 @@ __global__ void __launch_bounds__(1024) gather_qmv_warp_shared_kernel(
             for (; k_start + k_local < k_end_g; k_local++) {
               int k = k_start + k_local;
               float x_val = shared_x[k - chunk_start];
-              uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
-              qx_acc = fmaf(x_val, dequantize_value<BITS, false>(quant_val, 1.0f, 0.0f), qx_acc);
+              uint8_t quant_val =
+                  unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              qx_acc = fmaf(
+                  x_val,
+                  dequantize_value<BITS, false>(quant_val, 1.0f, 0.0f),
+                  qx_acc);
             }
           } else {
             for (int k_local = lane; k_start + k_local < k_end_g;
                  k_local += THREADS_PER_COL) {
               int k = k_start + k_local;
               float x_val = shared_x[k - chunk_start];
-              uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+              uint8_t quant_val =
+                  unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
               qx_acc = fmaf(
                   x_val,
                   dequantize_value<BITS, false>(quant_val, 1.0f, 0.0f),
@@ -2149,12 +2932,34 @@ __global__ void __launch_bounds__(1024) gather_qmv_warp_shared_kernel(
 }
 
 template <typename T, typename ScaleT, int BITS, int GROUP_SIZE, bool AFFINE>
-__global__ void gather_qmv_kernel(const T* __restrict__ x, const uint8_t* __restrict__ w, const ScaleT* __restrict__ scales, const ScaleT* __restrict__ biases, const uint32_t* __restrict__ lhs_indices, const uint32_t* __restrict__ rhs_indices, const rocm::Shape batch_shape, const rocm::Strides lhs_idx_strides, const rocm::Strides rhs_idx_strides, int batch_ndim, T* __restrict__ out, int B, int M, int N, int K, int E, bool has_bias) {
-  int batch = blockIdx.z; int row = blockIdx.x; int col = blockIdx.y * blockDim.x + threadIdx.x;
-  if (batch >= B || row >= M || col >= N) return;
+__global__ void gather_qmv_kernel(
+    const T* __restrict__ x,
+    const uint8_t* __restrict__ w,
+    const ScaleT* __restrict__ scales,
+    const ScaleT* __restrict__ biases,
+    const uint32_t* __restrict__ lhs_indices,
+    const uint32_t* __restrict__ rhs_indices,
+    const rocm::Shape batch_shape,
+    const rocm::Strides lhs_idx_strides,
+    const rocm::Strides rhs_idx_strides,
+    int batch_ndim,
+    T* __restrict__ out,
+    int B,
+    int M,
+    int N,
+    int K,
+    int E,
+    bool has_bias) {
+  int batch = blockIdx.z;
+  int row = blockIdx.x;
+  int col = blockIdx.y * blockDim.x + threadIdx.x;
+  if (batch >= B || row >= M || col >= N)
+    return;
   int64_t lhs_idx_loc = 0, rhs_idx_loc = 0;
-  if (batch_ndim == 1) { lhs_idx_loc = (int64_t)batch * lhs_idx_strides[0]; rhs_idx_loc = (int64_t)batch * rhs_idx_strides[0]; }
-  else if (batch_ndim > 1) { 
+  if (batch_ndim == 1) {
+    lhs_idx_loc = (int64_t)batch * lhs_idx_strides[0];
+    rhs_idx_loc = (int64_t)batch * rhs_idx_strides[0];
+  } else if (batch_ndim > 1) {
     int64_t elem = (int64_t)batch;
     for (int i = batch_ndim - 1; i >= 0; --i) {
       int64_t coord = elem % batch_shape.data_[i];
@@ -2180,12 +2985,11 @@ __global__ void gather_qmv_kernel(const T* __restrict__ x, const uint8_t* __rest
 
   const T* x_ptr = x + static_cast<int64_t>(lhs_idx) * x_batch_stride +
       static_cast<int64_t>(row) * K;
-  const uint8_t* w_ptr = w + static_cast<int64_t>(rhs_idx) * w_batch_stride +
-      col_w_offset;
+  const uint8_t* w_ptr =
+      w + static_cast<int64_t>(rhs_idx) * w_batch_stride + col_w_offset;
   const ScaleT* scales_ptr =
       scales + static_cast<int64_t>(rhs_idx) * sb_batch_stride + col_sb_offset;
-  const ScaleT* biases_ptr =
-      has_bias
+  const ScaleT* biases_ptr = has_bias
       ? biases + static_cast<int64_t>(rhs_idx) * sb_batch_stride + col_sb_offset
       : nullptr;
   float acc = 0.0f;
@@ -2194,16 +2998,19 @@ __global__ void gather_qmv_kernel(const T* __restrict__ x, const uint8_t* __rest
     float bias = has_bias ? (float)biases_ptr[g] : 0.0f;
     int k_start = g * GROUP_SIZE;
     int k_end = min(k_start + GROUP_SIZE, K);
-    
+
     if constexpr (BITS == 8) {
       int k = k_start;
       for (; k + 3 < k_end; k += 4) {
         uint32_t w_packed = *reinterpret_cast<const uint32_t*>(&w_ptr[k]);
         float w0 = dequantize_value<8, AFFINE>(w_packed & 0xFF, scale, bias);
-        float w1 = dequantize_value<8, AFFINE>((w_packed >> 8) & 0xFF, scale, bias);
-        float w2 = dequantize_value<8, AFFINE>((w_packed >> 16) & 0xFF, scale, bias);
-        float w3 = dequantize_value<8, AFFINE>((w_packed >> 24) & 0xFF, scale, bias);
-        
+        float w1 =
+            dequantize_value<8, AFFINE>((w_packed >> 8) & 0xFF, scale, bias);
+        float w2 =
+            dequantize_value<8, AFFINE>((w_packed >> 16) & 0xFF, scale, bias);
+        float w3 =
+            dequantize_value<8, AFFINE>((w_packed >> 24) & 0xFF, scale, bias);
+
         acc += (float)x_ptr[k] * w0;
         acc += (float)x_ptr[k + 1] * w1;
         acc += (float)x_ptr[k + 2] * w2;
@@ -2216,36 +3023,54 @@ __global__ void gather_qmv_kernel(const T* __restrict__ x, const uint8_t* __rest
     } else {
       for (int k = k_start; k < k_end; ++k) {
         uint8_t qv = unpack_packed_value_fast<BITS>(w_ptr, k, row_bytes);
-        acc += (float)x_ptr[k] * dequantize_value<BITS, AFFINE>(qv, scale, bias);
+        acc +=
+            (float)x_ptr[k] * dequantize_value<BITS, AFFINE>(qv, scale, bias);
       }
     }
   }
   out[batch * M * N + row * N + col] = (T)acc;
 }
-}
+} // namespace rocm
 
 void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
-  auto& s = stream(); auto& d = rocm::device(s.device); auto& enc = d.get_command_encoder(s);
+  auto& s = stream();
+  auto& d = rocm::device(s.device);
+  auto& enc = d.get_command_encoder(s);
   out.set_data(allocator::malloc(out.nbytes()));
   array x = ensure_row_contiguous_matrix(inputs[0], enc, s);
   array w = ensure_row_contiguous_matrix(inputs[1], enc, s);
   array scales = ensure_row_contiguous_matrix(inputs[2], enc, s);
-  std::optional<array> biases = std::nullopt; bool has_bias = (mode_ == QuantizationMode::Affine) && (inputs.size() == 6);
-  if (has_bias) biases = ensure_row_contiguous_matrix(inputs[3], enc, s);
-  const array& lhs_indices = inputs[inputs.size() - 2]; const array& rhs_indices = inputs[inputs.size() - 1];
-  auto [batch_shape, batch_strides] = collapse_contiguous_dims(lhs_indices.shape(), {lhs_indices.strides(), rhs_indices.strides()});
-  auto batch_shape_param = const_param(batch_shape); auto lhs_idx_strides_param = const_param<MAX_NDIM, int64_t>(batch_strides[0]); auto rhs_idx_strides_param = const_param<MAX_NDIM, int64_t>(batch_strides[1]);
+  std::optional<array> biases = std::nullopt;
+  bool has_bias = (mode_ == QuantizationMode::Affine) && (inputs.size() == 6);
+  if (has_bias)
+    biases = ensure_row_contiguous_matrix(inputs[3], enc, s);
+  const array& lhs_indices = inputs[inputs.size() - 2];
+  const array& rhs_indices = inputs[inputs.size() - 1];
+  auto [batch_shape, batch_strides] = collapse_contiguous_dims(
+      lhs_indices.shape(), {lhs_indices.strides(), rhs_indices.strides()});
+  auto batch_shape_param = const_param(batch_shape);
+  auto lhs_idx_strides_param = const_param<MAX_NDIM, int64_t>(batch_strides[0]);
+  auto rhs_idx_strides_param = const_param<MAX_NDIM, int64_t>(batch_strides[1]);
   int batch_ndim = batch_shape.size();
-  enc.set_input_array(x); enc.set_input_array(w); enc.set_input_array(scales); if (has_bias) enc.set_input_array(biases.value()); enc.set_input_array(lhs_indices); enc.set_input_array(rhs_indices); enc.set_output_array(out);
-  int K = x.shape(-1), M = x.shape(-2), N = out.shape(-1), B = out.size() / M / N, E = w.size() / w.shape(-1) / w.shape(-2);
+  enc.set_input_array(x);
+  enc.set_input_array(w);
+  enc.set_input_array(scales);
+  if (has_bias)
+    enc.set_input_array(biases.value());
+  enc.set_input_array(lhs_indices);
+  enc.set_input_array(rhs_indices);
+  enc.set_output_array(out);
+  int K = x.shape(-1), M = x.shape(-2), N = out.shape(-1),
+      B = out.size() / M / N, E = w.size() / w.shape(-1) / w.shape(-2);
   int block_size = 256;
   dim3 grid(M, (N + block_size - 1) / block_size, B);
 
   int fast_threads_per_col = 16;
-  int fast_threads_env = parse_threads_per_col_env(
-      "MLX_ROCM_GATHER_QMV_THREADS_PER_COL");
+  int fast_threads_env =
+      parse_threads_per_col_env("MLX_ROCM_GATHER_QMV_THREADS_PER_COL");
   if (fast_threads_env <= 0) {
-    fast_threads_env = parse_threads_per_col_env("MLX_ROCM_QMV_THREADS_PER_COL");
+    fast_threads_env =
+        parse_threads_per_col_env("MLX_ROCM_QMV_THREADS_PER_COL");
   }
   if (fast_threads_env > 0) {
     fast_threads_per_col = fast_threads_env;
@@ -2260,17 +3085,19 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   dim3 fast_block(fast_threads_per_col, fast_cols_per_block);
   dim3 fast_grid(M, (N + fast_cols_per_block - 1) / fast_cols_per_block, B);
 
-  bool bits_supported_by_fast =
-      (bits_ == 2 || bits_ == 4 || bits_ == 8) ||
+  bool bits_supported_by_fast = (bits_ == 2 || bits_ == 4 || bits_ == 8) ||
       (mode_ == QuantizationMode::Affine && (bits_ == 5 || bits_ == 6));
   bool use_fast_gather_qmv = transpose_ && bits_supported_by_fast;
   use_fast_gather_qmv = parse_warp_kernel_env(
       "MLX_ROCM_GATHER_QMV_USE_WARP", use_fast_gather_qmv);
-  const void *x_ptr = gpu_ptr<void>(x), *w_ptr = gpu_ptr<void>(w), *scales_ptr = gpu_ptr<void>(scales), *biases_ptr = has_bias ? gpu_ptr<void>(*biases) : nullptr;
-  const uint32_t *li_ptr = gpu_ptr<const uint32_t>(lhs_indices), *ri_ptr = gpu_ptr<const uint32_t>(rhs_indices); void* out_ptr = gpu_ptr<void>(out);
+  const void *x_ptr = gpu_ptr<void>(x), *w_ptr = gpu_ptr<void>(w),
+             *scales_ptr = gpu_ptr<void>(scales),
+             *biases_ptr = has_bias ? gpu_ptr<void>(*biases) : nullptr;
+  const uint32_t *li_ptr = gpu_ptr<const uint32_t>(lhs_indices),
+                 *ri_ptr = gpu_ptr<const uint32_t>(rhs_indices);
+  void* out_ptr = gpu_ptr<void>(out);
   enc.launch_kernel([&](hipStream_t stream) {
-    if (
-        use_fast_gather_qmv && mode_ == QuantizationMode::Affine &&
+    if (use_fast_gather_qmv && mode_ == QuantizationMode::Affine &&
         x.dtype() == bfloat16 && group_size_ == 64 &&
         (bits_ == 6 || bits_ == 8)) {
       auto launch_fast_kernel = [&](auto bits_tag) {
@@ -2348,105 +3175,1101 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
 
     if (x.dtype() == float32) {
       if (bits_ == 8 && group_size_ == 32) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<float, float, 8, 32, true>), grid, dim3(block_size), 0, stream, (const float*)x_ptr, (const uint8_t*)w_ptr, (const float*)scales_ptr, (const float*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (float*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<float, float, 8, 32, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const float*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const float*)scales_ptr,
+            (const float*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (float*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 8 && group_size_ == 64) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<float, float, 8, 64, true>), grid, dim3(block_size), 0, stream, (const float*)x_ptr, (const uint8_t*)w_ptr, (const float*)scales_ptr, (const float*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (float*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<float, float, 8, 64, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const float*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const float*)scales_ptr,
+            (const float*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (float*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 8 && group_size_ == 128) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<float, float, 8, 128, true>), grid, dim3(block_size), 0, stream, (const float*)x_ptr, (const uint8_t*)w_ptr, (const float*)scales_ptr, (const float*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (float*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<float, float, 8, 128, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const float*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const float*)scales_ptr,
+            (const float*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (float*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 5 && group_size_ == 32) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<float, float, 5, 32, true>), grid, dim3(block_size), 0, stream, (const float*)x_ptr, (const uint8_t*)w_ptr, (const float*)scales_ptr, (const float*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (float*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<float, float, 5, 32, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const float*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const float*)scales_ptr,
+            (const float*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (float*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 5 && group_size_ == 64) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<float, float, 5, 64, true>), grid, dim3(block_size), 0, stream, (const float*)x_ptr, (const uint8_t*)w_ptr, (const float*)scales_ptr, (const float*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (float*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<float, float, 5, 64, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const float*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const float*)scales_ptr,
+            (const float*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (float*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 5 && group_size_ == 128) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<float, float, 5, 128, true>), grid, dim3(block_size), 0, stream, (const float*)x_ptr, (const uint8_t*)w_ptr, (const float*)scales_ptr, (const float*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (float*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<float, float, 5, 128, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const float*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const float*)scales_ptr,
+            (const float*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (float*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 6 && group_size_ == 32) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<float, float, 6, 32, true>), grid, dim3(block_size), 0, stream, (const float*)x_ptr, (const uint8_t*)w_ptr, (const float*)scales_ptr, (const float*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (float*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<float, float, 6, 32, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const float*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const float*)scales_ptr,
+            (const float*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (float*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 6 && group_size_ == 64) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<float, float, 6, 64, true>), grid, dim3(block_size), 0, stream, (const float*)x_ptr, (const uint8_t*)w_ptr, (const float*)scales_ptr, (const float*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (float*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<float, float, 6, 64, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const float*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const float*)scales_ptr,
+            (const float*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (float*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 6 && group_size_ == 128) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<float, float, 6, 128, true>), grid, dim3(block_size), 0, stream, (const float*)x_ptr, (const uint8_t*)w_ptr, (const float*)scales_ptr, (const float*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (float*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<float, float, 6, 128, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const float*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const float*)scales_ptr,
+            (const float*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (float*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 4 && group_size_ == 32) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<float, float, 4, 32, true>), grid, dim3(block_size), 0, stream, (const float*)x_ptr, (const uint8_t*)w_ptr, (const float*)scales_ptr, (const float*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (float*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<float, float, 4, 32, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const float*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const float*)scales_ptr,
+            (const float*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (float*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 4 && group_size_ == 64) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<float, float, 4, 64, true>), grid, dim3(block_size), 0, stream, (const float*)x_ptr, (const uint8_t*)w_ptr, (const float*)scales_ptr, (const float*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (float*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<float, float, 4, 64, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const float*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const float*)scales_ptr,
+            (const float*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (float*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 4 && group_size_ == 128) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<float, float, 4, 128, true>), grid, dim3(block_size), 0, stream, (const float*)x_ptr, (const uint8_t*)w_ptr, (const float*)scales_ptr, (const float*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (float*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<float, float, 4, 128, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const float*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const float*)scales_ptr,
+            (const float*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (float*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 2 && group_size_ == 32) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<float, float, 2, 32, true>), grid, dim3(block_size), 0, stream, (const float*)x_ptr, (const uint8_t*)w_ptr, (const float*)scales_ptr, (const float*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (float*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<float, float, 2, 32, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const float*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const float*)scales_ptr,
+            (const float*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (float*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 2 && group_size_ == 64) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<float, float, 2, 64, true>), grid, dim3(block_size), 0, stream, (const float*)x_ptr, (const uint8_t*)w_ptr, (const float*)scales_ptr, (const float*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (float*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<float, float, 2, 64, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const float*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const float*)scales_ptr,
+            (const float*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (float*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 2 && group_size_ == 128) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<float, float, 2, 128, true>), grid, dim3(block_size), 0, stream, (const float*)x_ptr, (const uint8_t*)w_ptr, (const float*)scales_ptr, (const float*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (float*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<float, float, 2, 128, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const float*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const float*)scales_ptr,
+            (const float*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (float*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else {
-        throw std::runtime_error("Unsupported dtype/bits/group_size combination for float32: bits=" + std::to_string(bits_) + " gs=" + std::to_string(group_size_));
+        throw std::runtime_error(
+            "Unsupported dtype/bits/group_size combination for float32: bits=" +
+            std::to_string(bits_) + " gs=" + std::to_string(group_size_));
       }
     } else if (x.dtype() == float16) {
       if (bits_ == 8 && group_size_ == 32) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<__half, __half, 8, 32, true>), grid, dim3(block_size), 0, stream, (const __half*)x_ptr, (const uint8_t*)w_ptr, (const __half*)scales_ptr, (const __half*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (__half*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<__half, __half, 8, 32, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const __half*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const __half*)scales_ptr,
+            (const __half*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (__half*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 8 && group_size_ == 64) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<__half, __half, 8, 64, true>), grid, dim3(block_size), 0, stream, (const __half*)x_ptr, (const uint8_t*)w_ptr, (const __half*)scales_ptr, (const __half*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (__half*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<__half, __half, 8, 64, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const __half*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const __half*)scales_ptr,
+            (const __half*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (__half*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 8 && group_size_ == 128) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<__half, __half, 8, 128, true>), grid, dim3(block_size), 0, stream, (const __half*)x_ptr, (const uint8_t*)w_ptr, (const __half*)scales_ptr, (const __half*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (__half*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<__half, __half, 8, 128, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const __half*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const __half*)scales_ptr,
+            (const __half*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (__half*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 5 && group_size_ == 32) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<__half, __half, 5, 32, true>), grid, dim3(block_size), 0, stream, (const __half*)x_ptr, (const uint8_t*)w_ptr, (const __half*)scales_ptr, (const __half*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (__half*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<__half, __half, 5, 32, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const __half*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const __half*)scales_ptr,
+            (const __half*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (__half*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 5 && group_size_ == 64) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<__half, __half, 5, 64, true>), grid, dim3(block_size), 0, stream, (const __half*)x_ptr, (const uint8_t*)w_ptr, (const __half*)scales_ptr, (const __half*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (__half*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<__half, __half, 5, 64, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const __half*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const __half*)scales_ptr,
+            (const __half*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (__half*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 5 && group_size_ == 128) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<__half, __half, 5, 128, true>), grid, dim3(block_size), 0, stream, (const __half*)x_ptr, (const uint8_t*)w_ptr, (const __half*)scales_ptr, (const __half*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (__half*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<__half, __half, 5, 128, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const __half*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const __half*)scales_ptr,
+            (const __half*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (__half*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 6 && group_size_ == 32) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<__half, __half, 6, 32, true>), grid, dim3(block_size), 0, stream, (const __half*)x_ptr, (const uint8_t*)w_ptr, (const __half*)scales_ptr, (const __half*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (__half*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<__half, __half, 6, 32, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const __half*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const __half*)scales_ptr,
+            (const __half*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (__half*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 6 && group_size_ == 64) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<__half, __half, 6, 64, true>), grid, dim3(block_size), 0, stream, (const __half*)x_ptr, (const uint8_t*)w_ptr, (const __half*)scales_ptr, (const __half*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (__half*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<__half, __half, 6, 64, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const __half*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const __half*)scales_ptr,
+            (const __half*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (__half*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 6 && group_size_ == 128) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<__half, __half, 6, 128, true>), grid, dim3(block_size), 0, stream, (const __half*)x_ptr, (const uint8_t*)w_ptr, (const __half*)scales_ptr, (const __half*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (__half*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<__half, __half, 6, 128, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const __half*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const __half*)scales_ptr,
+            (const __half*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (__half*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 4 && group_size_ == 32) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<__half, __half, 4, 32, true>), grid, dim3(block_size), 0, stream, (const __half*)x_ptr, (const uint8_t*)w_ptr, (const __half*)scales_ptr, (const __half*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (__half*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<__half, __half, 4, 32, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const __half*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const __half*)scales_ptr,
+            (const __half*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (__half*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 4 && group_size_ == 64) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<__half, __half, 4, 64, true>), grid, dim3(block_size), 0, stream, (const __half*)x_ptr, (const uint8_t*)w_ptr, (const __half*)scales_ptr, (const __half*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (__half*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<__half, __half, 4, 64, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const __half*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const __half*)scales_ptr,
+            (const __half*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (__half*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 4 && group_size_ == 128) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<__half, __half, 4, 128, true>), grid, dim3(block_size), 0, stream, (const __half*)x_ptr, (const uint8_t*)w_ptr, (const __half*)scales_ptr, (const __half*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (__half*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<__half, __half, 4, 128, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const __half*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const __half*)scales_ptr,
+            (const __half*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (__half*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 2 && group_size_ == 32) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<__half, __half, 2, 32, true>), grid, dim3(block_size), 0, stream, (const __half*)x_ptr, (const uint8_t*)w_ptr, (const __half*)scales_ptr, (const __half*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (__half*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<__half, __half, 2, 32, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const __half*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const __half*)scales_ptr,
+            (const __half*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (__half*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 2 && group_size_ == 64) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<__half, __half, 2, 64, true>), grid, dim3(block_size), 0, stream, (const __half*)x_ptr, (const uint8_t*)w_ptr, (const __half*)scales_ptr, (const __half*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (__half*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<__half, __half, 2, 64, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const __half*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const __half*)scales_ptr,
+            (const __half*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (__half*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 2 && group_size_ == 128) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<__half, __half, 2, 128, true>), grid, dim3(block_size), 0, stream, (const __half*)x_ptr, (const uint8_t*)w_ptr, (const __half*)scales_ptr, (const __half*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (__half*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<__half, __half, 2, 128, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const __half*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const __half*)scales_ptr,
+            (const __half*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (__half*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else {
-        throw std::runtime_error("Unsupported dtype/bits/group_size combination for float16: bits=" + std::to_string(bits_) + " gs=" + std::to_string(group_size_));
+        throw std::runtime_error(
+            "Unsupported dtype/bits/group_size combination for float16: bits=" +
+            std::to_string(bits_) + " gs=" + std::to_string(group_size_));
       }
     } else if (x.dtype() == bfloat16) {
       if (bits_ == 8 && group_size_ == 32) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 8, 32, true>), grid, dim3(block_size), 0, stream, (const hip_bfloat16*)x_ptr, (const uint8_t*)w_ptr, (const hip_bfloat16*)scales_ptr, (const hip_bfloat16*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (hip_bfloat16*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 8, 32, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const hip_bfloat16*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const hip_bfloat16*)scales_ptr,
+            (const hip_bfloat16*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (hip_bfloat16*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 8 && group_size_ == 64) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 8, 64, true>), grid, dim3(block_size), 0, stream, (const hip_bfloat16*)x_ptr, (const uint8_t*)w_ptr, (const hip_bfloat16*)scales_ptr, (const hip_bfloat16*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (hip_bfloat16*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 8, 64, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const hip_bfloat16*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const hip_bfloat16*)scales_ptr,
+            (const hip_bfloat16*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (hip_bfloat16*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 8 && group_size_ == 128) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 8, 128, true>), grid, dim3(block_size), 0, stream, (const hip_bfloat16*)x_ptr, (const uint8_t*)w_ptr, (const hip_bfloat16*)scales_ptr, (const hip_bfloat16*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (hip_bfloat16*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 8, 128, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const hip_bfloat16*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const hip_bfloat16*)scales_ptr,
+            (const hip_bfloat16*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (hip_bfloat16*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 5 && group_size_ == 32) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 5, 32, true>), grid, dim3(block_size), 0, stream, (const hip_bfloat16*)x_ptr, (const uint8_t*)w_ptr, (const hip_bfloat16*)scales_ptr, (const hip_bfloat16*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (hip_bfloat16*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 5, 32, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const hip_bfloat16*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const hip_bfloat16*)scales_ptr,
+            (const hip_bfloat16*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (hip_bfloat16*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 5 && group_size_ == 64) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 5, 64, true>), grid, dim3(block_size), 0, stream, (const hip_bfloat16*)x_ptr, (const uint8_t*)w_ptr, (const hip_bfloat16*)scales_ptr, (const hip_bfloat16*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (hip_bfloat16*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 5, 64, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const hip_bfloat16*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const hip_bfloat16*)scales_ptr,
+            (const hip_bfloat16*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (hip_bfloat16*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 5 && group_size_ == 128) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 5, 128, true>), grid, dim3(block_size), 0, stream, (const hip_bfloat16*)x_ptr, (const uint8_t*)w_ptr, (const hip_bfloat16*)scales_ptr, (const hip_bfloat16*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (hip_bfloat16*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 5, 128, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const hip_bfloat16*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const hip_bfloat16*)scales_ptr,
+            (const hip_bfloat16*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (hip_bfloat16*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 6 && group_size_ == 32) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 6, 32, true>), grid, dim3(block_size), 0, stream, (const hip_bfloat16*)x_ptr, (const uint8_t*)w_ptr, (const hip_bfloat16*)scales_ptr, (const hip_bfloat16*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (hip_bfloat16*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 6, 32, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const hip_bfloat16*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const hip_bfloat16*)scales_ptr,
+            (const hip_bfloat16*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (hip_bfloat16*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 6 && group_size_ == 64) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 6, 64, true>), grid, dim3(block_size), 0, stream, (const hip_bfloat16*)x_ptr, (const uint8_t*)w_ptr, (const hip_bfloat16*)scales_ptr, (const hip_bfloat16*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (hip_bfloat16*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 6, 64, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const hip_bfloat16*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const hip_bfloat16*)scales_ptr,
+            (const hip_bfloat16*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (hip_bfloat16*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 6 && group_size_ == 128) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 6, 128, true>), grid, dim3(block_size), 0, stream, (const hip_bfloat16*)x_ptr, (const uint8_t*)w_ptr, (const hip_bfloat16*)scales_ptr, (const hip_bfloat16*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (hip_bfloat16*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 6, 128, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const hip_bfloat16*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const hip_bfloat16*)scales_ptr,
+            (const hip_bfloat16*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (hip_bfloat16*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 4 && group_size_ == 32) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 4, 32, true>), grid, dim3(block_size), 0, stream, (const hip_bfloat16*)x_ptr, (const uint8_t*)w_ptr, (const hip_bfloat16*)scales_ptr, (const hip_bfloat16*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (hip_bfloat16*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 4, 32, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const hip_bfloat16*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const hip_bfloat16*)scales_ptr,
+            (const hip_bfloat16*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (hip_bfloat16*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 4 && group_size_ == 64) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 4, 64, true>), grid, dim3(block_size), 0, stream, (const hip_bfloat16*)x_ptr, (const uint8_t*)w_ptr, (const hip_bfloat16*)scales_ptr, (const hip_bfloat16*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (hip_bfloat16*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 4, 64, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const hip_bfloat16*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const hip_bfloat16*)scales_ptr,
+            (const hip_bfloat16*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (hip_bfloat16*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 4 && group_size_ == 128) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 4, 128, true>), grid, dim3(block_size), 0, stream, (const hip_bfloat16*)x_ptr, (const uint8_t*)w_ptr, (const hip_bfloat16*)scales_ptr, (const hip_bfloat16*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (hip_bfloat16*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 4, 128, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const hip_bfloat16*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const hip_bfloat16*)scales_ptr,
+            (const hip_bfloat16*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (hip_bfloat16*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 2 && group_size_ == 32) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 2, 32, true>), grid, dim3(block_size), 0, stream, (const hip_bfloat16*)x_ptr, (const uint8_t*)w_ptr, (const hip_bfloat16*)scales_ptr, (const hip_bfloat16*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (hip_bfloat16*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 2, 32, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const hip_bfloat16*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const hip_bfloat16*)scales_ptr,
+            (const hip_bfloat16*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (hip_bfloat16*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 2 && group_size_ == 64) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 2, 64, true>), grid, dim3(block_size), 0, stream, (const hip_bfloat16*)x_ptr, (const uint8_t*)w_ptr, (const hip_bfloat16*)scales_ptr, (const hip_bfloat16*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (hip_bfloat16*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 2, 64, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const hip_bfloat16*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const hip_bfloat16*)scales_ptr,
+            (const hip_bfloat16*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (hip_bfloat16*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else if (bits_ == 2 && group_size_ == 128) {
-        hipLaunchKernelGGL((rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 2, 128, true>), grid, dim3(block_size), 0, stream, (const hip_bfloat16*)x_ptr, (const uint8_t*)w_ptr, (const hip_bfloat16*)scales_ptr, (const hip_bfloat16*)biases_ptr, li_ptr, ri_ptr, batch_shape_param, lhs_idx_strides_param, rhs_idx_strides_param, batch_ndim, (hip_bfloat16*)out_ptr, B, M, N, K, E, has_bias);
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_kernel<hip_bfloat16, hip_bfloat16, 2, 128, true>),
+            grid,
+            dim3(block_size),
+            0,
+            stream,
+            (const hip_bfloat16*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const hip_bfloat16*)scales_ptr,
+            (const hip_bfloat16*)biases_ptr,
+            li_ptr,
+            ri_ptr,
+            batch_shape_param,
+            lhs_idx_strides_param,
+            rhs_idx_strides_param,
+            batch_ndim,
+            (hip_bfloat16*)out_ptr,
+            B,
+            M,
+            N,
+            K,
+            E,
+            has_bias);
       } else {
-        throw std::runtime_error("Unsupported dtype/bits/group_size combination for bfloat16: bits=" + std::to_string(bits_) + " gs=" + std::to_string(group_size_));
+        throw std::runtime_error(
+            "Unsupported dtype/bits/group_size combination for bfloat16: bits=" +
+            std::to_string(bits_) + " gs=" + std::to_string(group_size_));
       }
     }
   });
