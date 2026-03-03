@@ -1954,7 +1954,7 @@ __global__ void qmv_warp_noshared_kernel(
             }
           }
 
-          float qx_acc = qx_acc0 + qx_acc1 + qx_acc2 + qx_acc3;
+          qx_acc = qx_acc0 + qx_acc1 + qx_acc2 + qx_acc3;
 
           // Tail loop
           for (; k_start + k_local < k_end; k_local++) {
@@ -2011,7 +2011,7 @@ __global__ void qmv_warp_noshared_kernel(
             qx_acc3 = fmaf(x3, w3, qx_acc3);
           }
 
-          float qx_acc = qx_acc0 + qx_acc1 + qx_acc2 + qx_acc3;
+          qx_acc = qx_acc0 + qx_acc1 + qx_acc2 + qx_acc3;
 
           for (; k_start + k_local < k_end; k_local++) {
             int k = k_start + k_local;
