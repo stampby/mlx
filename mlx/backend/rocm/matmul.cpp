@@ -701,8 +701,12 @@ void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto [a_transposed, lda, a] = check_transpose(encoder, s, a_pre);
   auto [b_transposed, ldb, b] = check_transpose(encoder, s, b_pre);
 
-  // Copy C into out first, then do GEMM with beta
-  copy_gpu(c, out, CopyType::General, s);
+  // Copy C into out only when beta uses it.
+  if (beta_ != 0.0f) {
+    copy_gpu(c, out, CopyType::General, s);
+  } else {
+    out.set_data(allocator::malloc(out.nbytes()));
+  }
 
   // Check if rocBLAS is available
   if (encoder.device().is_rocblas_available()) {

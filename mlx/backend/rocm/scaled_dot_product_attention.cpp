@@ -63,6 +63,23 @@ array prepare_sdpa_input(const array& x, Stream s) {
   return x;
 }
 
+bool prefer_flash_for_decode(
+    const array& q,
+    const array& k,
+    bool has_arr_mask,
+    bool has_sinks) {
+  if (has_arr_mask || has_sinks) {
+    return false;
+  }
+  if (q.shape(2) != 1) {
+    return false;
+  }
+  if (k.shape(2) < 512) {
+    return false;
+  }
+  return q.dtype() == float16 || q.dtype() == bfloat16;
+}
+
 } // namespace
 
 namespace fast {
@@ -105,21 +122,26 @@ void ScaledDotProductAttention::eval_gpu(
     mask_arr = prepare_sdpa_input(inputs[3], s);
   }
 
-  if (supports_sdpa_vector(
-          q, k, v, has_mask, has_arr_mask, do_causal_, output_logsumexp_)) {
+  bool vector_supported = supports_sdpa_vector(
+      q, k, v, has_mask, has_arr_mask, do_causal_, output_logsumexp_);
+  bool flash_supported = supports_sdpa_flash(
+      q, k, v, has_mask, has_arr_mask, do_causal_, output_logsumexp_);
+  bool flash_first = flash_supported &&
+      prefer_flash_for_decode(q, k, has_arr_mask, has_sinks_);
+
+  if (flash_first) {
+    if (has_sinks_) {
+      sdpa_flash(q, k, v, scale_, out, do_causal_, mask_arr, inputs.back(), s);
+    } else {
+      sdpa_flash(q, k, v, scale_, out, do_causal_, mask_arr, std::nullopt, s);
+    }
+  } else if (vector_supported) {
     if (has_sinks_) {
       sdpa_vector(q, k, v, scale_, out, do_causal_, inputs.back(), s);
     } else {
       sdpa_vector(q, k, v, scale_, out, do_causal_, std::nullopt, s);
     }
-  } else if (supports_sdpa_flash(
-                 q,
-                 k,
-                 v,
-                 has_mask,
-                 has_arr_mask,
-                 do_causal_,
-                 output_logsumexp_)) {
+  } else if (flash_supported) {
     if (has_sinks_) {
       sdpa_flash(q, k, v, scale_, out, do_causal_, mask_arr, inputs.back(), s);
     } else {
