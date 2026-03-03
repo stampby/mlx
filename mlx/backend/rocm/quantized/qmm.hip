@@ -2775,7 +2775,9 @@ __global__ void __launch_bounds__(1024) gather_qmv_warp_shared_kernel(
     int N,
     int K,
     int E,
-    bool has_bias) {
+    bool has_bias,
+    bool implicit_lhs = false,
+    int64_t implicit_x_batch_stride = 0) {
   const int lane = threadIdx.x;
   const int warp_idx = threadIdx.y;
   const int col = blockIdx.y * blockDim.y + warp_idx;
@@ -2786,22 +2788,26 @@ __global__ void __launch_bounds__(1024) gather_qmv_warp_shared_kernel(
     return;
   }
 
-  int64_t lhs_idx_loc = 0;
   int64_t rhs_idx_loc = 0;
+  int64_t lhs_idx_loc = 0;
   if (batch_ndim == 1) {
-    lhs_idx_loc = static_cast<int64_t>(batch) * lhs_idx_strides[0];
     rhs_idx_loc = static_cast<int64_t>(batch) * rhs_idx_strides[0];
+    if (!implicit_lhs) {
+      lhs_idx_loc = static_cast<int64_t>(batch) * lhs_idx_strides[0];
+    }
   } else if (batch_ndim > 1) {
     int64_t elem = static_cast<int64_t>(batch);
     for (int i = batch_ndim - 1; i >= 0; --i) {
       int64_t coord = elem % batch_shape.data_[i];
-      lhs_idx_loc += coord * lhs_idx_strides.data_[i];
       rhs_idx_loc += coord * rhs_idx_strides.data_[i];
+      if (!implicit_lhs) {
+        lhs_idx_loc += coord * lhs_idx_strides.data_[i];
+      }
       elem /= batch_shape.data_[i];
     }
   }
 
-  uint32_t lhs_idx = lhs_indices[lhs_idx_loc];
+  uint32_t lhs_idx = implicit_lhs ? 0u : lhs_indices[lhs_idx_loc];
   uint32_t rhs_idx = rhs_indices[rhs_idx_loc];
 
   const bool col_valid = col < N;
@@ -2817,8 +2823,10 @@ __global__ void __launch_bounds__(1024) gather_qmv_warp_shared_kernel(
   int64_t col_w_offset = static_cast<int64_t>(col) * row_bytes;
   int64_t col_sb_offset = static_cast<int64_t>(col) * num_groups;
 
-  const T* x_row = x + static_cast<int64_t>(lhs_idx) * x_batch_stride +
-      static_cast<int64_t>(row) * K;
+  int64_t x_batch_offset = implicit_lhs
+      ? (static_cast<int64_t>(batch) * implicit_x_batch_stride)
+      : (static_cast<int64_t>(lhs_idx) * x_batch_stride);
+  const T* x_row = x + x_batch_offset + static_cast<int64_t>(row) * K;
   const uint8_t* w_row = valid
       ? (w + static_cast<int64_t>(rhs_idx) * w_batch_stride + col_w_offset)
       : nullptr;
@@ -3200,26 +3208,33 @@ __global__ void gather_qmv_kernel(
     int N,
     int K,
     int E,
-    bool has_bias) {
+    bool has_bias,
+    bool implicit_lhs = false,
+    int64_t implicit_x_batch_stride = 0) {
   int batch = blockIdx.z;
   int row = blockIdx.x;
   int col = blockIdx.y * blockDim.x + threadIdx.x;
   if (batch >= B || row >= M || col >= N)
     return;
-  int64_t lhs_idx_loc = 0, rhs_idx_loc = 0;
+  int64_t lhs_idx_loc = 0;
+  int64_t rhs_idx_loc = 0;
   if (batch_ndim == 1) {
-    lhs_idx_loc = (int64_t)batch * lhs_idx_strides[0];
     rhs_idx_loc = (int64_t)batch * rhs_idx_strides[0];
+    if (!implicit_lhs) {
+      lhs_idx_loc = (int64_t)batch * lhs_idx_strides[0];
+    }
   } else if (batch_ndim > 1) {
     int64_t elem = (int64_t)batch;
     for (int i = batch_ndim - 1; i >= 0; --i) {
       int64_t coord = elem % batch_shape.data_[i];
-      lhs_idx_loc += coord * lhs_idx_strides.data_[i];
       rhs_idx_loc += coord * rhs_idx_strides.data_[i];
+      if (!implicit_lhs) {
+        lhs_idx_loc += coord * lhs_idx_strides.data_[i];
+      }
       elem /= batch_shape.data_[i];
     }
   }
-  uint32_t lhs_idx = lhs_indices[lhs_idx_loc];
+  uint32_t lhs_idx = implicit_lhs ? 0u : lhs_indices[lhs_idx_loc];
   uint32_t rhs_idx = rhs_indices[rhs_idx_loc];
   if (rhs_idx >= static_cast<uint32_t>(E)) {
     out[batch * M * N + row * N + col] = static_cast<T>(0);
@@ -3234,8 +3249,10 @@ __global__ void gather_qmv_kernel(
   int64_t col_w_offset = static_cast<int64_t>(col) * row_bytes;
   int64_t col_sb_offset = static_cast<int64_t>(col) * num_groups;
 
-  const T* x_ptr = x + static_cast<int64_t>(lhs_idx) * x_batch_stride +
-      static_cast<int64_t>(row) * K;
+  int64_t x_batch_offset = implicit_lhs
+      ? (static_cast<int64_t>(batch) * implicit_x_batch_stride)
+      : (static_cast<int64_t>(lhs_idx) * x_batch_stride);
+  const T* x_ptr = x + x_batch_offset + static_cast<int64_t>(row) * K;
   const uint8_t* w_ptr =
       w + static_cast<int64_t>(rhs_idx) * w_batch_stride + col_w_offset;
   const ScaleT* scales_ptr =
@@ -3313,6 +3330,14 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   enc.set_output_array(out);
   int K = x.shape(-1), M = x.shape(-2), N = out.shape(-1),
       B = out.size() / M / N, E = w.size() / w.shape(-1) / w.shape(-2);
+
+  int64_t x_batch_count = x.size() / (static_cast<int64_t>(M) * K);
+  bool use_sorted_rhs_schedule = transpose_ && right_sorted_ && (M == 1) &&
+      (B >= 16) && (E > 0) && (B / E >= 4) &&
+      (x_batch_count == 1 || x_batch_count == B);
+  int64_t implicit_x_batch_stride =
+      (x_batch_count == 1) ? 0 : static_cast<int64_t>(M) * K;
+
   int block_size = 256;
   dim3 grid(M, (N + block_size - 1) / block_size, B);
 
@@ -3389,7 +3414,9 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
               N,
               K,
               E,
-              has_bias);
+              has_bias,
+              use_sorted_rhs_schedule,
+              implicit_x_batch_stride);
         } else {
           hipLaunchKernelGGL(
               (rocm::gather_qmv_warp_shared_kernel<
@@ -3419,7 +3446,9 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
               N,
               K,
               E,
-              has_bias);
+              has_bias,
+              use_sorted_rhs_schedule,
+              implicit_x_batch_stride);
         }
       };
 
