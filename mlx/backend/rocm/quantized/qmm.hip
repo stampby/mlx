@@ -12,6 +12,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <rocblas/rocblas.h>
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <list>
@@ -204,13 +205,14 @@ inline int select_qmv_cols_per_block(int K, int N, int bits) {
 }
 
 inline int select_qmv_threads_per_col(int K, int N, int bits, int batch_count) {
-  (void)K;
-  (void)N;
-  (void)bits;
-  (void)batch_count;
   int threads_per_col = 16;
   if (WARP_SIZE == 32) {
-    threads_per_col = WARP_SIZE;
+    bool quant_bits_supported =
+        (bits == 2 || bits == 4 || bits == 5 || bits == 6 || bits == 8);
+    bool large_decode_like = (batch_count == 1) && (N >= 4096 || K >= 4096);
+    if (quant_bits_supported && large_decode_like) {
+      threads_per_col = WARP_SIZE;
+    }
   }
   return threads_per_col;
 }
@@ -2333,6 +2335,9 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     fast_threads_per_col = fast_threads_env;
 
   int fast_cols_per_block = select_qmv_cols_per_block(K, N, bits_);
+  if (fast_threads_per_col == 16 && bits_ == 8 && N >= 2048) {
+    fast_cols_per_block = std::max(fast_cols_per_block, 64);
+  }
   int max_cols_per_block = rocm::kMaxThreadsPerBlock / fast_threads_per_col;
   while (fast_cols_per_block > max_cols_per_block)
     fast_cols_per_block /= 2;
@@ -3323,6 +3328,9 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   }
 
   int fast_cols_per_block = select_qmv_cols_per_block(K, N, bits_);
+  if (fast_threads_per_col == 16 && bits_ == 8 && N >= 2048) {
+    fast_cols_per_block = std::max(fast_cols_per_block, 64);
+  }
   int max_cols_per_block = rocm::kMaxThreadsPerBlock / fast_threads_per_col;
   while (fast_cols_per_block > max_cols_per_block) {
     fast_cols_per_block /= 2;
