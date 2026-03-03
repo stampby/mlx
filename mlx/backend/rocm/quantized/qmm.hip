@@ -984,7 +984,7 @@ __global__ void __launch_bounds__(1024) qmv_warp_shared_kernel(
 
   // We load a chunk of X into shared memory.
   // We use a chunk size of 1024 elements.
-  constexpr int CHUNK_SIZE = 1024;
+  constexpr int CHUNK_SIZE = 2048;
   __shared__ float shared_x[CHUNK_SIZE];
 
   for (int chunk_start = 0; chunk_start < K; chunk_start += CHUNK_SIZE) {
@@ -1343,7 +1343,7 @@ __global__ void __launch_bounds__(1024) qmv_warp_shared_batched_kernel(
 
   float acc = 0.0f;
 
-  constexpr int CHUNK_SIZE = 1024;
+  constexpr int CHUNK_SIZE = 2048;
   __shared__ float shared_x[CHUNK_SIZE];
 
   for (int chunk_start = 0; chunk_start < K; chunk_start += CHUNK_SIZE) {
@@ -2833,7 +2833,7 @@ __global__ void __launch_bounds__(1024) gather_qmv_warp_shared_kernel(
 
   float acc = 0.0f;
 
-  constexpr int CHUNK_SIZE = 1024;
+  constexpr int CHUNK_SIZE = 2048;
   __shared__ float shared_x[CHUNK_SIZE];
 
   for (int chunk_start = 0; chunk_start < K; chunk_start += CHUNK_SIZE) {
