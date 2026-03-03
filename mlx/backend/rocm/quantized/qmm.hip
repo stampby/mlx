@@ -12,6 +12,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <rocblas/rocblas.h>
+#include <atomic>
 #include <cstring>
 #include <list>
 #include <mutex>
@@ -130,6 +131,20 @@ inline size_t parse_non_negative_size_t_env(
     return default_value;
   }
   return static_cast<size_t>(value);
+}
+
+inline int parse_non_negative_int_env(const char* env_name, int default_value) {
+  const char* raw = std::getenv(env_name);
+  if (raw == nullptr || *raw == '\0') {
+    return default_value;
+  }
+
+  char* end = nullptr;
+  long value = std::strtol(raw, &end, 10);
+  if (end == raw || *end != '\0' || value < 0) {
+    return default_value;
+  }
+  return static_cast<int>(value);
 }
 
 // Check if rocBLAS dequant fast path should be used
@@ -312,6 +327,28 @@ inline size_t dequant_cache_max_bytes() {
   return max_bytes;
 }
 
+inline int qmm_gemm_solution_index_f32(bool batched) {
+  static int single_index =
+      parse_non_negative_int_env("MLX_ROCM_GEMM_F32_SOLUTION_INDEX", 0);
+  static int batched_index = parse_non_negative_int_env(
+      "MLX_ROCM_GEMM_F32_BATCHED_SOLUTION_INDEX", -1);
+  if (!batched) {
+    return single_index;
+  }
+  return batched_index >= 0 ? batched_index : single_index;
+}
+
+inline int qmm_gemm_solution_index_bf16(bool batched) {
+  static int single_index =
+      parse_non_negative_int_env("MLX_ROCM_GEMM_BF16_SOLUTION_INDEX", 0);
+  static int batched_index = parse_non_negative_int_env(
+      "MLX_ROCM_GEMM_BF16_BATCHED_SOLUTION_INDEX", -1);
+  if (!batched) {
+    return single_index;
+  }
+  return batched_index >= 0 ? batched_index : single_index;
+}
+
 inline rocblas_operation to_rocblas_op(bool transpose) {
   return transpose ? rocblas_operation_transpose : rocblas_operation_none;
 }
@@ -347,21 +384,71 @@ void dequant_rocblas_gemm(
       case float32: {
         float alpha_f = alpha;
         float beta_f = beta;
-        rocblas_sgemm(
-            handle,
-            op_b,
-            op_a,
-            N,
-            M,
-            K,
-            &alpha_f,
-            static_cast<const float*>(b_ptr),
-            ldb,
-            static_cast<const float*>(a_ptr),
-            lda,
-            &beta_f,
-            static_cast<float*>(c_ptr),
-            ldc);
+        int solution_index = qmm_gemm_solution_index_f32(false);
+        static std::atomic<bool> solution_valid{true};
+
+        if (solution_index > 0 &&
+            solution_valid.load(std::memory_order_relaxed)) {
+          rocblas_status status = rocblas_gemm_ex(
+              handle,
+              op_b,
+              op_a,
+              N,
+              M,
+              K,
+              &alpha_f,
+              b_ptr,
+              rocblas_datatype_f32_r,
+              ldb,
+              a_ptr,
+              rocblas_datatype_f32_r,
+              lda,
+              &beta_f,
+              c_ptr,
+              rocblas_datatype_f32_r,
+              ldc,
+              c_ptr,
+              rocblas_datatype_f32_r,
+              ldc,
+              rocblas_datatype_f32_r,
+              rocblas_gemm_algo_solution_index,
+              solution_index,
+              0);
+          if (status != rocblas_status_success) {
+            solution_valid.store(false, std::memory_order_relaxed);
+            rocblas_sgemm(
+                handle,
+                op_b,
+                op_a,
+                N,
+                M,
+                K,
+                &alpha_f,
+                static_cast<const float*>(b_ptr),
+                ldb,
+                static_cast<const float*>(a_ptr),
+                lda,
+                &beta_f,
+                static_cast<float*>(c_ptr),
+                ldc);
+          }
+        } else {
+          rocblas_sgemm(
+              handle,
+              op_b,
+              op_a,
+              N,
+              M,
+              K,
+              &alpha_f,
+              static_cast<const float*>(b_ptr),
+              ldb,
+              static_cast<const float*>(a_ptr),
+              lda,
+              &beta_f,
+              static_cast<float*>(c_ptr),
+              ldc);
+        }
         break;
       }
       case float16: {
@@ -390,7 +477,18 @@ void dequant_rocblas_gemm(
       case bfloat16: {
         float alpha_f = alpha;
         float beta_f = beta;
-        rocblas_gemm_ex(
+        int solution_index = qmm_gemm_solution_index_bf16(false);
+        static std::atomic<bool> solution_valid{true};
+
+        rocblas_gemm_algo algo = rocblas_gemm_algo_standard;
+        if (solution_index > 0 &&
+            solution_valid.load(std::memory_order_relaxed)) {
+          algo = rocblas_gemm_algo_solution_index;
+        } else {
+          solution_index = 0;
+        }
+
+        rocblas_status status = rocblas_gemm_ex(
             handle,
             op_b,
             op_a,
@@ -412,9 +510,39 @@ void dequant_rocblas_gemm(
             rocblas_datatype_bf16_r,
             ldc,
             rocblas_datatype_f32_r,
-            rocblas_gemm_algo_standard,
-            0,
+            algo,
+            solution_index,
             0);
+
+        if (status != rocblas_status_success &&
+            algo == rocblas_gemm_algo_solution_index) {
+          solution_valid.store(false, std::memory_order_relaxed);
+          rocblas_gemm_ex(
+              handle,
+              op_b,
+              op_a,
+              N,
+              M,
+              K,
+              &alpha_f,
+              b_ptr,
+              rocblas_datatype_bf16_r,
+              ldb,
+              a_ptr,
+              rocblas_datatype_bf16_r,
+              lda,
+              &beta_f,
+              c_ptr,
+              rocblas_datatype_bf16_r,
+              ldc,
+              c_ptr,
+              rocblas_datatype_bf16_r,
+              ldc,
+              rocblas_datatype_f32_r,
+              rocblas_gemm_algo_standard,
+              0,
+              0);
+        }
         break;
       }
       default:
@@ -458,25 +586,84 @@ void dequant_rocblas_gemm_batched(
       case float32: {
         float alpha_f = alpha;
         float beta_f = beta;
-        rocblas_sgemm_strided_batched(
-            handle,
-            op_b,
-            op_a,
-            N,
-            M,
-            K,
-            &alpha_f,
-            static_cast<const float*>(b_ptr),
-            ldb,
-            stride_b,
-            static_cast<const float*>(a_ptr),
-            lda,
-            stride_a,
-            &beta_f,
-            static_cast<float*>(c_ptr),
-            ldc,
-            stride_c,
-            batch_count);
+        int solution_index = qmm_gemm_solution_index_f32(true);
+        static std::atomic<bool> solution_valid{true};
+
+        if (solution_index > 0 &&
+            solution_valid.load(std::memory_order_relaxed)) {
+          rocblas_status status = rocblas_gemm_strided_batched_ex(
+              handle,
+              op_b,
+              op_a,
+              N,
+              M,
+              K,
+              &alpha_f,
+              b_ptr,
+              rocblas_datatype_f32_r,
+              ldb,
+              stride_b,
+              a_ptr,
+              rocblas_datatype_f32_r,
+              lda,
+              stride_a,
+              &beta_f,
+              c_ptr,
+              rocblas_datatype_f32_r,
+              ldc,
+              stride_c,
+              c_ptr,
+              rocblas_datatype_f32_r,
+              ldc,
+              stride_c,
+              batch_count,
+              rocblas_datatype_f32_r,
+              rocblas_gemm_algo_solution_index,
+              solution_index,
+              0);
+          if (status != rocblas_status_success) {
+            solution_valid.store(false, std::memory_order_relaxed);
+            rocblas_sgemm_strided_batched(
+                handle,
+                op_b,
+                op_a,
+                N,
+                M,
+                K,
+                &alpha_f,
+                static_cast<const float*>(b_ptr),
+                ldb,
+                stride_b,
+                static_cast<const float*>(a_ptr),
+                lda,
+                stride_a,
+                &beta_f,
+                static_cast<float*>(c_ptr),
+                ldc,
+                stride_c,
+                batch_count);
+          }
+        } else {
+          rocblas_sgemm_strided_batched(
+              handle,
+              op_b,
+              op_a,
+              N,
+              M,
+              K,
+              &alpha_f,
+              static_cast<const float*>(b_ptr),
+              ldb,
+              stride_b,
+              static_cast<const float*>(a_ptr),
+              lda,
+              stride_a,
+              &beta_f,
+              static_cast<float*>(c_ptr),
+              ldc,
+              stride_c,
+              batch_count);
+        }
         break;
       }
       case float16: {
@@ -509,7 +696,18 @@ void dequant_rocblas_gemm_batched(
       case bfloat16: {
         float alpha_f = alpha;
         float beta_f = beta;
-        rocblas_gemm_strided_batched_ex(
+        int solution_index = qmm_gemm_solution_index_bf16(true);
+        static std::atomic<bool> solution_valid{true};
+
+        rocblas_gemm_algo algo = rocblas_gemm_algo_standard;
+        if (solution_index > 0 &&
+            solution_valid.load(std::memory_order_relaxed)) {
+          algo = rocblas_gemm_algo_solution_index;
+        } else {
+          solution_index = 0;
+        }
+
+        rocblas_status status = rocblas_gemm_strided_batched_ex(
             handle,
             op_b,
             op_a,
@@ -536,9 +734,44 @@ void dequant_rocblas_gemm_batched(
             stride_c,
             batch_count,
             rocblas_datatype_f32_r,
-            rocblas_gemm_algo_standard,
-            0,
+            algo,
+            solution_index,
             0);
+
+        if (status != rocblas_status_success &&
+            algo == rocblas_gemm_algo_solution_index) {
+          solution_valid.store(false, std::memory_order_relaxed);
+          rocblas_gemm_strided_batched_ex(
+              handle,
+              op_b,
+              op_a,
+              N,
+              M,
+              K,
+              &alpha_f,
+              b_ptr,
+              rocblas_datatype_bf16_r,
+              ldb,
+              stride_b,
+              a_ptr,
+              rocblas_datatype_bf16_r,
+              lda,
+              stride_a,
+              &beta_f,
+              c_ptr,
+              rocblas_datatype_bf16_r,
+              ldc,
+              stride_c,
+              c_ptr,
+              rocblas_datatype_bf16_r,
+              ldc,
+              stride_c,
+              batch_count,
+              rocblas_datatype_f32_r,
+              rocblas_gemm_algo_standard,
+              0,
+              0);
+        }
         break;
       }
       default:
