@@ -217,49 +217,171 @@ inline int select_qmv_threads_per_col(int K, int N, int bits, int batch_count) {
   return threads_per_col;
 }
 
+enum class RocmQmvArchTier {
+  Rdna,
+  Rdna3Plus,
+  CdnaLike,
+};
+
+inline RocmQmvArchTier detect_rocm_qmv_arch_tier(rocm::Device& d) {
+  static std::mutex arch_mutex;
+  static std::unordered_map<int, RocmQmvArchTier> arch_cache;
+
+  int hip_device = d.hip_device();
+  {
+    std::lock_guard<std::mutex> lock(arch_mutex);
+    auto it = arch_cache.find(hip_device);
+    if (it != arch_cache.end()) {
+      return it->second;
+    }
+  }
+
+  hipDeviceProp_t props{};
+  d.make_current();
+  hipError_t err = hipGetDeviceProperties(&props, hip_device);
+
+  RocmQmvArchTier tier =
+      (WARP_SIZE == 32) ? RocmQmvArchTier::Rdna : RocmQmvArchTier::CdnaLike;
+  if (err == hipSuccess) {
+    const char* arch_name = props.gcnArchName;
+    if (arch_name != nullptr) {
+      if (std::strstr(arch_name, "gfx11") != nullptr ||
+          std::strstr(arch_name, "gfx12") != nullptr) {
+        tier = RocmQmvArchTier::Rdna3Plus;
+      } else if (std::strstr(arch_name, "gfx10") != nullptr) {
+        tier = RocmQmvArchTier::Rdna;
+      } else if (std::strstr(arch_name, "gfx9") != nullptr) {
+        tier = RocmQmvArchTier::CdnaLike;
+      }
+    }
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(arch_mutex);
+    arch_cache[hip_device] = tier;
+  }
+  return tier;
+}
+
+inline int select_qmv_qmm_crossover_m_threshold(
+    int K,
+    int N,
+    int batch_count,
+    bool transpose,
+    bool can_use_batched_qmv,
+    rocm::Device& d) {
+  if (!transpose) {
+    return 1;
+  }
+  if ((batch_count > 1) && !can_use_batched_qmv) {
+    return 1;
+  }
+
+  int small_shape_limit;
+  int medium_shape_limit;
+  int large_shape_limit;
+
+  switch (detect_rocm_qmv_arch_tier(d)) {
+    case RocmQmvArchTier::Rdna3Plus:
+      small_shape_limit = 36;
+      medium_shape_limit = 24;
+      large_shape_limit = 16;
+      break;
+    case RocmQmvArchTier::Rdna:
+      small_shape_limit = 28;
+      medium_shape_limit = 20;
+      large_shape_limit = 14;
+      break;
+    case RocmQmvArchTier::CdnaLike:
+    default:
+      small_shape_limit = 20;
+      medium_shape_limit = 14;
+      large_shape_limit = 10;
+      break;
+  }
+
+  if (batch_count > 1 && can_use_batched_qmv) {
+    small_shape_limit += 8;
+    medium_shape_limit += 6;
+    large_shape_limit += 4;
+  }
+
+  if (K <= 2048 && N <= 2048) {
+    return small_shape_limit;
+  }
+  if (K <= 4096 && N <= 4096) {
+    return medium_shape_limit;
+  }
+  return large_shape_limit;
+}
+
+inline bool should_use_tiny_k_qmv_path(
+    int M,
+    int N,
+    int K,
+    int batch_count,
+    bool transpose,
+    bool can_use_batched_qmv,
+    int bits,
+    QuantizationMode mode) {
+  if (!transpose || can_use_batched_qmv || batch_count != 1) {
+    return false;
+  }
+
+  bool bits_supported = (bits == 2 || bits == 4 || bits == 8) ||
+      (mode == QuantizationMode::Affine && (bits == 5 || bits == 6));
+  if (!bits_supported) {
+    return false;
+  }
+
+  bool tiny_k = (K == 64 || K == 128 || K == 256);
+  bool decode_like = (M <= 4);
+  bool width_enough = (N >= 512);
+  return tiny_k && decode_like && width_enough;
+}
+
 inline bool should_use_dequant_gemm_path(
     int M,
     int N,
     int K,
     int batch_count,
     bool non_batched,
-    bool can_use_batched_qmv) {
+    bool transpose,
+    bool can_use_batched_qmv,
+    rocm::Device& d) {
   int env_threshold =
       parse_positive_int_env("MLX_ROCM_QMM_DEQUANT_M_THRESHOLD", -1);
   if (env_threshold > 0) {
     return M >= env_threshold;
   }
 
+  if (!transpose) {
+    return true;
+  }
+
   if (batch_count > 1) {
     if (!can_use_batched_qmv) {
       return true;
     }
-    if (M <= 4) {
-      return false;
-    }
-    if (M >= 32) {
-      return true;
-    }
-    return (N >= 4096 && K >= 2048) || (N >= 8192 && M >= 8);
   }
 
   if (!non_batched) {
-    return M >= 24;
+    return M >= select_qmv_qmm_crossover_m_threshold(
+                    K, N, batch_count, transpose, can_use_batched_qmv, d);
   }
 
-  if (M <= 8) {
-    return false;
-  }
-  if (M >= 64) {
+  int threshold = select_qmv_qmm_crossover_m_threshold(
+      K, N, batch_count, transpose, can_use_batched_qmv, d);
+
+  if (M >= threshold) {
     return true;
   }
-  if (K <= 1024 && N <= 2048) {
-    return false;
-  }
+
+  // Favor dequant+GEMM slightly earlier on very large decode-style shapes.
   if (N >= 8192 && K >= 2048) {
-    return M >= 16;
+    return M >= std::max(8, threshold - 4);
   }
-  return M >= 24;
+  return false;
 }
 
 struct DequantCacheKey {
@@ -2125,7 +2247,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
       (w.ndim() > 2 && !w_singleton_batch && !can_use_batched_qmv);
   bool dequant_gemm_supported_mode = (mode_ == QuantizationMode::Affine);
   bool should_prefer_dequant = should_use_dequant_gemm_path(
-      M, N, K, batch_count, non_batched, can_use_batched_qmv);
+      M, N, K, batch_count, non_batched, transpose_, can_use_batched_qmv, d);
 
   // Dequant + rocBLAS GEMM path
   // Disable with MLX_ROCM_QMM_DEQUANT_GEMM=0 if needed
@@ -2323,6 +2445,8 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (can_use_batched_qmv) {
     use_fast_qmv = true;
   }
+  bool use_tiny_k_qmv = should_use_tiny_k_qmv_path(
+      M, N, K, batch_count, transpose_, can_use_batched_qmv, bits_, mode_);
 
   int block_size = 256;
   dim3 grid(M, (N + block_size - 1) / block_size);
@@ -2335,6 +2459,9 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     fast_threads_per_col = fast_threads_env;
 
   int fast_cols_per_block = select_qmv_cols_per_block(K, N, bits_);
+  if (use_tiny_k_qmv) {
+    fast_cols_per_block = std::max(fast_cols_per_block, 32);
+  }
   if (fast_threads_per_col == 16 && bits_ == 8 && N >= 2048) {
     fast_cols_per_block = std::max(fast_cols_per_block, 64);
   }
@@ -2378,6 +2505,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
                      biases_ptr,
                      out_ptr,
                      fast_threads_per_col,
+                     use_tiny_k_qmv,
                      x_batch_stride,
                      w_batch_stride,
                      sb_batch_stride,
@@ -2446,50 +2574,98 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
                       has_bias);
                 }
               } else {
-                if (fast_threads_per_col == 16) {
-                  hipLaunchKernelGGL(
-                      (rocm::qmv_warp_shared_kernel<
-                          T,
-                          ScaleT,
-                          BITS,
-                          GROUP_SIZE,
-                          true,
-                          16>),
-                      fast_grid,
-                      fast_block,
-                      0,
-                      stream,
-                      (const T*)x_ptr,
-                      w_ptr,
-                      (const ScaleT*)scales_ptr,
-                      (const ScaleT*)biases_ptr,
-                      (T*)out_ptr,
-                      M,
-                      N,
-                      K,
-                      has_bias);
+                if (use_tiny_k_qmv) {
+                  if (fast_threads_per_col == 16) {
+                    hipLaunchKernelGGL(
+                        (rocm::qmv_warp_noshared_kernel<
+                            T,
+                            ScaleT,
+                            BITS,
+                            GROUP_SIZE,
+                            true,
+                            16>),
+                        fast_grid,
+                        fast_block,
+                        0,
+                        stream,
+                        (const T*)x_ptr,
+                        w_ptr,
+                        (const ScaleT*)scales_ptr,
+                        (const ScaleT*)biases_ptr,
+                        (T*)out_ptr,
+                        M,
+                        N,
+                        K,
+                        has_bias);
+                  } else {
+                    hipLaunchKernelGGL(
+                        (rocm::qmv_warp_noshared_kernel<
+                            T,
+                            ScaleT,
+                            BITS,
+                            GROUP_SIZE,
+                            true,
+                            WARP_SIZE>),
+                        fast_grid,
+                        fast_block,
+                        0,
+                        stream,
+                        (const T*)x_ptr,
+                        w_ptr,
+                        (const ScaleT*)scales_ptr,
+                        (const ScaleT*)biases_ptr,
+                        (T*)out_ptr,
+                        M,
+                        N,
+                        K,
+                        has_bias);
+                  }
                 } else {
-                  hipLaunchKernelGGL(
-                      (rocm::qmv_warp_shared_kernel<
-                          T,
-                          ScaleT,
-                          BITS,
-                          GROUP_SIZE,
-                          true,
-                          WARP_SIZE>),
-                      fast_grid,
-                      fast_block,
-                      0,
-                      stream,
-                      (const T*)x_ptr,
-                      w_ptr,
-                      (const ScaleT*)scales_ptr,
-                      (const ScaleT*)biases_ptr,
-                      (T*)out_ptr,
-                      M,
-                      N,
-                      K,
-                      has_bias);
+                  if (fast_threads_per_col == 16) {
+                    hipLaunchKernelGGL(
+                        (rocm::qmv_warp_shared_kernel<
+                            T,
+                            ScaleT,
+                            BITS,
+                            GROUP_SIZE,
+                            true,
+                            16>),
+                        fast_grid,
+                        fast_block,
+                        0,
+                        stream,
+                        (const T*)x_ptr,
+                        w_ptr,
+                        (const ScaleT*)scales_ptr,
+                        (const ScaleT*)biases_ptr,
+                        (T*)out_ptr,
+                        M,
+                        N,
+                        K,
+                        has_bias);
+                  } else {
+                    hipLaunchKernelGGL(
+                        (rocm::qmv_warp_shared_kernel<
+                            T,
+                            ScaleT,
+                            BITS,
+                            GROUP_SIZE,
+                            true,
+                            WARP_SIZE>),
+                        fast_grid,
+                        fast_block,
+                        0,
+                        stream,
+                        (const T*)x_ptr,
+                        w_ptr,
+                        (const ScaleT*)scales_ptr,
+                        (const ScaleT*)biases_ptr,
+                        (T*)out_ptr,
+                        M,
+                        N,
+                        K,
+                        has_bias);
+                  }
                 }
               }
             } else if (transpose_) {
@@ -2582,50 +2758,98 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
                       has_bias);
                 }
               } else {
-                if (fast_threads_per_col == 16) {
-                  hipLaunchKernelGGL(
-                      (rocm::qmv_warp_shared_kernel<
-                          T,
-                          ScaleT,
-                          BITS,
-                          GROUP_SIZE,
-                          false,
-                          16>),
-                      fast_grid,
-                      fast_block,
-                      0,
-                      stream,
-                      (const T*)x_ptr,
-                      w_ptr,
-                      (const ScaleT*)scales_ptr,
-                      (const ScaleT*)biases_ptr,
-                      (T*)out_ptr,
-                      M,
-                      N,
-                      K,
-                      has_bias);
+                if (use_tiny_k_qmv) {
+                  if (fast_threads_per_col == 16) {
+                    hipLaunchKernelGGL(
+                        (rocm::qmv_warp_noshared_kernel<
+                            T,
+                            ScaleT,
+                            BITS,
+                            GROUP_SIZE,
+                            false,
+                            16>),
+                        fast_grid,
+                        fast_block,
+                        0,
+                        stream,
+                        (const T*)x_ptr,
+                        w_ptr,
+                        (const ScaleT*)scales_ptr,
+                        (const ScaleT*)biases_ptr,
+                        (T*)out_ptr,
+                        M,
+                        N,
+                        K,
+                        has_bias);
+                  } else {
+                    hipLaunchKernelGGL(
+                        (rocm::qmv_warp_noshared_kernel<
+                            T,
+                            ScaleT,
+                            BITS,
+                            GROUP_SIZE,
+                            false,
+                            WARP_SIZE>),
+                        fast_grid,
+                        fast_block,
+                        0,
+                        stream,
+                        (const T*)x_ptr,
+                        w_ptr,
+                        (const ScaleT*)scales_ptr,
+                        (const ScaleT*)biases_ptr,
+                        (T*)out_ptr,
+                        M,
+                        N,
+                        K,
+                        has_bias);
+                  }
                 } else {
-                  hipLaunchKernelGGL(
-                      (rocm::qmv_warp_shared_kernel<
-                          T,
-                          ScaleT,
-                          BITS,
-                          GROUP_SIZE,
-                          false,
-                          WARP_SIZE>),
-                      fast_grid,
-                      fast_block,
-                      0,
-                      stream,
-                      (const T*)x_ptr,
-                      w_ptr,
-                      (const ScaleT*)scales_ptr,
-                      (const ScaleT*)biases_ptr,
-                      (T*)out_ptr,
-                      M,
-                      N,
-                      K,
-                      has_bias);
+                  if (fast_threads_per_col == 16) {
+                    hipLaunchKernelGGL(
+                        (rocm::qmv_warp_shared_kernel<
+                            T,
+                            ScaleT,
+                            BITS,
+                            GROUP_SIZE,
+                            false,
+                            16>),
+                        fast_grid,
+                        fast_block,
+                        0,
+                        stream,
+                        (const T*)x_ptr,
+                        w_ptr,
+                        (const ScaleT*)scales_ptr,
+                        (const ScaleT*)biases_ptr,
+                        (T*)out_ptr,
+                        M,
+                        N,
+                        K,
+                        has_bias);
+                  } else {
+                    hipLaunchKernelGGL(
+                        (rocm::qmv_warp_shared_kernel<
+                            T,
+                            ScaleT,
+                            BITS,
+                            GROUP_SIZE,
+                            false,
+                            WARP_SIZE>),
+                        fast_grid,
+                        fast_block,
+                        0,
+                        stream,
+                        (const T*)x_ptr,
+                        w_ptr,
+                        (const ScaleT*)scales_ptr,
+                        (const ScaleT*)biases_ptr,
+                        (T*)out_ptr,
+                        M,
+                        N,
+                        K,
+                        has_bias);
+                  }
                 }
               }
             } else if (transpose_) {
