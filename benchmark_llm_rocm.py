@@ -204,23 +204,85 @@ def run_mlx(cfg: dict[str, str], variant: str, args: argparse.Namespace) -> RunS
 
     try:
         import mlx.core as mx
-        import mlx_lm
         import time
 
-        # Load model once
-        print(f"  Loading MLX model: {mlx_model}")
-        model, tokenizer = mlx_lm.load(mlx_model)
+        try:
+            import mlx_lm
+            from mlx_lm.generate import stream_generate as lm_stream_generate
+        except Exception:
+            mlx_lm = None
+            lm_stream_generate = None
 
+        try:
+            from mlx_vlm import load as vlm_load
+            from mlx_vlm import stream_generate as vlm_stream_generate
+        except Exception:
+            vlm_load = None
+            vlm_stream_generate = None
+
+        if mlx_lm is None and vlm_load is None:
+            raise RuntimeError(
+                "No MLX generation backend available. Install mlx-lm and/or mlx-vlm."
+            )
+
+        def likely_vision_model(model_id: str) -> bool:
+            model_id = model_id.lower()
+            return any(
+                token in model_id
+                for token in (
+                    "qwen3.5",
+                    "vision",
+                    "multimodal",
+                    "llava",
+                    "internvl",
+                    "gemma3",
+                )
+            )
+
+        def looks_like_vision_weight_mismatch(exc: Exception) -> bool:
+            message = str(exc).lower()
+            return "vision_tower" in message or (
+                "parameters not in model" in message and "vision" in message
+            )
+
+        backend = "mlx_lm"
+        stream_generate_fn = lm_stream_generate
+
+        if likely_vision_model(mlx_model) and vlm_load is not None:
+            backend = "mlx_vlm"
+            stream_generate_fn = vlm_stream_generate
+            print(f"  Loading MLX model ({backend}): {mlx_model}")
+            model, processor = vlm_load(mlx_model)
+        elif mlx_lm is not None:
+            try:
+                print(f"  Loading MLX model ({backend}): {mlx_model}")
+                model, processor = mlx_lm.load(mlx_model)
+            except Exception as exc:
+                if vlm_load is None or not looks_like_vision_weight_mismatch(exc):
+                    raise
+                backend = "mlx_vlm"
+                stream_generate_fn = vlm_stream_generate
+                print(f"  Falling back to {backend} for: {mlx_model}")
+                model, processor = vlm_load(mlx_model)
+        else:
+            backend = "mlx_vlm"
+            stream_generate_fn = vlm_stream_generate
+            print(f"  Loading MLX model ({backend}): {mlx_model}")
+            model, processor = vlm_load(mlx_model)
+
+        # Load model once
         # Warmup runs (model stays loaded, JIT compiles kernels)
         if args.warmup_runs > 0:
             print(f"  Warming up MLX ({args.warmup_runs} runs)...")
             for i in range(args.warmup_runs):
-                _ = mlx_lm.generate(
-                    model,
-                    tokenizer,
-                    prompt=args.prompt,
-                    max_tokens=1,
-                    verbose=False,
+                _ = next(
+                    stream_generate_fn(
+                        model,
+                        processor,
+                        prompt=args.prompt,
+                        max_tokens=1,
+                        sampler=lambda x: mx.argmax(x, axis=-1),
+                    )
                 )
                 mx.synchronize()
 
@@ -229,22 +291,18 @@ def run_mlx(cfg: dict[str, str], variant: str, args: argparse.Namespace) -> RunS
 
         # Use stream_generate to get accurate per-token timings in a single pass
         # This avoids running the prompt twice and eliminates tokenization overhead from the timing
-        from mlx_lm.generate import stream_generate
-
         start_time = time.perf_counter()
         final_stats = None
         output_text = ""
-        for response in stream_generate(
-            model,
-            tokenizer,
-            prompt=args.prompt,
-            max_tokens=args.max_tokens,
-            temp=args.temp,
-            top_p=args.top_p,
-            sampler=lambda x: (
-                mx.argmax(x, axis=-1) if args.temp == 0 else None
-            ),  # Use greedy if temp is 0
-        ):
+        stream_kwargs = {
+            "prompt": args.prompt,
+            "max_tokens": args.max_tokens,
+            "sampler": lambda x: mx.argmax(x, axis=-1) if args.temp == 0 else None,
+        }
+        if backend == "mlx_vlm":
+            stream_kwargs.update({"temp": args.temp, "top_p": args.top_p})
+
+        for response in stream_generate_fn(model, processor, **stream_kwargs):
             output_text += response.text
             final_stats = response
 

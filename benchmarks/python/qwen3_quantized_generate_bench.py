@@ -12,16 +12,28 @@ import argparse
 import statistics
 import time
 from dataclasses import dataclass
+from typing import Callable
 
 import mlx.core as mx
 
 try:
-    from mlx_lm import load
-    from mlx_lm.generate import stream_generate
-except Exception as exc:  # pragma: no cover
+    from mlx_lm import load as lm_load
+    from mlx_lm.generate import stream_generate as lm_stream_generate
+except Exception:  # pragma: no cover
+    lm_load = None
+    lm_stream_generate = None
+
+try:
+    from mlx_vlm import load as vlm_load
+    from mlx_vlm import stream_generate as vlm_stream_generate
+except Exception:  # pragma: no cover
+    vlm_load = None
+    vlm_stream_generate = None
+
+if lm_load is None and vlm_load is None:  # pragma: no cover
     raise RuntimeError(
-        "mlx_lm is required for this benchmark. Install mlx-lm first."
-    ) from exc
+        "No generation backend available. Install mlx-lm and/or mlx-vlm."
+    )
 
 
 DEFAULT_MODELS = (
@@ -46,12 +58,64 @@ def greedy_sampler(logprobs: mx.array) -> mx.array:
     return mx.argmax(logprobs, axis=-1)
 
 
-def run_once(model, tokenizer, prompt: str, max_tokens: int) -> RunStats:
+def _is_likely_vision_model(model_id: str) -> bool:
+    model_id = model_id.lower()
+    return any(
+        token in model_id
+        for token in (
+            "qwen3.5",
+            "vision",
+            "multimodal",
+            "llava",
+            "internvl",
+            "gemma3",
+        )
+    )
+
+
+def _looks_like_vision_weight_mismatch(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "vision_tower" in message or (
+        "parameters not in model" in message and "vision" in message
+    )
+
+
+def load_with_backend(
+    model_id: str,
+) -> tuple[object, object, Callable[..., object], str]:
+    if _is_likely_vision_model(model_id) and vlm_load is not None:
+        model, processor = vlm_load(model_id)
+        return model, processor, vlm_stream_generate, "mlx_vlm"
+
+    if lm_load is not None:
+        try:
+            model, tokenizer = lm_load(model_id)
+            return model, tokenizer, lm_stream_generate, "mlx_lm"
+        except Exception as exc:
+            if vlm_load is not None and _looks_like_vision_weight_mismatch(exc):
+                model, processor = vlm_load(model_id)
+                return model, processor, vlm_stream_generate, "mlx_vlm"
+            raise
+
+    if vlm_load is not None:
+        model, processor = vlm_load(model_id)
+        return model, processor, vlm_stream_generate, "mlx_vlm"
+
+    raise RuntimeError("Unable to load model with mlx-lm or mlx-vlm.")
+
+
+def run_once(
+    model,
+    processor,
+    stream_fn: Callable[..., object],
+    prompt: str,
+    max_tokens: int,
+) -> RunStats:
     start = time.perf_counter()
     final = None
-    for response in stream_generate(
+    for response in stream_fn(
         model,
-        tokenizer,
+        processor,
         prompt=prompt,
         max_tokens=max_tokens,
         sampler=greedy_sampler,
@@ -137,18 +201,20 @@ def main() -> None:
         print(f"=== {model_id} ===")
 
         load_start = time.perf_counter()
-        model, tokenizer = load(model_id)
+        model, processor, stream_fn, backend = load_with_backend(model_id)
         load_s = time.perf_counter() - load_start
-        print(f"load_s={load_s:.3f}")
+        print(f"load_s={load_s:.3f} backend={backend}")
 
         for _ in range(args.warmup_runs):
             mx.random.seed(args.seed)
-            _ = run_once(model, tokenizer, args.prompt, args.max_tokens)
+            _ = run_once(model, processor, stream_fn, args.prompt, args.max_tokens)
 
         runs: list[RunStats] = []
         for run_idx in range(args.runs):
             mx.random.seed(args.seed + run_idx)
-            runs.append(run_once(model, tokenizer, args.prompt, args.max_tokens))
+            runs.append(
+                run_once(model, processor, stream_fn, args.prompt, args.max_tokens)
+            )
 
         wall_mean, wall_std = summarize([r.wall_s for r in runs])
         gen_tps_mean, gen_tps_std = summarize([r.generation_tps for r in runs])
@@ -185,7 +251,7 @@ def main() -> None:
         print()
 
         del model
-        del tokenizer
+        del processor
         mx.clear_cache()
 
 
