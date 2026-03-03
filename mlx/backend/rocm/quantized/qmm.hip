@@ -84,8 +84,7 @@ inline int parse_threads_per_col_env(const char* env_name) {
     return 0;
   }
 
-  return (value == 16 || value == 32 || value == 64) ? static_cast<int>(value)
-                                                     : 0;
+  return (value == 16 || value == WARP_SIZE) ? static_cast<int>(value) : 0;
 }
 
 inline bool parse_warp_kernel_env(const char* env_name, bool default_value) {
@@ -189,6 +188,18 @@ inline int select_qmv_cols_per_block(int K, int N, int bits) {
   return 16;
 }
 
+inline int select_qmv_threads_per_col(int K, int N, int bits, int batch_count) {
+  (void)K;
+  (void)N;
+  (void)bits;
+  (void)batch_count;
+  int threads_per_col = 16;
+  if (WARP_SIZE == 32) {
+    threads_per_col = WARP_SIZE;
+  }
+  return threads_per_col;
+}
+
 inline bool should_use_dequant_gemm_path(
     int M,
     int N,
@@ -235,9 +246,9 @@ inline bool should_use_dequant_gemm_path(
 }
 
 struct DequantCacheKey {
-  std::uintptr_t w_id;
-  std::uintptr_t scales_id;
-  std::uintptr_t biases_id;
+  std::uintptr_t w_ptr;
+  std::uintptr_t scales_ptr;
+  std::uintptr_t biases_ptr;
   int group_size;
   int bits;
   int stream_index;
@@ -245,8 +256,8 @@ struct DequantCacheKey {
   Dtype dtype;
 
   bool operator==(const DequantCacheKey& other) const {
-    return w_id == other.w_id && scales_id == other.scales_id &&
-        biases_id == other.biases_id && group_size == other.group_size &&
+    return w_ptr == other.w_ptr && scales_ptr == other.scales_ptr &&
+        biases_ptr == other.biases_ptr && group_size == other.group_size &&
         bits == other.bits && stream_index == other.stream_index &&
         transpose == other.transpose && dtype == other.dtype;
   }
@@ -254,10 +265,10 @@ struct DequantCacheKey {
 
 struct DequantCacheKeyHasher {
   size_t operator()(const DequantCacheKey& key) const {
-    size_t h = std::hash<std::uintptr_t>{}(key.w_id);
-    h ^= std::hash<std::uintptr_t>{}(key.scales_id) + 0x9e3779b9 + (h << 6) +
+    size_t h = std::hash<std::uintptr_t>{}(key.w_ptr);
+    h ^= std::hash<std::uintptr_t>{}(key.scales_ptr) + 0x9e3779b9 + (h << 6) +
         (h >> 2);
-    h ^= std::hash<std::uintptr_t>{}(key.biases_id) + 0x9e3779b9 + (h << 6) +
+    h ^= std::hash<std::uintptr_t>{}(key.biases_ptr) + 0x9e3779b9 + (h << 6) +
         (h >> 2);
     h ^= std::hash<int>{}(key.group_size) + 0x9e3779b9 + (h << 6) + (h >> 2);
     h ^= std::hash<int>{}(key.bits) + 0x9e3779b9 + (h << 6) + (h >> 2);
@@ -1917,9 +1928,10 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
           cache;
 
       DequantCacheKey key{
-          w.id(),
-          scales.id(),
-          has_bias ? biases->id() : 0,
+          reinterpret_cast<std::uintptr_t>(gpu_ptr<void>(w)),
+          reinterpret_cast<std::uintptr_t>(gpu_ptr<void>(scales)),
+          has_bias ? reinterpret_cast<std::uintptr_t>(gpu_ptr<void>(*biases))
+                   : 0,
           group_size_,
           bits_,
           s.index,
@@ -2080,7 +2092,8 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   int block_size = 256;
   dim3 grid(M, (N + block_size - 1) / block_size);
 
-  int fast_threads_per_col = 16;
+  int fast_threads_per_col =
+      select_qmv_threads_per_col(K, N, bits_, batch_count);
   int fast_threads_env =
       parse_threads_per_col_env("MLX_ROCM_QMV_THREADS_PER_COL");
   if (fast_threads_env > 0)
@@ -3065,7 +3078,7 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   int block_size = 256;
   dim3 grid(M, (N + block_size - 1) / block_size, B);
 
-  int fast_threads_per_col = 16;
+  int fast_threads_per_col = select_qmv_threads_per_col(K, N, bits_, B);
   int fast_threads_env =
       parse_threads_per_col_env("MLX_ROCM_GATHER_QMV_THREADS_PER_COL");
   if (fast_threads_env <= 0) {
@@ -3076,9 +3089,13 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     fast_threads_per_col = fast_threads_env;
   }
 
-  int fast_cols_per_block = 32;
+  int fast_cols_per_block = select_qmv_cols_per_block(K, N, bits_);
   int max_cols_per_block = rocm::kMaxThreadsPerBlock / fast_threads_per_col;
   while (fast_cols_per_block > max_cols_per_block) {
+    fast_cols_per_block /= 2;
+  }
+  while (fast_cols_per_block > 1 && (N % fast_cols_per_block) != 0 &&
+         fast_cols_per_block > 8) {
     fast_cols_per_block /= 2;
   }
 
