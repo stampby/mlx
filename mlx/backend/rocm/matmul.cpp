@@ -55,6 +55,31 @@ std::tuple<bool, int64_t, array> ensure_batch_contiguous(
   return std::make_tuple(false, x_copy.strides(-2), x_copy);
 }
 
+std::pair<bool, int64_t> get_uniform_batch_stride(
+    const Shape& batch_shape,
+    const Strides& batch_strides) {
+  if (batch_shape.empty() || batch_shape.size() != batch_strides.size()) {
+    return {false, 0};
+  }
+
+  if (batch_shape.size() == 1) {
+    return {true, batch_strides.back()};
+  }
+
+  for (int i = batch_shape.size() - 2; i >= 0; --i) {
+    int64_t cur = batch_strides[i];
+    int64_t next = batch_strides[i + 1];
+    if (cur == 0 && next == 0) {
+      continue;
+    }
+    if (cur != next * batch_shape[i + 1]) {
+      return {false, 0};
+    }
+  }
+
+  return {true, batch_strides.back()};
+}
+
 void gemm_rocblas(
     rocm::CommandEncoder& encoder,
     int M,
@@ -400,6 +425,10 @@ void gemm_and_bias(
 
   // Check if rocBLAS is available
   bool use_rocblas = encoder.device().is_rocblas_available();
+  auto [a_uniform_batch, a_uniform_stride] =
+      get_uniform_batch_stride(batch_shape, a_batch_strides);
+  auto [b_uniform_batch, b_uniform_stride] =
+      get_uniform_batch_stride(batch_shape, b_batch_strides);
 
   if (batch_count == 1) {
     // Simple single GEMM
@@ -435,9 +464,7 @@ void gemm_and_bias(
           alpha,
           beta);
     }
-  } else if (
-      batch_shape.size() == 1 && a_batch_strides.back() > 0 &&
-      b_batch_strides.back() > 0) {
+  } else if (a_uniform_batch && b_uniform_batch) {
     // Use strided batched GEMM for uniform batches
     if (use_rocblas) {
       gemm_strided_batched_rocblas(
@@ -447,10 +474,10 @@ void gemm_and_bias(
           K,
           a_transposed,
           lda,
-          a_batch_strides.back(),
+          a_uniform_stride,
           b_transposed,
           ldb,
-          b_batch_strides.back(),
+          b_uniform_stride,
           M * N,
           batch_count,
           out,
@@ -470,10 +497,10 @@ void gemm_and_bias(
           K,
           a_transposed,
           lda,
-          a_batch_strides.back(),
+          a_uniform_stride,
           b_transposed,
           ldb,
-          b_batch_strides.back(),
+          b_uniform_stride,
           M * N,
           batch_count,
           alpha,
