@@ -361,40 +361,21 @@ struct RightShift {
   __device__ T operator()(T x, T y) { return x >> y; }
 };
 
-// Helper: check if T is a half-precision type that needs float promotion
-template <typename T>
-constexpr bool is_half_type() {
-  return std::is_same_v<T, __half> || std::is_same_v<T, hip_bfloat16>;
-}
-
-// Promote half types to float for math ops, use native for float/double
-#define UNARY_FLOAT_OP(name, float_op, native_op) \
+// All unary math ops promote through float to support half/bfloat16.
+// For float inputs the static_cast is a no-op.
+#define UNARY_FLOAT_OP(name, op) \
 struct name { \
   template <typename T> \
   __device__ T operator()(T x) { \
-    if constexpr (is_half_type<T>()) { \
-      return T(float_op(static_cast<float>(x))); \
-    } else { \
-      return native_op(x); \
-    } \
+    return T(op(static_cast<float>(x))); \
   } \
 };
 
 // Unary ops
-struct Abs {
-  template <typename T>
-  __device__ T operator()(T x) {
-    if constexpr (is_half_type<T>()) {
-      return T(fabsf(static_cast<float>(x)));
-    } else {
-      return abs(x);
-    }
-  }
-};
-
-UNARY_FLOAT_OP(Exp, expf, exp)
-UNARY_FLOAT_OP(Log, logf, log)
-UNARY_FLOAT_OP(Sqrt, sqrtf, sqrt)
+UNARY_FLOAT_OP(Abs, fabsf)
+UNARY_FLOAT_OP(Exp, expf)
+UNARY_FLOAT_OP(Log, logf)
+UNARY_FLOAT_OP(Sqrt, sqrtf)
 
 struct Negative {
   template <typename T>
@@ -415,41 +396,37 @@ struct Sigmoid {
   }
 };
 
-UNARY_FLOAT_OP(Tanh, tanhf, tanh)
-UNARY_FLOAT_OP(Sin, sinf, sin)
-UNARY_FLOAT_OP(Cos, cosf, cos)
-UNARY_FLOAT_OP(Tan, tanf, tan)
-UNARY_FLOAT_OP(Sinh, sinhf, sinh)
-UNARY_FLOAT_OP(Cosh, coshf, cosh)
-UNARY_FLOAT_OP(Erf, erff, erff)
-UNARY_FLOAT_OP(ErfInv, erfinvf, erfinvf)
-UNARY_FLOAT_OP(Expm1, expm1f, expm1f)
-UNARY_FLOAT_OP(Log1p, log1pf, log1pf)
-UNARY_FLOAT_OP(Log2, log2f, log2)
-UNARY_FLOAT_OP(Log10, log10f, log10)
-UNARY_FLOAT_OP(Ceil, ceilf, ceil)
-UNARY_FLOAT_OP(Floor, floorf, floor)
-UNARY_FLOAT_OP(Round, rintf, rint)
-UNARY_FLOAT_OP(Rsqrt, rsqrtf, rsqrt)
+UNARY_FLOAT_OP(Tanh, tanhf)
+UNARY_FLOAT_OP(Sin, sinf)
+UNARY_FLOAT_OP(Cos, cosf)
+UNARY_FLOAT_OP(Tan, tanf)
+UNARY_FLOAT_OP(Sinh, sinhf)
+UNARY_FLOAT_OP(Cosh, coshf)
+UNARY_FLOAT_OP(Erf, erff)
+UNARY_FLOAT_OP(ErfInv, erfinvf)
+UNARY_FLOAT_OP(Expm1, expm1f)
+UNARY_FLOAT_OP(Log1p, log1pf)
+UNARY_FLOAT_OP(Log2, log2f)
+UNARY_FLOAT_OP(Log10, log10f)
+UNARY_FLOAT_OP(Ceil, ceilf)
+UNARY_FLOAT_OP(Floor, floorf)
+UNARY_FLOAT_OP(Round, rintf)
+UNARY_FLOAT_OP(Rsqrt, rsqrtf)
 
 struct Sign {
   template <typename T>
   __device__ T operator()(T x) {
-    if constexpr (is_half_type<T>()) {
-      float fx = static_cast<float>(x);
-      return T((fx > 0.0f) - (fx < 0.0f));
-    } else {
-      return (x > T(0)) - (x < T(0));
-    }
+    float fx = static_cast<float>(x);
+    return T((fx > 0.0f) - (fx < 0.0f));
   }
 };
 
-UNARY_FLOAT_OP(Asin, asinf, asin)
-UNARY_FLOAT_OP(Acos, acosf, acos)
-UNARY_FLOAT_OP(Atan, atanf, atan)
-UNARY_FLOAT_OP(Asinh, asinhf, asinh)
-UNARY_FLOAT_OP(Acosh, acoshf, acosh)
-UNARY_FLOAT_OP(Atanh, atanhf, atanh)
+UNARY_FLOAT_OP(Asin, asinf)
+UNARY_FLOAT_OP(Acos, acosf)
+UNARY_FLOAT_OP(Atan, atanf)
+UNARY_FLOAT_OP(Asinh, asinhf)
+UNARY_FLOAT_OP(Acosh, acoshf)
+UNARY_FLOAT_OP(Atanh, atanhf)
 
 struct LogicalNot {
   template <typename T>
