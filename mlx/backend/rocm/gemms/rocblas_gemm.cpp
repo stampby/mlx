@@ -2,6 +2,7 @@
 
 #include "mlx/backend/rocm/gemms/rocblas_gemm.h"
 #include "mlx/backend/rocm/device.h"
+#include "mlx/backend/rocm/kernel_utils.hpp"
 #include "mlx/backend/rocm/gemms/naive_gemm.h"
 
 #include <hip/hip_fp16.h>
