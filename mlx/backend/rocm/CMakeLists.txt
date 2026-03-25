@@ -176,7 +176,7 @@ foreach(hip_src ${HIP_SOURCES})
     OUTPUT ${hip_obj}
     COMMAND ${CMAKE_HIP_COMPILER} -c ${hip_src} -o ${hip_obj} -fPIC
             -DMLX_USE_ROCM ${HIP_ARCH_FLAGS} ${HIP_INCLUDE_FLAGS} -std=c++17
-            --parallel-jobs=${NPROC}
+            -parallel-jobs=${NPROC}
     DEPENDS ${hip_src}
     COMMENT "Compiling HIP source ${hip_src}"
     VERBATIM)
