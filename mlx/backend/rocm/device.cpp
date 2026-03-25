@@ -44,6 +44,10 @@ rocblas_handle Device::get_rocblas_handle() {
     // List of architectures supported by rocBLAS (based on TensileLibrary
     // files) These are the architectures that have TensileLibrary_lazy_*.dat
     // files
+    // Only include architectures that have Tensile kernels in the
+    // installed rocBLAS. RDNA 3.5 (gfx1150/1151/1152) and RDNA 4
+    // (gfx1200/1201) typically lack Tensile support in stock ROCm
+    // packages — they'll use naive_gemm fallback instead.
     static const std::vector<std::string> supported_archs = {
         "gfx908",
         "gfx90a",
@@ -52,11 +56,7 @@ rocblas_handle Device::get_rocblas_handle() {
         "gfx1030",
         "gfx1100",
         "gfx1101",
-        "gfx1102",
-        "gfx1150",
-        "gfx1151",
-        "gfx1200",
-        "gfx1201"};
+        "gfx1102"};
 
     // Extract base architecture name (remove any suffix like :sramecc+:xnack-)
     std::string base_arch = arch_name;
