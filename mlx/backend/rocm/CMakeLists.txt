@@ -14,13 +14,15 @@ find_package(hiprand REQUIRED CONFIG)
 # Ensure HIP architectures are set - respect user-provided value from command
 # line The user can set this via -DCMAKE_HIP_ARCHITECTURES=gfx1011
 #
-# Supported architectures from ROCm 6.4.0 - 7.2.0 compatibility matrix: CDNA:
-# gfx908 (MI100), gfx90a (MI200), gfx942 (MI300) CDNA4: gfx950 (MI400 series)
-# RDNA2: gfx1030 (RX 6000 series) RDNA3: gfx1100 (RX 7900), gfx1101 (RX 7600)
-# RDNA4: gfx1200, gfx1201 (RX 8000 series)
+# Supported architectures from ROCm 6.4.0 - 7.2.0 compatibility matrix:
+# CDNA:   gfx908 (MI100), gfx90a (MI200), gfx942 (MI300)
+# RDNA2:  gfx1030 (RX 6000 series)
+# RDNA3:  gfx1100 (RX 7900), gfx1101 (RX 7600)
+# RDNA3.5: gfx1150, gfx1151, gfx1152 (Ryzen AI / Radeon 8060S)
+# RDNA4:  gfx1200, gfx1201 (RX 9000 series)
 if(NOT CMAKE_HIP_ARCHITECTURES)
   set(CMAKE_HIP_ARCHITECTURES
-      "gfx908;gfx90a;gfx942;gfx1010;gfx1011;gfx1012;gfx1030;gfx1031;gfx1032;gfx1100;gfx1101;gfx1102"
+      "gfx908;gfx90a;gfx942;gfx1010;gfx1011;gfx1012;gfx1030;gfx1031;gfx1032;gfx1100;gfx1101;gfx1102;gfx1150;gfx1151;gfx1152;gfx1200;gfx1201"
       CACHE STRING "HIP architectures" FORCE)
 endif()
 message(
@@ -146,6 +148,13 @@ set(HIP_SOURCES
 set(HIP_OBJ_DIR "${CMAKE_CURRENT_BINARY_DIR}/hip_objs")
 file(MAKE_DIRECTORY ${HIP_OBJ_DIR})
 
+# Detect CPU count for parallel HIP offload compilation
+include(ProcessorCount)
+ProcessorCount(NPROC)
+if(NPROC EQUAL 0)
+  set(NPROC 8)
+endif()
+
 # Compile each HIP file to object file using custom commands Use -fno-gpu-rdc to
 # avoid needing device link step
 set(HIP_OBJECTS "")
@@ -167,6 +176,7 @@ foreach(hip_src ${HIP_SOURCES})
     OUTPUT ${hip_obj}
     COMMAND ${CMAKE_HIP_COMPILER} -c ${hip_src} -o ${hip_obj} -fPIC
             -DMLX_USE_ROCM ${HIP_ARCH_FLAGS} ${HIP_INCLUDE_FLAGS} -std=c++17
+            --parallel-jobs=${NPROC}
     DEPENDS ${hip_src}
     COMMENT "Compiling HIP source ${hip_src}"
     VERBATIM)
