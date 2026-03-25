@@ -41,7 +41,6 @@ NO_GPU(Cholesky)
 NO_GPU_MULTI(Eig)
 NO_GPU_MULTI(Eigh)
 NO_GPU(MaskedScatter)
-NO_GPU(SliceUpdate)
 
 // Note: The following are now implemented in their respective files:
 // - Load: load.cpp
