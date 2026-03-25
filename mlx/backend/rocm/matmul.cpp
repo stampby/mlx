@@ -70,11 +70,19 @@ void gemm_rocblas(
     float alpha = 1.0f,
     float beta = 0.0f) {
   auto& device = encoder.device();
+
+  // For bfloat16: check if rocBLAS bf16 kernels actually work on this device
+  if (a.dtype() == bfloat16 && !device.is_rocblas_bf16_available()) {
+    naive_gemm(
+        encoder, a, b, out, M, N, K,
+        a_transposed, a_transposed ? M : K,
+        b_transposed, b_transposed ? K : N,
+        alpha, beta);
+    return;
+  }
+
   rocblas_handle handle = device.get_rocblas_handle();
 
-  // rocBLAS uses column-major, so we swap A and B and compute B^T * A^T = (A *
-  // B)^T But since we want row-major output, we compute C = A * B by doing C^T
-  // = B^T * A^T
   rocblas_operation trans_a =
       b_transposed ? rocblas_operation_none : rocblas_operation_transpose;
   rocblas_operation trans_b =
@@ -231,6 +239,17 @@ void gemm_strided_batched_rocblas(
     float alpha = 1.0f,
     float beta = 0.0f) {
   auto& device = encoder.device();
+
+  // For bfloat16: check if rocBLAS bf16 kernels actually work on this device
+  if (a.dtype() == bfloat16 && !device.is_rocblas_bf16_available()) {
+    naive_gemm_batched(
+        encoder, a, b, out, M, N, K,
+        a_transposed, a_transposed ? M : K, stride_a,
+        b_transposed, b_transposed ? K : N, stride_b,
+        stride_c, batch_count, alpha, beta);
+    return;
+  }
+
   rocblas_handle handle = device.get_rocblas_handle();
 
   rocblas_operation trans_a =

@@ -106,14 +106,88 @@ rocblas_handle Device::get_rocblas_handle() {
 
 bool Device::is_rocblas_available() {
   if (!rocblas_initialized_) {
-    // Trigger initialization to check availability
     try {
       get_rocblas_handle();
     } catch (...) {
-      // Ignore exception, rocblas_available_ is already set
     }
   }
   return rocblas_available_;
+}
+
+bool Device::is_rocblas_bf16_available() {
+  if (!rocblas_bf16_probed_) {
+    rocblas_bf16_probed_ = true;
+    rocblas_bf16_available_ = false;
+
+    if (!is_rocblas_available()) {
+      return false;
+    }
+
+    // Probe: run a tiny bf16 GEMM and check if the GPU survives.
+    // rocBLAS may claim support but crash if the Tensile .co files
+    // are corrupt or missing specific kernel variants.
+    make_current();
+    void* a_ptr = nullptr;
+    void* b_ptr = nullptr;
+    void* c_ptr = nullptr;
+    hipError_t err;
+
+    err = hipMalloc(&a_ptr, 4 * 4 * 2); // 4x4 bf16
+    if (err != hipSuccess) return false;
+    err = hipMalloc(&b_ptr, 4 * 4 * 2);
+    if (err != hipSuccess) { hipFree(a_ptr); return false; }
+    err = hipMalloc(&c_ptr, 4 * 4 * 2);
+    if (err != hipSuccess) { hipFree(a_ptr); hipFree(b_ptr); return false; }
+
+    (void)hipMemset(a_ptr, 0, 4 * 4 * 2);
+    (void)hipMemset(b_ptr, 0, 4 * 4 * 2);
+    (void)hipMemset(c_ptr, 0, 4 * 4 * 2);
+
+    float alpha = 1.0f, beta = 0.0f;
+    rocblas_status status = rocblas_gemm_ex(
+        rocblas_,
+        rocblas_operation_none,
+        rocblas_operation_none,
+        4, 4, 4,
+        &alpha,
+        a_ptr, rocblas_datatype_bf16_r, 4,
+        b_ptr, rocblas_datatype_bf16_r, 4,
+        &beta,
+        c_ptr, rocblas_datatype_bf16_r, 4,
+        c_ptr, rocblas_datatype_bf16_r, 4,
+        rocblas_datatype_f32_r,
+        rocblas_gemm_algo_standard, 0, 0);
+
+    // Sync and check if the GPU is still alive
+    hipError_t sync_err = hipDeviceSynchronize();
+    // Clear any lingering error
+    (void)hipGetLastError();
+
+    hipFree(a_ptr);
+    hipFree(b_ptr);
+    hipFree(c_ptr);
+
+    if (status == rocblas_status_success && sync_err == hipSuccess) {
+      rocblas_bf16_available_ = true;
+    } else {
+      // GPU may be in a bad state — need to reset
+      (void)hipDeviceReset();
+      // Re-initialize device
+      make_current();
+      // Re-create rocBLAS handle
+      if (rocblas_) {
+        rocblas_destroy_handle(rocblas_);
+        rocblas_ = nullptr;
+      }
+      rocblas_status rs = rocblas_create_handle(&rocblas_);
+      if (rs != rocblas_status_success) {
+        rocblas_available_ = false;
+      }
+      std::cerr << "Warning: rocBLAS bfloat16 GEMM probe failed on this GPU. "
+                << "Using fallback kernels for bf16 matmul." << std::endl;
+    }
+  }
+  return rocblas_bf16_available_;
 }
 
 void Device::make_current() {

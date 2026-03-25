@@ -89,11 +89,16 @@ class Device {
   // Check if rocBLAS is available for the current GPU architecture
   bool is_rocblas_available();
 
+  // Check if rocBLAS bf16 GEMM works on this device (probed at init)
+  bool is_rocblas_bf16_available();
+
  private:
   int device_;
   rocblas_handle rocblas_{nullptr};
   bool rocblas_initialized_{false};
   bool rocblas_available_{true};
+  bool rocblas_bf16_probed_{false};
+  bool rocblas_bf16_available_{false};
   std::unordered_map<int, std::unique_ptr<CommandEncoder>> encoders_;
 };
 
