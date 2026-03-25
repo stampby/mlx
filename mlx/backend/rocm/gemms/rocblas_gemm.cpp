@@ -86,19 +86,18 @@ void rocblas_gemm(
             M,
             K,
             &alpha_f,
-            b.data<float>(),
+            gpu_ptr<float>(b),
             ldb,
-            a.data<float>(),
+            gpu_ptr<float>(a),
             lda,
             &beta_f,
-            c.data<float>(),
+            gpu_ptr<float>(c),
             ldc);
         break;
       }
       case float16: {
         rocblas_half alpha_h;
         rocblas_half beta_h;
-        // Convert float to half
         alpha_h = rocblas_half(alpha);
         beta_h = rocblas_half(beta);
         rocblas_hgemm(
@@ -109,12 +108,12 @@ void rocblas_gemm(
             M,
             K,
             &alpha_h,
-            reinterpret_cast<const rocblas_half*>(b.data<uint16_t>()),
+            reinterpret_cast<const rocblas_half*>(gpu_ptr<void>(b)),
             ldb,
-            reinterpret_cast<const rocblas_half*>(a.data<uint16_t>()),
+            reinterpret_cast<const rocblas_half*>(gpu_ptr<void>(a)),
             lda,
             &beta_h,
-            reinterpret_cast<rocblas_half*>(c.data<uint16_t>()),
+            reinterpret_cast<rocblas_half*>(gpu_ptr<void>(c)),
             ldc);
         break;
       }
