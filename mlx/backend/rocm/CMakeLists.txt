@@ -149,10 +149,17 @@ set(HIP_OBJ_DIR "${CMAKE_CURRENT_BINARY_DIR}/hip_objs")
 file(MAKE_DIRECTORY ${HIP_OBJ_DIR})
 
 # Detect CPU count for parallel HIP offload compilation
+# Use half of available CPUs for parallel HIP offload compilation per file
+# (Ninja already parallelizes across files, so this avoids oversubscription)
 include(ProcessorCount)
 ProcessorCount(NPROC)
 if(NPROC EQUAL 0)
-  set(NPROC 8)
+  set(NPROC 4)
+else()
+  math(EXPR NPROC "${NPROC} / 2")
+  if(NPROC LESS 2)
+    set(NPROC 2)
+  endif()
 endif()
 
 # Compile each HIP file to object file using custom commands Use -fno-gpu-rdc to
