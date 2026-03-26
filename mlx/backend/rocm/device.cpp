@@ -42,8 +42,7 @@ rocblas_handle Device::get_rocblas_handle() {
     std::string arch_name = props.gcnArchName;
 
     // List of architectures supported by rocBLAS (based on TensileLibrary
-    // files) These are the architectures that have TensileLibrary_lazy_*.dat
-    // files
+    // files). These are the architectures that have TensileLibrary_lazy_*.dat.
     static const std::vector<std::string> supported_archs = {
         "gfx908",
         "gfx90a",

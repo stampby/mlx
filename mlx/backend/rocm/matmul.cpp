@@ -71,10 +71,8 @@ void gemm_rocblas(
     float beta = 0.0f) {
   auto& device = encoder.device();
 
-  // bfloat16: use naive_gemm directly. rocBLAS Tensile libraries for bf16
-  // have corrupt/missing optimized kernel variants on many GPU architectures
-  // (e.g., gfx1151 .co files are unreadable). This causes GPU memory faults
-  // that crash the device. naive_gemm is correct for all architectures.
+  // bfloat16: use naive_gemm directly. rocBLAS Tensile bf16 kernels may
+  // have issues on some architectures (corrupt .co files for gfx1151 etc.)
   if (a.dtype() == bfloat16) {
     naive_gemm(
         encoder, a, b, out, M, N, K,
@@ -243,7 +241,7 @@ void gemm_strided_batched_rocblas(
     float beta = 0.0f) {
   auto& device = encoder.device();
 
-  // For bfloat16: check if rocBLAS bf16 kernels actually work on this device
+  // For bfloat16: use naive_gemm as rocBLAS bf16 may have Tensile issues
   if (a.dtype() == bfloat16) {
     naive_gemm_batched(
         encoder, a, b, out, M, N, K,

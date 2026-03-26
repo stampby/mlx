@@ -228,25 +228,34 @@ struct numeric_limits<float> {
 // Include device operations
 namespace mlx::core::rocm {
 
-// Binary ops
+// Binary ops — promote half/bfloat16 through float to avoid precision loss
+// that compounds across 28-36 transformer layers in LLM inference.
 struct Add {
   template <typename T>
-  __device__ T operator()(T x, T y) { return x + y; }
+  __device__ T operator()(T x, T y) {
+    return T(static_cast<float>(x) + static_cast<float>(y));
+  }
 };
 
 struct Subtract {
   template <typename T>
-  __device__ T operator()(T x, T y) { return x - y; }
+  __device__ T operator()(T x, T y) {
+    return T(static_cast<float>(x) - static_cast<float>(y));
+  }
 };
 
 struct Multiply {
   template <typename T>
-  __device__ T operator()(T x, T y) { return x * y; }
+  __device__ T operator()(T x, T y) {
+    return T(static_cast<float>(x) * static_cast<float>(y));
+  }
 };
 
 struct Divide {
   template <typename T>
-  __device__ T operator()(T x, T y) { return x / y; }
+  __device__ T operator()(T x, T y) {
+    return T(static_cast<float>(x) / static_cast<float>(y));
+  }
 };
 
 struct Maximum {
