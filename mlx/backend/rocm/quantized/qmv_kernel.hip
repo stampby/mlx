@@ -133,14 +133,14 @@ void qmv_fast_kernel(
 template <typename T, typename ScaleT, int BITS, int GROUP_SIZE>
 __global__ __launch_bounds__(256)
 void gather_qmv_fast_kernel(
-    const T* __restrict__ x,                     // [B, M, K]
+    const T* __restrict__ x,                     // [LHS_B, M, K]
     const uint32_t* __restrict__ w,              // [E, N, K/pack_factor] as uint32
     const ScaleT* __restrict__ scales,           // [E, N, K/GROUP_SIZE]
     const ScaleT* __restrict__ biases,           // [E, N, K/GROUP_SIZE] or nullptr
     const uint32_t* __restrict__ lhs_indices,    // [B]
     const uint32_t* __restrict__ rhs_indices,    // [B]
     T* __restrict__ out,                         // [B, M, N]
-    int B, int M, int N, int K, int E,
+    int B, int M, int N, int K, int E, int LHS_B,
     bool has_bias)
 {
   constexpr int PF = pack_factor_u32<BITS>;
@@ -158,6 +158,10 @@ void gather_qmv_fast_kernel(
 
   uint32_t lhs_idx = valid ? lhs_indices[batch] : 0;
   uint32_t rhs_idx = valid ? rhs_indices[batch] : 0;
+
+  // Clamp indices to valid range to prevent catastrophic OOB on corrupt data.
+  if (lhs_idx >= static_cast<uint32_t>(LHS_B)) lhs_idx = 0;
+  if (rhs_idx >= static_cast<uint32_t>(E)) rhs_idx = 0;
 
   __shared__ float x_shared[BSK];
 

@@ -303,7 +303,7 @@ namespace rocm {
 
 template <typename T, typename ScaleT, int BITS, int GROUP_SIZE>
 __global__ void gather_qmv_kernel(
-    const T* __restrict__ x,           // [B, M, K]
+    const T* __restrict__ x,           // [LHS_B, M, K]
     const uint8_t* __restrict__ w,     // [E, N, K/pack_factor] packed
     const ScaleT* __restrict__ scales, // [E, N, K/GROUP_SIZE]
     const ScaleT* __restrict__ biases, // [E, N, K/GROUP_SIZE] or nullptr
@@ -315,19 +315,24 @@ __global__ void gather_qmv_kernel(
     int N,
     int K,
     int E,
+    int LHS_B,
     bool has_bias) {
-  
+
   constexpr int pack_factor = 8 / BITS;
-  
+
   int batch = blockIdx.z;
   int row = blockIdx.x;  // output row (M dimension)
   int col = blockIdx.y * blockDim.x + threadIdx.x;  // output col (N dimension)
-  
+
   if (batch >= B || row >= M || col >= N) return;
-  
+
   uint32_t lhs_idx = lhs_indices[batch];
   uint32_t rhs_idx = rhs_indices[batch];
-  
+
+  // Clamp indices to valid range to prevent catastrophic OOB on corrupt data.
+  if (lhs_idx >= static_cast<uint32_t>(LHS_B)) lhs_idx = 0;
+  if (rhs_idx >= static_cast<uint32_t>(E)) rhs_idx = 0;
+
   const T* x_ptr = x + lhs_idx * M * K + row * K;
   const uint8_t* w_ptr = w + rhs_idx * N * (K / pack_factor) + col * (K / pack_factor);
   const ScaleT* scales_ptr = scales + rhs_idx * N * ((K + GROUP_SIZE - 1) / GROUP_SIZE) + col * ((K + GROUP_SIZE - 1) / GROUP_SIZE);
@@ -372,27 +377,23 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   out.set_data(allocator::malloc(out.nbytes()));
 
-  // Make sure the last two dims of x and w, s, b are contiguous
-  array x = ensure_row_contiguous_matrix(inputs[0], enc, s);
-  array w = ensure_row_contiguous_matrix(inputs[1], enc, s);
-  array scales = ensure_row_contiguous_matrix(inputs[2], enc, s);
+  // GatherQMM kernels use flat pointer arithmetic (e.g. x + lhs_idx * M * K,
+  // w + rhs_idx * N * w_stride) to index into multi-dimensional arrays.
+  // This requires ALL dimensions to be row-contiguous, not just the last two.
+  // Arrays from expand_dims (e.g. [1,1,1,1,2048] with strides [2048,2048,1,1,1])
+  // pass ensure_row_contiguous_matrix's last-two-stride check but are NOT fully
+  // contiguous — the kernel's flat offsets would be wrong when lhs_idx > 0.
+  array x = ensure_row_contiguous(inputs[0], enc, s);
+  array w = ensure_row_contiguous(inputs[1], enc, s);
+  array scales = ensure_row_contiguous(inputs[2], enc, s);
   std::optional<array> biases = std::nullopt;
   bool has_bias = (mode_ == QuantizationMode::Affine) && (inputs.size() == 6);
   if (has_bias) {
-    biases = ensure_row_contiguous_matrix(inputs[3], enc, s);
+    biases = ensure_row_contiguous(inputs[3], enc, s);
   }
-  // Indices must be contiguous for flat kernel access (indices[batch]).
-  // They may have non-trivial strides from broadcasting in gather_qmm ops.cpp.
-  array lhs_indices = inputs[inputs.size() - 2];
-  array rhs_indices = inputs[inputs.size() - 1];
-  if (!lhs_indices.flags().row_contiguous) {
-    lhs_indices = contiguous_copy_gpu(lhs_indices, s);
-    enc.add_temporary(lhs_indices);
-  }
-  if (!rhs_indices.flags().row_contiguous) {
-    rhs_indices = contiguous_copy_gpu(rhs_indices, s);
-    enc.add_temporary(rhs_indices);
-  }
+  // Indices must also be fully contiguous for flat kernel access (indices[batch]).
+  array lhs_indices = ensure_row_contiguous(inputs[inputs.size() - 2], enc, s);
+  array rhs_indices = ensure_row_contiguous(inputs[inputs.size() - 1], enc, s);
 
   enc.set_input_array(x);
   enc.set_input_array(w);
@@ -410,12 +411,13 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   int N = out.shape(-1);
   int B = out.size() / M / N;
   int E = w.size() / w.shape(-1) / w.shape(-2);
+  int LHS_B = x.size() / M / K;  // number of distinct x batches (for bounds check)
 
   bool use_fast_gemv = true;
 
   enc.launch_kernel([&](hipStream_t stream) {
     if (use_fast_gemv) {
-      // --- Optimized gather kernel ---
+      // --- Optimized gather kernel (disabled pending corruption fix) ---
       constexpr int RPB = rocm::ROWS_PER_BLOCK;
       dim3 grid(M, (N + RPB - 1) / RPB, B);
       dim3 block(WARP_SIZE, RPB);
@@ -430,7 +432,7 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
             scales.data<ScaleT>(), \
             has_bias ? biases->data<ScaleT>() : nullptr, \
             lhs_indices.data<uint32_t>(), rhs_indices.data<uint32_t>(), \
-            out.data<T>(), B, M, N, K, E, has_bias)
+            out.data<T>(), B, M, N, K, E, LHS_B, has_bias)
 
       #define DISPATCH_GS_FAST_G(T, ScaleT, BITS) \
         switch (group_size_) { \
@@ -472,7 +474,7 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
             scales.data<ScaleT>(), \
             has_bias ? biases->data<ScaleT>() : nullptr, \
             lhs_indices.data<uint32_t>(), rhs_indices.data<uint32_t>(), \
-            out.data<T>(), B, M, N, K, E, has_bias)
+            out.data<T>(), B, M, N, K, E, LHS_B, has_bias)
 
       #define DISPATCH_GROUP_SIZE_GATHER(T, ScaleT, BITS) \
         switch (group_size_) { \
