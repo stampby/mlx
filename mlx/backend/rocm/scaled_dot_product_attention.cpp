@@ -60,7 +60,10 @@ bool ScaledDotProductAttention::use_fallback(
     return true;
   }
 
-  // Use fallback if we don't support the vector kernel
+  // Return true (use fallback decomposition) when the optimized kernel
+  // can't handle the config. The framework's fallback function decomposes
+  // SDPA into matmul + softmax + matmul ops that each route to ROCm GPU
+  // kernels — it does NOT fall back to CPU despite the method name.
   return !supports_sdpa_vector(
       q, k, v, has_mask, has_arr_mask, do_causal, output_logsumexp);
 }
@@ -95,11 +98,12 @@ void ScaledDotProductAttention::eval_gpu(
       sdpa_vector(q, k, v, scale_, out, do_causal_, std::nullopt, s);
     }
   } else {
-    // Fallback: compute attention manually
-    // This path should rarely be hit due to use_fallback check
+    // This should not be reached — use_fallback() returns true for unsupported
+    // configs, causing the framework to decompose SDPA into basic GPU ops
+    // (matmul + softmax + matmul) before this primitive is created.
     throw std::runtime_error(
-        "SDPA configuration not supported by ROCm kernel. "
-        "Please use CPU fallback or adjust parameters.");
+        "[ScaledDotProductAttention::eval_gpu] Unsupported configuration reached. "
+        "This is a bug — use_fallback() should have returned true.");
   }
 }
 
