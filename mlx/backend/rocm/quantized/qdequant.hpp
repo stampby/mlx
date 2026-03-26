@@ -44,17 +44,26 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
   return val;
 }
 
-// --- Dequantize: extract values from a packed uint32 word ---
-// Returns `count` float values in `out[]`.
-// Formula: out[i] = scale * quant_val[i] + bias  (unsigned affine)
+// --- Dequant-and-dot: integer dot product + x-sum accumulation ---
+//
+// Metal-compatible accumulation: accumulates raw integer dot product and
+// x-sum separately. The caller applies scale and bias ONCE per group:
+//   result += scale * total_qdot + bias * total_xsum
+//
+// This matches Metal's qdot() which returns scale * accum + sum * bias,
+// where accum and sum span all values_per_thread elements at once.
+//
+// The naive per-element form `acc += x[i] * (scale * q[i] + bias)` is
+// mathematically equivalent but produces different float32 rounding due to
+// a different number of scale/bias multiply operations, causing LLM output
+// to degenerate into repetitive loops after ~10 tokens.
 
 template <int BITS>
 __device__ __forceinline__ void dequant_and_dot(
     uint32_t packed,
     const float* __restrict__ x_local,
-    float scale,
-    float bias,
-    float& acc)
+    float& qdot_acc,
+    float& x_sum)
 {
   constexpr int pf = pack_factor_u32<BITS>;
   constexpr uint32_t mask = (1u << BITS) - 1u;
@@ -62,7 +71,8 @@ __device__ __forceinline__ void dequant_and_dot(
   #pragma unroll
   for (int i = 0; i < pf; i++) {
     float q = static_cast<float>((packed >> (i * BITS)) & mask);
-    acc += x_local[i] * (scale * q + bias);
+    qdot_acc += x_local[i] * q;
+    x_sum += x_local[i];
   }
 }
 

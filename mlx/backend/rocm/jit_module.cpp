@@ -6,18 +6,82 @@
 #include "mlx/version.h"
 
 #include <cstdlib>
+#include <cstdio>
 #include <filesystem>
 #include <functional>
 #include <fstream>
 #include <mutex>
 #include <sstream>
 
+#include <fcntl.h>
 #include <hip/hiprtc.h>
 #include <unistd.h>
 
 namespace mlx::core::rocm {
 
 namespace {
+
+// RAII helper that silences stderr during hipRTC compilation.
+// AMD's comgr library (used by hipRTC) unconditionally writes preprocessed
+// source and internal diagnostics to fd 2. This floods the terminal with
+// thousands of lines of compiler-internal defines every time a new fused
+// kernel is JIT-compiled.
+struct StderrSuppressor {
+  StderrSuppressor() {
+    saved_fd_ = dup(STDERR_FILENO);
+    if (saved_fd_ >= 0) {
+      int devnull = open("/dev/null", O_WRONLY);
+      if (devnull >= 0) {
+        dup2(devnull, STDERR_FILENO);
+        close(devnull);
+        active_ = true;
+      } else {
+        // Could not open /dev/null — leave stderr alone.
+        close(saved_fd_);
+        saved_fd_ = -1;
+      }
+    }
+  }
+  ~StderrSuppressor() { restore(); }
+  void restore() {
+    if (active_) {
+      fflush(stderr);
+      dup2(saved_fd_, STDERR_FILENO);
+      close(saved_fd_);
+      saved_fd_ = -1;
+      active_ = false;
+    }
+  }
+  StderrSuppressor(const StderrSuppressor&) = delete;
+  StderrSuppressor& operator=(const StderrSuppressor&) = delete;
+
+ private:
+  int saved_fd_ = -1;
+  bool active_ = false;
+};
+
+// Extract the last N lines from a compiler log.  AMD comgr prepends the
+// entire preprocessed source to the error log, making it enormous.  The
+// actual compiler errors are always at the end.
+std::string tail_lines(const std::string& text, size_t n = 60) {
+  if (text.empty()) {
+    return text;
+  }
+  // Walk backwards to find the start of the last `n` lines.
+  size_t count = 0;
+  size_t pos = text.size();
+  while (pos > 0 && count < n) {
+    --pos;
+    if (text[pos] == '\n') {
+      ++count;
+    }
+  }
+  if (pos > 0) {
+    // Skip past the newline we stopped on.
+    return "... [preprocessed source truncated] ...\n" + text.substr(pos + 1);
+  }
+  return text;
+}
 
 // Truncate long kernel names to avoid exceeding filesystem 255-byte limit.
 // Names > 200 chars are replaced with a prefix + hash.
@@ -202,15 +266,24 @@ void compile(
     args.push_back(arg.c_str());
   }
 
+  // Suppress stderr during hipRTC compilation.  AMD's comgr backend
+  // unconditionally dumps the entire preprocessed source to fd 2, flooding
+  // the terminal with thousands of lines of compiler-internal defines.
+  StderrSuppressor suppressor;
   hiprtcResult compile_result =
       hiprtcCompileProgram(prog, args.size(), args.data());
+  suppressor.restore(); // restore stderr before any error reporting
+
   if (compile_result != HIPRTC_SUCCESS) {
     size_t log_size;
     CHECK_HIPRTC_ERROR(hiprtcGetProgramLogSize(prog, &log_size));
     std::vector<char> log(log_size + 1, 0);
     CHECK_HIPRTC_ERROR(hiprtcGetProgramLog(prog, log.data()));
+    // The comgr log prepends the entire preprocessed source before the
+    // actual error messages.  Truncate to only the trailing error lines.
+    std::string truncated = tail_lines(std::string(log.data()));
     std::ostringstream oss;
-    oss << "Failed to compile kernel: " << log.data() << ".";
+    oss << "Failed to compile kernel '" << module_name << "': " << truncated;
     throw std::runtime_error(oss.str());
   }
 

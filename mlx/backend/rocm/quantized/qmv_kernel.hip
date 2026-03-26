@@ -87,20 +87,31 @@ void qmv_fast_kernel(
     }
 
     // --- Coalesced weight load + dequant + accumulate ---
+    // Metal-compatible accumulation: separate integer dot product from scaling.
+    // We accumulate dot(x, q_int) and sum(x) across ALL packs in the same
+    // group, then apply: acc += scale * total_qdot + bias * total_xsum.
+    // This matches Metal's qdot() which computes scale*accum + sum*bias
+    // over all values_per_thread at once.
     int w_offset = k_base / PF + lane * PPT;
+
+    // Accumulate integer dot and x-sum across all packs (same group for all)
+    float group_qdot = 0.0f;
+    float group_xsum = 0.0f;
+
+    // All PPT packs share the same group (thread's 16 values are contiguous)
+    int k_val = k_base + lane * VPT;
+    int group_idx = k_val / GROUP_SIZE;
 
     #pragma unroll
     for (int p = 0; p < PPT; p++) {
       uint32_t packed = (w_offset + p < w_stride) ? w_row[w_offset + p] : 0u;
-
-      // Determine which group this pack belongs to
-      int k_val = k_base + lane * VPT + p * PF;
-      int group_idx = k_val / GROUP_SIZE;
-      float scale = (group_idx < num_groups) ? to_float(s_row[group_idx]) : 0.0f;
-      float bias = (has_bias && group_idx < num_groups) ? to_float(b_row[group_idx]) : 0.0f;
-
-      dequant_and_dot<BITS>(packed, &x_local[p * PF], scale, bias, acc);
+      dequant_and_dot<BITS>(packed, &x_local[p * PF], group_qdot, group_xsum);
     }
+
+    // Apply scale and bias ONCE for the whole group (matches Metal)
+    float scale = (group_idx < num_groups) ? to_float(s_row[group_idx]) : 0.0f;
+    float bias = (has_bias && group_idx < num_groups) ? to_float(b_row[group_idx]) : 0.0f;
+    acc += scale * group_qdot + bias * group_xsum;
   }
 
   if (!valid) return;
@@ -179,17 +190,22 @@ void gather_qmv_fast_kernel(
 
     int w_offset = k_base / PF + lane * PPT;
 
+    // Accumulate integer dot and x-sum across all packs (same group)
+    float group_qdot = 0.0f;
+    float group_xsum = 0.0f;
+
+    int k_val = k_base + lane * VPT;
+    int group_idx = k_val / GROUP_SIZE;
+
     #pragma unroll
     for (int p = 0; p < PPT; p++) {
       uint32_t packed = (w_offset + p < w_stride) ? w_row[w_offset + p] : 0u;
-
-      int k_val = k_base + lane * VPT + p * PF;
-      int group_idx = k_val / GROUP_SIZE;
-      float scale = (group_idx < num_groups) ? to_float(s_row[group_idx]) : 0.0f;
-      float bias = (has_bias && group_idx < num_groups) ? to_float(b_row[group_idx]) : 0.0f;
-
-      dequant_and_dot<BITS>(packed, &x_local[p * PF], scale, bias, acc);
+      dequant_and_dot<BITS>(packed, &x_local[p * PF], group_qdot, group_xsum);
     }
+
+    float scale = (group_idx < num_groups) ? to_float(s_row[group_idx]) : 0.0f;
+    float bias = (has_bias && group_idx < num_groups) ? to_float(b_row[group_idx]) : 0.0f;
+    acc += scale * group_qdot + bias * group_xsum;
   }
 
   if (!valid) return;
