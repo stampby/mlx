@@ -90,21 +90,16 @@ __global__ void qmv_kernel(
       int bit_offset = (k % pack_factor) * BITS;
       uint8_t packed = w[col * (K / pack_factor) + pack_idx];
       uint8_t mask = (1 << BITS) - 1;
-      int8_t quant_val = static_cast<int8_t>((packed >> bit_offset) & mask);
-      
-      // Sign extend if needed
-      if (quant_val & (1 << (BITS - 1))) {
-        quant_val |= ~mask;
-      }
-      
-      // Dequantize
+      uint8_t quant_val = (packed >> bit_offset) & mask;
+
+      // Dequantize (unsigned affine: w = scale * val + bias)
       float w_val = static_cast<float>(quant_val) * scale + bias;
-      
+
       // Accumulate
       acc += static_cast<float>(x[row * K + k]) * w_val;
     }
   }
-  
+
   out[row * N + col] = static_cast<T>(acc);
 }
 
@@ -145,16 +140,11 @@ __global__ void qmv_t_kernel(
       int bit_offset = (k % pack_factor) * BITS;
       uint8_t packed = w[col * (K / pack_factor) + pack_idx];
       uint8_t mask = (1 << BITS) - 1;
-      int8_t quant_val = static_cast<int8_t>((packed >> bit_offset) & mask);
-      
-      // Sign extend if needed
-      if (quant_val & (1 << (BITS - 1))) {
-        quant_val |= ~mask;
-      }
-      
-      // Dequantize
+      uint8_t quant_val = (packed >> bit_offset) & mask;
+
+      // Dequantize (unsigned affine: w = scale * val + bias)
       float w_val = static_cast<float>(quant_val) * scale + bias;
-      
+
       // Accumulate
       acc += static_cast<float>(x[row * K + k]) * w_val;
     }
@@ -164,6 +154,13 @@ __global__ void qmv_t_kernel(
 }
 
 } // namespace rocm
+
+} // namespace mlx::core
+
+// Include optimized GEMV kernel (separate file for organization)
+#include "mlx/backend/rocm/quantized/qmv_kernel.hip"
+
+namespace mlx::core {
 
 void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto& s = stream();
@@ -196,63 +193,108 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   int M = non_batched ? x.size() / K : x.shape(-2);
   int N = out.shape(-1);
 
-  int block_size = 256;
-  dim3 grid((M + 0) / 1, (N + block_size - 1) / block_size);
-  grid.x = M;
-  
+  // Use optimized warp-cooperative kernel for all M values.
+  // A dedicated tiled GEMM for large M is future work (Phase 2).
+  bool use_fast_gemv = true;
+
   enc.launch_kernel([&](hipStream_t stream) {
-    #define LAUNCH_QMV(T, ScaleT, BITS, GROUP_SIZE) \
-      if (transpose_) { \
+    if (use_fast_gemv) {
+      // --- Optimized: warp-cooperative with coalesced loads ---
+      constexpr int RPB = rocm::ROWS_PER_BLOCK;
+      dim3 grid(M, (N + RPB - 1) / RPB);
+      dim3 block(WARP_SIZE, RPB);  // 32 x 8 = 256 threads
+
+      // Cast w pointer from uint8 to uint32 to preserve correct byte offset
+      // (data<uint32_t>() would apply the element offset as 4-byte units)
+      auto w_ptr_u32 = reinterpret_cast<const uint32_t*>(w.data<uint8_t>());
+
+      #define LAUNCH_FAST_QMV(T, ScaleT, BITS, GROUP_SIZE) \
         hipLaunchKernelGGL( \
-            (rocm::qmv_t_kernel<T, ScaleT, BITS, GROUP_SIZE>), \
-            grid, dim3(block_size), 0, stream, \
-            x.data<T>(), w.data<uint8_t>(), \
+            (rocm::qmv_fast_kernel<T, ScaleT, BITS, GROUP_SIZE>), \
+            grid, block, 0, stream, \
+            x.data<T>(), w_ptr_u32, \
             scales.data<ScaleT>(), \
             has_bias ? biases->data<ScaleT>() : nullptr, \
-            out.data<T>(), M, N, K, has_bias); \
-      } else { \
-        hipLaunchKernelGGL( \
-            (rocm::qmv_kernel<T, ScaleT, BITS, GROUP_SIZE>), \
-            grid, dim3(block_size), 0, stream, \
-            x.data<T>(), w.data<uint8_t>(), \
-            scales.data<ScaleT>(), \
-            has_bias ? biases->data<ScaleT>() : nullptr, \
-            out.data<T>(), M, N, K, has_bias); \
+            out.data<T>(), M, N, K, has_bias)
+
+      #define DISPATCH_GROUP_SIZE_FAST(T, ScaleT, BITS) \
+        switch (group_size_) { \
+          case 32: LAUNCH_FAST_QMV(T, ScaleT, BITS, 32); break; \
+          case 64: LAUNCH_FAST_QMV(T, ScaleT, BITS, 64); break; \
+          case 128: LAUNCH_FAST_QMV(T, ScaleT, BITS, 128); break; \
+          default: throw std::runtime_error("Unsupported group_size: " + std::to_string(group_size_)); \
+        }
+
+      #define DISPATCH_BITS_FAST(T, ScaleT) \
+        switch (bits_) { \
+          case 2: DISPATCH_GROUP_SIZE_FAST(T, ScaleT, 2); break; \
+          case 4: DISPATCH_GROUP_SIZE_FAST(T, ScaleT, 4); break; \
+          case 8: DISPATCH_GROUP_SIZE_FAST(T, ScaleT, 8); break; \
+          default: throw std::runtime_error("Unsupported bits: " + std::to_string(bits_)); \
+        }
+
+      switch (x.dtype()) {
+        case float32:  DISPATCH_BITS_FAST(float, float); break;
+        case float16:  DISPATCH_BITS_FAST(__half, __half); break;
+        case bfloat16: DISPATCH_BITS_FAST(hip_bfloat16, hip_bfloat16); break;
+        default: throw std::runtime_error("Unsupported dtype for QuantizedMatmul");
       }
-    
-    #define DISPATCH_GROUP_SIZE(T, ScaleT, BITS) \
-      switch (group_size_) { \
-        case 32: LAUNCH_QMV(T, ScaleT, BITS, 32); break; \
-        case 64: LAUNCH_QMV(T, ScaleT, BITS, 64); break; \
-        case 128: LAUNCH_QMV(T, ScaleT, BITS, 128); break; \
-        default: throw std::runtime_error("Unsupported group_size for QuantizedMatmul: " + std::to_string(group_size_)); \
+
+      #undef DISPATCH_BITS_FAST
+      #undef DISPATCH_GROUP_SIZE_FAST
+      #undef LAUNCH_FAST_QMV
+
+    } else {
+      // --- Fallback: naive kernel for larger M (until tiled GEMM is implemented) ---
+      int block_size = 256;
+      dim3 grid(M, (N + block_size - 1) / block_size);
+
+      #define LAUNCH_QMV(T, ScaleT, BITS, GROUP_SIZE) \
+        if (transpose_) { \
+          hipLaunchKernelGGL( \
+              (rocm::qmv_t_kernel<T, ScaleT, BITS, GROUP_SIZE>), \
+              grid, dim3(block_size), 0, stream, \
+              x.data<T>(), w.data<uint8_t>(), \
+              scales.data<ScaleT>(), \
+              has_bias ? biases->data<ScaleT>() : nullptr, \
+              out.data<T>(), M, N, K, has_bias); \
+        } else { \
+          hipLaunchKernelGGL( \
+              (rocm::qmv_kernel<T, ScaleT, BITS, GROUP_SIZE>), \
+              grid, dim3(block_size), 0, stream, \
+              x.data<T>(), w.data<uint8_t>(), \
+              scales.data<ScaleT>(), \
+              has_bias ? biases->data<ScaleT>() : nullptr, \
+              out.data<T>(), M, N, K, has_bias); \
+        }
+
+      #define DISPATCH_GROUP_SIZE(T, ScaleT, BITS) \
+        switch (group_size_) { \
+          case 32: LAUNCH_QMV(T, ScaleT, BITS, 32); break; \
+          case 64: LAUNCH_QMV(T, ScaleT, BITS, 64); break; \
+          case 128: LAUNCH_QMV(T, ScaleT, BITS, 128); break; \
+          default: throw std::runtime_error("Unsupported group_size: " + std::to_string(group_size_)); \
+        }
+
+      #define DISPATCH_BITS(T, ScaleT) \
+        switch (bits_) { \
+          case 2: DISPATCH_GROUP_SIZE(T, ScaleT, 2); break; \
+          case 4: DISPATCH_GROUP_SIZE(T, ScaleT, 4); break; \
+          case 8: DISPATCH_GROUP_SIZE(T, ScaleT, 8); break; \
+          default: throw std::runtime_error("Unsupported bits: " + std::to_string(bits_)); \
+        }
+
+      switch (x.dtype()) {
+        case float32:  DISPATCH_BITS(float, float); break;
+        case float16:  DISPATCH_BITS(__half, __half); break;
+        case bfloat16: DISPATCH_BITS(hip_bfloat16, hip_bfloat16); break;
+        default: throw std::runtime_error("Unsupported dtype for QuantizedMatmul");
       }
-    
-    #define DISPATCH_BITS(T, ScaleT) \
-      switch (bits_) { \
-        case 2: DISPATCH_GROUP_SIZE(T, ScaleT, 2); break; \
-        case 4: DISPATCH_GROUP_SIZE(T, ScaleT, 4); break; \
-        case 8: DISPATCH_GROUP_SIZE(T, ScaleT, 8); break; \
-        default: throw std::runtime_error("Unsupported bits for QuantizedMatmul: " + std::to_string(bits_)); \
-      }
-    
-    switch (x.dtype()) {
-      case float32:
-        DISPATCH_BITS(float, float);
-        break;
-      case float16:
-        DISPATCH_BITS(__half, __half);
-        break;
-      case bfloat16:
-        DISPATCH_BITS(hip_bfloat16, hip_bfloat16);
-        break;
-      default:
-        throw std::runtime_error("Unsupported dtype for QuantizedMatmul");
+
+      #undef DISPATCH_BITS
+      #undef DISPATCH_GROUP_SIZE
+      #undef LAUNCH_QMV
     }
-    
-    #undef DISPATCH_BITS
-    #undef DISPATCH_GROUP_SIZE
-    #undef LAUNCH_QMV
   });
 }
 
@@ -308,14 +350,9 @@ __global__ void gather_qmv_kernel(
       int bit_offset = (k % pack_factor) * BITS;
       uint8_t packed = w_ptr[pack_idx];
       uint8_t mask = (1 << BITS) - 1;
-      int8_t quant_val = static_cast<int8_t>((packed >> bit_offset) & mask);
-      
-      // Sign extend if needed
-      if (quant_val & (1 << (BITS - 1))) {
-        quant_val |= ~mask;
-      }
-      
-      // Dequantize
+      uint8_t quant_val = (packed >> bit_offset) & mask;
+
+      // Dequantize (unsigned affine: w = scale * val + bias)
       float w_val = static_cast<float>(quant_val) * scale + bias;
       
       // Accumulate
@@ -364,53 +401,96 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   int B = out.size() / M / N;
   int E = w.size() / w.shape(-1) / w.shape(-2);
 
-  int block_size = 256;
-  dim3 grid(M, (N + block_size - 1) / block_size, B);
-  
+  bool use_fast_gemv = true;
+
   enc.launch_kernel([&](hipStream_t stream) {
-    #define LAUNCH_GATHER_QMV(T, ScaleT, BITS, GROUP_SIZE) \
-      hipLaunchKernelGGL( \
-          (rocm::gather_qmv_kernel<T, ScaleT, BITS, GROUP_SIZE>), \
-          grid, dim3(block_size), 0, stream, \
-          x.data<T>(), w.data<uint8_t>(), \
-          scales.data<ScaleT>(), \
-          has_bias ? biases->data<ScaleT>() : nullptr, \
-          lhs_indices.data<uint32_t>(), rhs_indices.data<uint32_t>(), \
-          out.data<T>(), B, M, N, K, E, has_bias)
-    
-    #define DISPATCH_GROUP_SIZE_GATHER(T, ScaleT, BITS) \
-      switch (group_size_) { \
-        case 32: LAUNCH_GATHER_QMV(T, ScaleT, BITS, 32); break; \
-        case 64: LAUNCH_GATHER_QMV(T, ScaleT, BITS, 64); break; \
-        case 128: LAUNCH_GATHER_QMV(T, ScaleT, BITS, 128); break; \
-        default: throw std::runtime_error("Unsupported group_size for GatherQMM: " + std::to_string(group_size_)); \
+    if (use_fast_gemv) {
+      // --- Optimized gather kernel ---
+      constexpr int RPB = rocm::ROWS_PER_BLOCK;
+      dim3 grid(M, (N + RPB - 1) / RPB, B);
+      dim3 block(WARP_SIZE, RPB);
+
+      auto w_ptr_u32_g = reinterpret_cast<const uint32_t*>(w.data<uint8_t>());
+
+      #define LAUNCH_FAST_GATHER(T, ScaleT, BITS, GROUP_SIZE) \
+        hipLaunchKernelGGL( \
+            (rocm::gather_qmv_fast_kernel<T, ScaleT, BITS, GROUP_SIZE>), \
+            grid, block, 0, stream, \
+            x.data<T>(), w_ptr_u32_g, \
+            scales.data<ScaleT>(), \
+            has_bias ? biases->data<ScaleT>() : nullptr, \
+            lhs_indices.data<uint32_t>(), rhs_indices.data<uint32_t>(), \
+            out.data<T>(), B, M, N, K, E, has_bias)
+
+      #define DISPATCH_GS_FAST_G(T, ScaleT, BITS) \
+        switch (group_size_) { \
+          case 32: LAUNCH_FAST_GATHER(T, ScaleT, BITS, 32); break; \
+          case 64: LAUNCH_FAST_GATHER(T, ScaleT, BITS, 64); break; \
+          case 128: LAUNCH_FAST_GATHER(T, ScaleT, BITS, 128); break; \
+          default: throw std::runtime_error("Unsupported group_size: " + std::to_string(group_size_)); \
+        }
+
+      #define DISPATCH_BITS_FAST_G(T, ScaleT) \
+        switch (bits_) { \
+          case 2: DISPATCH_GS_FAST_G(T, ScaleT, 2); break; \
+          case 4: DISPATCH_GS_FAST_G(T, ScaleT, 4); break; \
+          case 8: DISPATCH_GS_FAST_G(T, ScaleT, 8); break; \
+          default: throw std::runtime_error("Unsupported bits: " + std::to_string(bits_)); \
+        }
+
+      switch (x.dtype()) {
+        case float32:  DISPATCH_BITS_FAST_G(float, float); break;
+        case float16:  DISPATCH_BITS_FAST_G(__half, __half); break;
+        case bfloat16: DISPATCH_BITS_FAST_G(hip_bfloat16, hip_bfloat16); break;
+        default: throw std::runtime_error("Unsupported dtype for GatherQMM");
       }
-    
-    #define DISPATCH_BITS_GATHER(T, ScaleT) \
-      switch (bits_) { \
-        case 2: DISPATCH_GROUP_SIZE_GATHER(T, ScaleT, 2); break; \
-        case 4: DISPATCH_GROUP_SIZE_GATHER(T, ScaleT, 4); break; \
-        case 8: DISPATCH_GROUP_SIZE_GATHER(T, ScaleT, 8); break; \
-        default: throw std::runtime_error("Unsupported bits for GatherQMM: " + std::to_string(bits_)); \
+
+      #undef DISPATCH_BITS_FAST_G
+      #undef DISPATCH_GS_FAST_G
+      #undef LAUNCH_FAST_GATHER
+
+    } else {
+      // --- Fallback: naive gather kernel ---
+      int block_size = 256;
+      dim3 grid(M, (N + block_size - 1) / block_size, B);
+
+      #define LAUNCH_GATHER_QMV(T, ScaleT, BITS, GROUP_SIZE) \
+        hipLaunchKernelGGL( \
+            (rocm::gather_qmv_kernel<T, ScaleT, BITS, GROUP_SIZE>), \
+            grid, dim3(block_size), 0, stream, \
+            x.data<T>(), w.data<uint8_t>(), \
+            scales.data<ScaleT>(), \
+            has_bias ? biases->data<ScaleT>() : nullptr, \
+            lhs_indices.data<uint32_t>(), rhs_indices.data<uint32_t>(), \
+            out.data<T>(), B, M, N, K, E, has_bias)
+
+      #define DISPATCH_GROUP_SIZE_GATHER(T, ScaleT, BITS) \
+        switch (group_size_) { \
+          case 32: LAUNCH_GATHER_QMV(T, ScaleT, BITS, 32); break; \
+          case 64: LAUNCH_GATHER_QMV(T, ScaleT, BITS, 64); break; \
+          case 128: LAUNCH_GATHER_QMV(T, ScaleT, BITS, 128); break; \
+          default: throw std::runtime_error("Unsupported group_size: " + std::to_string(group_size_)); \
+        }
+
+      #define DISPATCH_BITS_GATHER(T, ScaleT) \
+        switch (bits_) { \
+          case 2: DISPATCH_GROUP_SIZE_GATHER(T, ScaleT, 2); break; \
+          case 4: DISPATCH_GROUP_SIZE_GATHER(T, ScaleT, 4); break; \
+          case 8: DISPATCH_GROUP_SIZE_GATHER(T, ScaleT, 8); break; \
+          default: throw std::runtime_error("Unsupported bits: " + std::to_string(bits_)); \
+        }
+
+      switch (x.dtype()) {
+        case float32:  DISPATCH_BITS_GATHER(float, float); break;
+        case float16:  DISPATCH_BITS_GATHER(__half, __half); break;
+        case bfloat16: DISPATCH_BITS_GATHER(hip_bfloat16, hip_bfloat16); break;
+        default: throw std::runtime_error("Unsupported dtype for GatherQMM");
       }
-    
-    switch (x.dtype()) {
-      case float32:
-        DISPATCH_BITS_GATHER(float, float);
-        break;
-      case float16:
-        DISPATCH_BITS_GATHER(__half, __half);
-        break;
-      case bfloat16:
-        DISPATCH_BITS_GATHER(hip_bfloat16, hip_bfloat16);
-        break;
-      default:
-        throw std::runtime_error("Unsupported dtype for GatherQMM");
+
+      #undef DISPATCH_BITS_GATHER
+      #undef DISPATCH_GROUP_SIZE_GATHER
+      #undef LAUNCH_GATHER_QMV
     }
-    
-    #undef DISPATCH_BITS_GATHER
-    #undef DISPATCH_GROUP_SIZE_GATHER
-    #undef LAUNCH_GATHER_QMV
   });
 }
 

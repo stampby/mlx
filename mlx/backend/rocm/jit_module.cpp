@@ -7,6 +7,7 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include <mutex>
 #include <sstream>
@@ -17,6 +18,19 @@
 namespace mlx::core::rocm {
 
 namespace {
+
+// Truncate long kernel names to avoid exceeding filesystem 255-byte limit.
+// Names > 200 chars are replaced with a prefix + hash.
+std::string safe_filename(const std::string& name) {
+  constexpr size_t kMaxLen = 200;
+  if (name.size() <= kMaxLen) {
+    return name;
+  }
+  auto h = std::hash<std::string>{}(name);
+  std::ostringstream oss;
+  oss << name.substr(0, 64) << "_" << std::hex << h;
+  return oss.str();
+}
 
 #define CHECK_HIPRTC_ERROR(cmd) check_hiprtc_error(#cmd, (cmd))
 
@@ -248,9 +262,12 @@ JitModule::JitModule(
   std::string hsaco;
   std::vector<std::pair<std::string, std::string>> hsaco_kernels;
 
+  // Use a safe filename for disk cache to avoid exceeding 255-byte limit
+  std::string cache_name = safe_filename(module_name);
+
   // Try to load them from the file cache
   if (!read_cached_hsaco(
-          hsaco_cache_dir(), module_name, hsaco, hsaco_kernels)) {
+          hsaco_cache_dir(), cache_name, hsaco, hsaco_kernels)) {
     auto [precompiled, source_code, kernel_names] = builder();
 
     // Get the HSACO (AMD GPU binary)
@@ -267,7 +284,7 @@ JitModule::JitModule(
     // If requested save them in the file cache for the next launch
     if (use_disk_cache) {
       write_cached_hsaco(
-          hsaco_cache_dir(), module_name, hsaco, hsaco_kernels, source_code);
+          hsaco_cache_dir(), cache_name, hsaco, hsaco_kernels, source_code);
     }
   }
 

@@ -7,6 +7,17 @@
 #include "mlx/primitives.h"
 
 #include <hip/hip_runtime.h>
+
+// Workaround: rocprim headers use placement new in __device__ code,
+// which requires __device__ overloads of operator new/delete.
+#ifdef __HIP_DEVICE_COMPILE__
+__device__ inline void* operator new(size_t, void* p) noexcept { return p; }
+__device__ inline void* operator new[](size_t, void* p) noexcept { return p; }
+__device__ inline void operator delete(void*, void*) noexcept {}
+__device__ inline void operator delete[](void*, void*) noexcept {}
+#endif
+
+#include <rocprim/rocprim.hpp>
 #include <cassert>
 #include <limits>
 
@@ -292,7 +303,8 @@ struct KernelMergeSort {
     block_merge_sort_t::sort(tgp_vals, tgp_idxs, size_sorted_axis);
     __syncthreads();
 
-    for (int i = threadIdx.x; i < size_sorted_axis; i += BLOCK_THREADS) {
+    int out_limit = min(size_sorted_axis, N_PER_BLOCK);
+    for (int i = threadIdx.x; i < out_limit; i += BLOCK_THREADS) {
       if constexpr (ARG_SORT) {
         out[i * out_stride_sorted_axis] = tgp_idxs[i];
       } else {
@@ -386,8 +398,116 @@ void gpu_sort(const Stream& s, array in, array& out_, int axis, bool argsort) {
   
   auto& stream = encoder.stream();
   
-  // Determine block size
+  // For large arrays that exceed the block sort capacity (512 threads * 8 items = 4096),
+  // use rocprim radix sort which handles arbitrary sizes correctly.
   constexpr int tn = N_PER_THREAD;
+  constexpr int max_block_sort_size = 512 * tn;  // 4096
+
+  if (size_sorted_axis > max_block_sort_size) {
+    dispatch_all_types(in.dtype(), [&](auto type_tag) {
+      using CTYPE = MLX_GET_TYPE(type_tag);
+      if constexpr (!std::is_same_v<CTYPE, complex64_t>) {
+        using ValT = hip_type_t<CTYPE>;
+
+        encoder.launch_kernel([&](hipStream_t hip_stream) {
+          for (int row = 0; row < n_rows; ++row) {
+            const ValT* in_row = in.data<ValT>() + row * size_sorted_axis;
+
+            if (argsort) {
+              // Allocate temporary index array and initialize to 0..N-1
+              uint32_t* indices_in = nullptr;
+              uint32_t* indices_out = nullptr;
+              ValT* vals_tmp = nullptr;
+              CHECK_HIP_ERROR(hipMalloc(&indices_in, size_sorted_axis * sizeof(uint32_t)));
+              CHECK_HIP_ERROR(hipMalloc(&indices_out, size_sorted_axis * sizeof(uint32_t)));
+              CHECK_HIP_ERROR(hipMalloc(&vals_tmp, size_sorted_axis * sizeof(ValT)));
+
+              // Initialize indices with a simple kernel via hipMemcpy + iota
+              std::vector<uint32_t> host_indices(size_sorted_axis);
+              for (int i = 0; i < size_sorted_axis; ++i) host_indices[i] = i;
+              CHECK_HIP_ERROR(hipMemcpyAsync(indices_in, host_indices.data(),
+                  size_sorted_axis * sizeof(uint32_t), hipMemcpyHostToDevice, hip_stream));
+
+              // Copy input values to a mutable buffer for rocprim
+              CHECK_HIP_ERROR(hipMemcpyAsync(vals_tmp, in_row,
+                  size_sorted_axis * sizeof(ValT), hipMemcpyDeviceToDevice, hip_stream));
+
+              // Get temp storage size
+              size_t temp_bytes = 0;
+              rocprim::radix_sort_pairs(
+                  nullptr, temp_bytes,
+                  vals_tmp, (ValT*)nullptr,
+                  indices_in, indices_out,
+                  size_sorted_axis, 0, sizeof(ValT) * 8, hip_stream);
+
+              void* temp_storage = nullptr;
+              CHECK_HIP_ERROR(hipMalloc(&temp_storage, temp_bytes));
+
+              ValT* vals_sorted = nullptr;
+              CHECK_HIP_ERROR(hipMalloc(&vals_sorted, size_sorted_axis * sizeof(ValT)));
+
+              rocprim::radix_sort_pairs(
+                  temp_storage, temp_bytes,
+                  vals_tmp, vals_sorted,
+                  indices_in, indices_out,
+                  size_sorted_axis, 0, sizeof(ValT) * 8, hip_stream);
+
+              // Copy result indices to output
+              uint32_t* out_row = out.data<uint32_t>() + row * size_sorted_axis;
+              CHECK_HIP_ERROR(hipMemcpyAsync(out_row, indices_out,
+                  size_sorted_axis * sizeof(uint32_t), hipMemcpyDeviceToDevice, hip_stream));
+
+              CHECK_HIP_ERROR(hipFree(indices_in));
+              CHECK_HIP_ERROR(hipFree(indices_out));
+              CHECK_HIP_ERROR(hipFree(vals_tmp));
+              CHECK_HIP_ERROR(hipFree(vals_sorted));
+              CHECK_HIP_ERROR(hipFree(temp_storage));
+            } else {
+              // Sort values only
+              ValT* vals_in = nullptr;
+              ValT* vals_out_buf = nullptr;
+              CHECK_HIP_ERROR(hipMalloc(&vals_in, size_sorted_axis * sizeof(ValT)));
+              CHECK_HIP_ERROR(hipMalloc(&vals_out_buf, size_sorted_axis * sizeof(ValT)));
+              CHECK_HIP_ERROR(hipMemcpyAsync(vals_in, in_row,
+                  size_sorted_axis * sizeof(ValT), hipMemcpyDeviceToDevice, hip_stream));
+
+              size_t temp_bytes = 0;
+              rocprim::radix_sort_keys(
+                  nullptr, temp_bytes,
+                  vals_in, vals_out_buf,
+                  size_sorted_axis, 0, sizeof(ValT) * 8, hip_stream);
+
+              void* temp_storage = nullptr;
+              CHECK_HIP_ERROR(hipMalloc(&temp_storage, temp_bytes));
+
+              rocprim::radix_sort_keys(
+                  temp_storage, temp_bytes,
+                  vals_in, vals_out_buf,
+                  size_sorted_axis, 0, sizeof(ValT) * 8, hip_stream);
+
+              ValT* out_row = out.data<ValT>() + row * size_sorted_axis;
+              CHECK_HIP_ERROR(hipMemcpyAsync(out_row, vals_out_buf,
+                  size_sorted_axis * sizeof(ValT), hipMemcpyDeviceToDevice, hip_stream));
+
+              CHECK_HIP_ERROR(hipFree(vals_in));
+              CHECK_HIP_ERROR(hipFree(vals_out_buf));
+              CHECK_HIP_ERROR(hipFree(temp_storage));
+            }
+          }
+        });
+      } else {
+        throw std::runtime_error(
+            "ROCm backend does not support sorting complex numbers");
+      }
+    });
+
+    if (!is_segmented_sort) {
+      copy_gpu(swapaxes_in_eval(out, axis, last_dim), out_, CopyType::General, s);
+    }
+    return;
+  }
+
+  // Determine block size for small-array block sort
   int potential_bn = (size_sorted_axis + tn - 1) / tn;
   int bn;
   if (potential_bn > 256) {
