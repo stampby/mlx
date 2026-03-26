@@ -45,10 +45,26 @@ __device__ __forceinline__ _Float16 nan_value<_Float16>() {
   return static_cast<_Float16>(__builtin_nanf(""));
 }
 
+// __half may or may not be the same as _Float16 depending on HIP version.
+// Provide explicit specialization via __float2half conversion.
+template <>
+__device__ __forceinline__ __half nan_value<__half>() {
+  return __float2half(__builtin_nanf(""));
+}
+
 template <>
 __device__ __forceinline__ hip_bfloat16 nan_value<hip_bfloat16>() {
   return hip_bfloat16(__builtin_nanf(""));
 }
+
+// Helper trait: true for all floating-point types including __half and hip_bfloat16.
+// std::is_floating_point_v<T> is false for __half and hip_bfloat16, which would
+// cause NaN handling to be skipped and produce incorrect sort results.
+template <typename T>
+inline constexpr bool is_sort_floating_v =
+    std::is_floating_point_v<T> ||
+    std::is_same_v<T, __half> ||
+    std::is_same_v<T, hip_bfloat16>;
 
 template <typename T, typename = void>
 struct InitValue {
@@ -58,7 +74,7 @@ struct InitValue {
 };
 
 template <typename T>
-struct InitValue<T, std::enable_if_t<std::is_floating_point_v<T>>> {
+struct InitValue<T, std::enable_if_t<is_sort_floating_v<T>>> {
   __device__ __forceinline__ static T value() {
     return nan_value<T>();
   }
@@ -78,7 +94,7 @@ struct LessThan {
   }
 
   __device__ __forceinline__ bool operator()(T a, T b) const {
-    if constexpr (std::is_floating_point_v<T>) {
+    if constexpr (is_sort_floating_v<T>) {
       bool an = isnan(static_cast<float>(a));
       bool bn = isnan(static_cast<float>(b));
       if (an | bn) {
@@ -361,6 +377,15 @@ __global__ void block_sort_kernel(
   }
 }
 
+// Simple iota kernel: fills output[i] = i for i in [0, n).
+// Used to initialize index arrays on-device instead of copying from host.
+__global__ void iota_kernel(uint32_t* out, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) {
+    out[i] = static_cast<uint32_t>(i);
+  }
+}
+
 } // namespace rocm
 
 namespace {
@@ -410,89 +435,106 @@ void gpu_sort(const Stream& s, array in, array& out_, int axis, bool argsort) {
         using ValT = hip_type_t<CTYPE>;
 
         encoder.launch_kernel([&](hipStream_t hip_stream) {
-          for (int row = 0; row < n_rows; ++row) {
-            const ValT* in_row = in.data<ValT>() + row * size_sorted_axis;
+          int N = size_sorted_axis;
 
-            if (argsort) {
-              // Allocate temporary index array and initialize to 0..N-1
-              uint32_t* indices_in = nullptr;
-              uint32_t* indices_out = nullptr;
-              ValT* vals_tmp = nullptr;
-              CHECK_HIP_ERROR(hipMalloc(&indices_in, size_sorted_axis * sizeof(uint32_t)));
-              CHECK_HIP_ERROR(hipMalloc(&indices_out, size_sorted_axis * sizeof(uint32_t)));
-              CHECK_HIP_ERROR(hipMalloc(&vals_tmp, size_sorted_axis * sizeof(ValT)));
+          if (argsort) {
+            // Allocate all temp buffers once, outside the row loop.
+            uint32_t* indices_in = nullptr;
+            uint32_t* indices_out = nullptr;
+            ValT* vals_tmp = nullptr;
+            ValT* vals_sorted = nullptr;
+            CHECK_HIP_ERROR(hipMalloc(&indices_in, N * sizeof(uint32_t)));
+            CHECK_HIP_ERROR(hipMalloc(&indices_out, N * sizeof(uint32_t)));
+            CHECK_HIP_ERROR(hipMalloc(&vals_tmp, N * sizeof(ValT)));
+            CHECK_HIP_ERROR(hipMalloc(&vals_sorted, N * sizeof(ValT)));
 
-              // Initialize indices with a simple kernel via hipMemcpy + iota
-              std::vector<uint32_t> host_indices(size_sorted_axis);
-              for (int i = 0; i < size_sorted_axis; ++i) host_indices[i] = i;
-              CHECK_HIP_ERROR(hipMemcpyAsync(indices_in, host_indices.data(),
-                  size_sorted_axis * sizeof(uint32_t), hipMemcpyHostToDevice, hip_stream));
+            // Query temp storage size (same for all rows with same N).
+            size_t temp_bytes = 0;
+            rocprim::radix_sort_pairs(
+                nullptr, temp_bytes,
+                vals_tmp, vals_sorted,
+                indices_in, indices_out,
+                N, 0, sizeof(ValT) * 8, hip_stream);
 
-              // Copy input values to a mutable buffer for rocprim
+            void* temp_storage = nullptr;
+            CHECK_HIP_ERROR(hipMalloc(&temp_storage, temp_bytes));
+
+            // Initialize iota indices on device (avoids host vector + memcpy).
+            {
+              int block = 256;
+              int grid = (N + block - 1) / block;
+              hipLaunchKernelGGL(
+                  rocm::iota_kernel, dim3(grid), dim3(block), 0, hip_stream,
+                  indices_in, N);
+            }
+
+            for (int row = 0; row < n_rows; ++row) {
+              const ValT* in_row = in.data<ValT>() + row * N;
+
+              // Copy input values to mutable buffer for rocprim.
               CHECK_HIP_ERROR(hipMemcpyAsync(vals_tmp, in_row,
-                  size_sorted_axis * sizeof(ValT), hipMemcpyDeviceToDevice, hip_stream));
+                  N * sizeof(ValT), hipMemcpyDeviceToDevice, hip_stream));
 
-              // Get temp storage size
-              size_t temp_bytes = 0;
-              rocprim::radix_sort_pairs(
-                  nullptr, temp_bytes,
-                  vals_tmp, (ValT*)nullptr,
-                  indices_in, indices_out,
-                  size_sorted_axis, 0, sizeof(ValT) * 8, hip_stream);
-
-              void* temp_storage = nullptr;
-              CHECK_HIP_ERROR(hipMalloc(&temp_storage, temp_bytes));
-
-              ValT* vals_sorted = nullptr;
-              CHECK_HIP_ERROR(hipMalloc(&vals_sorted, size_sorted_axis * sizeof(ValT)));
+              // Re-initialize indices for each row (iota is idempotent so
+              // we can re-use the same buffer if we reset it).
+              if (row > 0) {
+                hipLaunchKernelGGL(
+                    rocm::iota_kernel, dim3((N + 255) / 256), dim3(256),
+                    0, hip_stream, indices_in, N);
+              }
 
               rocprim::radix_sort_pairs(
                   temp_storage, temp_bytes,
                   vals_tmp, vals_sorted,
                   indices_in, indices_out,
-                  size_sorted_axis, 0, sizeof(ValT) * 8, hip_stream);
+                  N, 0, sizeof(ValT) * 8, hip_stream);
 
-              // Copy result indices to output
-              uint32_t* out_row = out.data<uint32_t>() + row * size_sorted_axis;
+              // Copy result indices to output.
+              uint32_t* out_row = out.data<uint32_t>() + row * N;
               CHECK_HIP_ERROR(hipMemcpyAsync(out_row, indices_out,
-                  size_sorted_axis * sizeof(uint32_t), hipMemcpyDeviceToDevice, hip_stream));
+                  N * sizeof(uint32_t), hipMemcpyDeviceToDevice, hip_stream));
+            }
 
-              CHECK_HIP_ERROR(hipFree(indices_in));
-              CHECK_HIP_ERROR(hipFree(indices_out));
-              CHECK_HIP_ERROR(hipFree(vals_tmp));
-              CHECK_HIP_ERROR(hipFree(vals_sorted));
-              CHECK_HIP_ERROR(hipFree(temp_storage));
-            } else {
-              // Sort values only
-              ValT* vals_in = nullptr;
-              ValT* vals_out_buf = nullptr;
-              CHECK_HIP_ERROR(hipMalloc(&vals_in, size_sorted_axis * sizeof(ValT)));
-              CHECK_HIP_ERROR(hipMalloc(&vals_out_buf, size_sorted_axis * sizeof(ValT)));
+            CHECK_HIP_ERROR(hipFree(indices_in));
+            CHECK_HIP_ERROR(hipFree(indices_out));
+            CHECK_HIP_ERROR(hipFree(vals_tmp));
+            CHECK_HIP_ERROR(hipFree(vals_sorted));
+            CHECK_HIP_ERROR(hipFree(temp_storage));
+          } else {
+            // Sort values only -- allocate once outside loop.
+            ValT* vals_in = nullptr;
+            ValT* vals_out_buf = nullptr;
+            CHECK_HIP_ERROR(hipMalloc(&vals_in, N * sizeof(ValT)));
+            CHECK_HIP_ERROR(hipMalloc(&vals_out_buf, N * sizeof(ValT)));
+
+            size_t temp_bytes = 0;
+            rocprim::radix_sort_keys(
+                nullptr, temp_bytes,
+                vals_in, vals_out_buf,
+                N, 0, sizeof(ValT) * 8, hip_stream);
+
+            void* temp_storage = nullptr;
+            CHECK_HIP_ERROR(hipMalloc(&temp_storage, temp_bytes));
+
+            for (int row = 0; row < n_rows; ++row) {
+              const ValT* in_row = in.data<ValT>() + row * N;
+
               CHECK_HIP_ERROR(hipMemcpyAsync(vals_in, in_row,
-                  size_sorted_axis * sizeof(ValT), hipMemcpyDeviceToDevice, hip_stream));
-
-              size_t temp_bytes = 0;
-              rocprim::radix_sort_keys(
-                  nullptr, temp_bytes,
-                  vals_in, vals_out_buf,
-                  size_sorted_axis, 0, sizeof(ValT) * 8, hip_stream);
-
-              void* temp_storage = nullptr;
-              CHECK_HIP_ERROR(hipMalloc(&temp_storage, temp_bytes));
+                  N * sizeof(ValT), hipMemcpyDeviceToDevice, hip_stream));
 
               rocprim::radix_sort_keys(
                   temp_storage, temp_bytes,
                   vals_in, vals_out_buf,
-                  size_sorted_axis, 0, sizeof(ValT) * 8, hip_stream);
+                  N, 0, sizeof(ValT) * 8, hip_stream);
 
-              ValT* out_row = out.data<ValT>() + row * size_sorted_axis;
+              ValT* out_row = out.data<ValT>() + row * N;
               CHECK_HIP_ERROR(hipMemcpyAsync(out_row, vals_out_buf,
-                  size_sorted_axis * sizeof(ValT), hipMemcpyDeviceToDevice, hip_stream));
-
-              CHECK_HIP_ERROR(hipFree(vals_in));
-              CHECK_HIP_ERROR(hipFree(vals_out_buf));
-              CHECK_HIP_ERROR(hipFree(temp_storage));
+                  N * sizeof(ValT), hipMemcpyDeviceToDevice, hip_stream));
             }
+
+            CHECK_HIP_ERROR(hipFree(vals_in));
+            CHECK_HIP_ERROR(hipFree(vals_out_buf));
+            CHECK_HIP_ERROR(hipFree(temp_storage));
           }
         });
       } else {

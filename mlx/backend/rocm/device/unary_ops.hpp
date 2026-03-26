@@ -38,6 +38,8 @@ struct ArcCos {
       return ::acosf(x);
     } else if constexpr (std::is_same_v<T, double>) {
       return ::acos(x);
+    } else if constexpr (std::is_same_v<T, __half>) {
+      return __float2half(acosf(__half2float(x)));
     } else {
       return acos(x);
     }
@@ -51,6 +53,8 @@ struct ArcCosh {
       return ::acoshf(x);
     } else if constexpr (std::is_same_v<T, double>) {
       return ::acosh(x);
+    } else if constexpr (std::is_same_v<T, __half>) {
+      return __float2half(acoshf(__half2float(x)));
     } else {
       return acosh(x);
     }
@@ -64,6 +68,8 @@ struct ArcSin {
       return ::asinf(x);
     } else if constexpr (std::is_same_v<T, double>) {
       return ::asin(x);
+    } else if constexpr (std::is_same_v<T, __half>) {
+      return __float2half(asinf(__half2float(x)));
     } else {
       return asin(x);
     }
@@ -77,6 +83,8 @@ struct ArcSinh {
       return ::asinhf(x);
     } else if constexpr (std::is_same_v<T, double>) {
       return ::asinh(x);
+    } else if constexpr (std::is_same_v<T, __half>) {
+      return __float2half(asinhf(__half2float(x)));
     } else {
       return asinh(x);
     }
@@ -90,6 +98,8 @@ struct ArcTan {
       return ::atanf(x);
     } else if constexpr (std::is_same_v<T, double>) {
       return ::atan(x);
+    } else if constexpr (std::is_same_v<T, __half>) {
+      return __float2half(atanf(__half2float(x)));
     } else {
       return atan(x);
     }
@@ -103,6 +113,8 @@ struct ArcTanh {
       return ::atanhf(x);
     } else if constexpr (std::is_same_v<T, double>) {
       return ::atanh(x);
+    } else if constexpr (std::is_same_v<T, __half>) {
+      return __float2half(atanhf(__half2float(x)));
     } else {
       return atanh(x);
     }
@@ -157,6 +169,8 @@ struct Cos {
       return cosf(x);
     } else if constexpr (std::is_same_v<T, double>) {
       return ::cos(x);
+    } else if constexpr (std::is_same_v<T, __half>) {
+      return __float2half(cosf(__half2float(x)));
     } else {
       return cos(x);
     }
@@ -170,6 +184,8 @@ struct Cosh {
       return ::coshf(x);
     } else if constexpr (std::is_same_v<T, double>) {
       return ::cosh(x);
+    } else if constexpr (std::is_same_v<T, __half>) {
+      return __float2half(coshf(__half2float(x)));
     } else {
       return cosh(x);
     }
@@ -213,6 +229,8 @@ struct Exp {
       return expf(x);
     } else if constexpr (std::is_same_v<T, double>) {
       return ::exp(x);
+    } else if constexpr (std::is_same_v<T, __half>) {
+      return __float2half(expf(__half2float(x)));
     } else {
       return exp(x);
     }
@@ -270,6 +288,8 @@ struct Log {
       return logf(x);
     } else if constexpr (std::is_same_v<T, double>) {
       return ::log(x);
+    } else if constexpr (std::is_same_v<T, __half>) {
+      return __float2half(logf(__half2float(x)));
     } else {
       return log(x);
     }
@@ -287,6 +307,8 @@ struct Log2 {
       return ::log2f(x);
     } else if constexpr (std::is_same_v<T, double>) {
       return ::log2(x);
+    } else if constexpr (std::is_same_v<T, __half>) {
+      return __float2half(log2f(__half2float(x)));
     } else {
       return log2(x);
     }
@@ -300,6 +322,8 @@ struct Log10 {
       return ::log10f(x);
     } else if constexpr (std::is_same_v<T, double>) {
       return ::log10(x);
+    } else if constexpr (std::is_same_v<T, __half>) {
+      return __float2half(log10f(__half2float(x)));
     } else {
       return log10(x);
     }
@@ -427,6 +451,8 @@ struct Sin {
       return sinf(x);
     } else if constexpr (std::is_same_v<T, double>) {
       return ::sin(x);
+    } else if constexpr (std::is_same_v<T, __half>) {
+      return __float2half(sinf(__half2float(x)));
     } else {
       return sin(x);
     }
@@ -440,6 +466,8 @@ struct Sinh {
       return ::sinhf(x);
     } else if constexpr (std::is_same_v<T, double>) {
       return ::sinh(x);
+    } else if constexpr (std::is_same_v<T, __half>) {
+      return __float2half(sinhf(__half2float(x)));
     } else {
       return sinh(x);
     }
@@ -451,6 +479,12 @@ struct Square {
   __device__ T operator()(T x) {
     if constexpr (is_complex_v<T>) {
       return hipCmulf(x, x);
+    } else if constexpr (std::is_same_v<T, hip_bfloat16>) {
+      float fx = static_cast<float>(x);
+      return hip_bfloat16(fx * fx);
+    } else if constexpr (std::is_same_v<T, __half>) {
+      float fx = __half2float(x);
+      return __float2half(fx * fx);
     } else {
       return x * x;
     }
@@ -464,6 +498,8 @@ struct Sqrt {
       return ::sqrtf(x);
     } else if constexpr (std::is_same_v<T, double>) {
       return ::sqrt(x);
+    } else if constexpr (std::is_same_v<T, __half>) {
+      return __float2half(sqrtf(__half2float(x)));
     } else {
       return sqrt(x);
     }
@@ -479,6 +515,8 @@ struct Rsqrt {
       return ::rsqrtf(x);
     } else if constexpr (std::is_same_v<T, double>) {
       return ::rsqrt(x);
+    } else if constexpr (std::is_same_v<T, __half>) {
+      return __float2half(rsqrtf(__half2float(x)));
     } else {
       return rsqrt(x);
     }
@@ -492,6 +530,8 @@ struct Tan {
       return ::tanf(x);
     } else if constexpr (std::is_same_v<T, double>) {
       return ::tan(x);
+    } else if constexpr (std::is_same_v<T, __half>) {
+      return __float2half(tanf(__half2float(x)));
     } else {
       return tan(x);
     }
@@ -505,6 +545,8 @@ struct Tanh {
       return ::tanhf(x);
     } else if constexpr (std::is_same_v<T, double>) {
       return ::tanh(x);
+    } else if constexpr (std::is_same_v<T, __half>) {
+      return __float2half(tanhf(__half2float(x)));
     } else {
       return tanh(x);
     }

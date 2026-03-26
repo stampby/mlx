@@ -13,6 +13,10 @@ struct Add {
   __device__ T operator()(T x, T y) {
     if constexpr (is_complex_v<T>) {
       return hipCaddf(x, y);
+    } else if constexpr (std::is_same_v<T, hip_bfloat16>) {
+      return hip_bfloat16(static_cast<float>(x) + static_cast<float>(y));
+    } else if constexpr (std::is_same_v<T, __half>) {
+      return __float2half(__half2float(x) + __half2float(y));
     } else {
       return x + y;
     }
@@ -40,6 +44,10 @@ struct Divide {
   __device__ T operator()(T x, T y) {
     if constexpr (is_complex_v<T>) {
       return hipCdivf(x, y);
+    } else if constexpr (std::is_same_v<T, hip_bfloat16>) {
+      return hip_bfloat16(static_cast<float>(x) / static_cast<float>(y));
+    } else if constexpr (std::is_same_v<T, __half>) {
+      return __float2half(__half2float(x) / __half2float(y));
     } else {
       return x / y;
     }
@@ -289,6 +297,10 @@ struct Multiply {
   __device__ T operator()(T x, T y) {
     if constexpr (is_complex_v<T>) {
       return hipCmulf(x, y);
+    } else if constexpr (std::is_same_v<T, hip_bfloat16>) {
+      return hip_bfloat16(static_cast<float>(x) * static_cast<float>(y));
+    } else if constexpr (std::is_same_v<T, __half>) {
+      return __float2half(__half2float(x) * __half2float(y));
     } else {
       return x * y;
     }
@@ -350,6 +362,10 @@ struct Subtract {
   __device__ T operator()(T x, T y) {
     if constexpr (is_complex_v<T>) {
       return hipCsubf(x, y);
+    } else if constexpr (std::is_same_v<T, hip_bfloat16>) {
+      return hip_bfloat16(static_cast<float>(x) - static_cast<float>(y));
+    } else if constexpr (std::is_same_v<T, __half>) {
+      return __float2half(__half2float(x) - __half2float(y));
     } else {
       return x - y;
     }

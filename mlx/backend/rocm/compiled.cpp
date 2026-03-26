@@ -270,7 +270,9 @@ struct Minimum {
 
 struct Power {
   template <typename T>
-  __device__ T operator()(T base, T exp) { return powf(base, exp); }
+  __device__ T operator()(T base, T exp) {
+    return T(powf(static_cast<float>(base), static_cast<float>(exp)));
+  }
 };
 
 struct Equal {
@@ -393,7 +395,10 @@ struct Negative {
 
 struct Square {
   template <typename T>
-  __device__ T operator()(T x) { return x * x; }
+  __device__ T operator()(T x) {
+    float fx = static_cast<float>(x);
+    return T(fx * fx);
+  }
 };
 
 struct Sigmoid {
@@ -451,7 +456,7 @@ struct BitwiseNot {
 
 struct Reciprocal {
   template <typename T>
-  __device__ T operator()(T x) { return T(1) / x; }
+  __device__ T operator()(T x) { return T(1.0f / static_cast<float>(x)); }
 };
 
 // Ternary ops
