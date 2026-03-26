@@ -381,8 +381,18 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (has_bias) {
     biases = ensure_row_contiguous_matrix(inputs[3], enc, s);
   }
-  const array& lhs_indices = inputs[inputs.size() - 2];
-  const array& rhs_indices = inputs[inputs.size() - 1];
+  // Indices must be contiguous for flat kernel access (indices[batch]).
+  // They may have non-trivial strides from broadcasting in gather_qmm ops.cpp.
+  array lhs_indices = inputs[inputs.size() - 2];
+  array rhs_indices = inputs[inputs.size() - 1];
+  if (!lhs_indices.flags().row_contiguous) {
+    lhs_indices = contiguous_copy_gpu(lhs_indices, s);
+    enc.add_temporary(lhs_indices);
+  }
+  if (!rhs_indices.flags().row_contiguous) {
+    rhs_indices = contiguous_copy_gpu(rhs_indices, s);
+    enc.add_temporary(rhs_indices);
+  }
 
   enc.set_input_array(x);
   enc.set_input_array(w);

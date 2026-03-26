@@ -230,7 +230,8 @@ bool supports_sdpa_vector(
   const int query_sequence_length = q.shape(2);
 
   const bool sdpa_supported_head_dim = query_head_dim == value_head_dim &&
-      (query_head_dim == 64 || query_head_dim == 96 || query_head_dim == 128);
+      (query_head_dim == 64 || query_head_dim == 96 || query_head_dim == 128 ||
+       query_head_dim == 256);
 
   const bool supported_vector_config =
       sdpa_supported_head_dim && query_sequence_length < 4;
