@@ -36,6 +36,63 @@ TEST_CASE("test stream management") {
   }
 }
 
+TEST_CASE("test default stream in threads") {
+  std::set<Stream> thread_streams;
+  std::mutex mtx;
+  std::vector<std::thread> threads;
+
+  auto all_streams = get_streams();
+  size_t num_streams = all_streams.size();
+
+  size_t num_threads = 4;
+  for (size_t i = 0; i < num_threads; ++i) {
+    threads.emplace_back([&thread_streams, &mtx]() {
+      auto s = default_stream(gpu::is_available() ? Device::gpu : Device::cpu);
+      std::lock_guard lock(mtx);
+      thread_streams.insert(s);
+    });
+  }
+
+  for (auto& t : threads) {
+    t.join();
+  }
+  CHECK_EQ(thread_streams.size(), num_threads);
+
+  all_streams = get_streams();
+  CHECK_EQ(all_streams.size() - num_streams, num_threads);
+
+  std::set new_streams(all_streams.begin() + num_streams, all_streams.end());
+  CHECK_EQ(new_streams, thread_streams);
+}
+
+TEST_CASE("test get streams") {
+  auto streams = get_streams();
+
+  // At least the default CPU stream exists
+  CHECK(streams.size() >= 1);
+
+  // All default streams should be in the list
+  auto s_cpu = default_stream(Device::cpu);
+  bool found_cpu = false;
+  for (auto& s : streams) {
+    if (s == s_cpu) {
+      found_cpu = true;
+    }
+  }
+  CHECK(found_cpu);
+
+  // New streams show up
+  auto s_new = new_stream(Device::cpu);
+  streams = get_streams();
+  bool found_new = false;
+  for (auto& s : streams) {
+    if (s == s_new) {
+      found_new = true;
+    }
+  }
+  CHECK(found_new);
+}
+
 TEST_CASE("test asynchronous launch") {
   auto s1 = default_stream(Device::cpu);
   auto s2 = new_stream(Device::cpu);

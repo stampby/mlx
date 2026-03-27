@@ -26,10 +26,13 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/distributed.cu
           ${CMAKE_CURRENT_SOURCE_DIR}/eval.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/event.cu
+          ${CMAKE_CURRENT_SOURCE_DIR}/fft.cu
           ${CMAKE_CURRENT_SOURCE_DIR}/fence.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/gemms/block_mask.cu
           ${CMAKE_CURRENT_SOURCE_DIR}/gemms/gemv.cu
           ${CMAKE_CURRENT_SOURCE_DIR}/gemms/cublas_gemm.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/gemms/grouped_gemm_unaligned.cu
+          ${CMAKE_CURRENT_SOURCE_DIR}/hadamard.cu
           ${CMAKE_CURRENT_SOURCE_DIR}/jit_module.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/indexing.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/kernel_utils.cu
@@ -57,21 +60,24 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/quantized/affine_quantize.cu
           ${CMAKE_CURRENT_SOURCE_DIR}/quantized/fp_quantize.cu
           ${CMAKE_CURRENT_SOURCE_DIR}/quantized/quantized.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/quantized/qqmm.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/quantized/qqmm_utils.cu
           ${CMAKE_CURRENT_SOURCE_DIR}/quantized/convert_fp8.cu
           ${CMAKE_CURRENT_SOURCE_DIR}/worker.cpp)
 
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/binary)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/quantized/qmm)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/unary)
 
 # fp4 is not available on < 12.8
 if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.8.0)
   target_include_directories(mlx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/quantized/)
+  target_sources(mlx
+                 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/quantized/no_qqmm_impl.cpp)
 else()
   target_sources(
-    mlx
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/quantized/qqmm.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/quantized/cublas_qqmm.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/quantized/qqmm_utils.cu)
+    mlx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/quantized/qqmm_impl.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/quantized/cublas_qqmm.cpp)
 endif()
 
 if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9.0)
@@ -113,6 +119,16 @@ target_compile_options(mlx
 target_compile_options(
   mlx PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>")
 
+if(MSVC)
+  # Ignore warnings from CUTLASS.
+  target_compile_options(
+    mlx PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcudafe="--diag_suppress=2908">)
+else()
+  # Required for generating optimized CUTLASS code.
+  target_compile_options(
+    mlx PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fno-strict-aliasing>")
+endif()
+
 # Suppress nvcc warnings on C++ headers.
 target_compile_options(
   mlx
@@ -137,12 +153,11 @@ if(NOT DEFINED MLX_CUDA_ARCHITECTURES)
     COMMAND __nvcc_device_query
     OUTPUT_VARIABLE MLX_CUDA_ARCHITECTURES
     OUTPUT_STRIP_TRAILING_WHITESPACE)
-  set(UPGRADABLE_ARCHITECTURES "90;100;121")
   if(MLX_CUDA_ARCHITECTURES STREQUAL "")
     message(
       FATAL_ERROR
         "Can not get native CUDA arch, must set MLX_CUDA_ARCHITECTURES")
-  elseif(MLX_CUDA_ARCHITECTURES IN_LIST UPGRADABLE_ARCHITECTURES)
+  elseif(MLX_CUDA_ARCHITECTURES GREATER_EQUAL 90)
     # Use arch-specific compute capability whenever possible.
     set(MLX_CUDA_ARCHITECTURES "${MLX_CUDA_ARCHITECTURES}a")
   endif()
@@ -150,6 +165,13 @@ endif()
 message(STATUS "CUDA architectures: ${MLX_CUDA_ARCHITECTURES}")
 set_target_properties(mlx PROPERTIES CUDA_ARCHITECTURES
                                      "${MLX_CUDA_ARCHITECTURES}")
+
+# Skip Hopper-only kernels when not building for sm90a.
+if(NOT DEFINED ENV{MLX_DISABLE_SM90A_KERNELS}
+   AND (("90a" IN_LIST MLX_CUDA_ARCHITECTURES) OR ("90a-real" IN_LIST
+                                                   MLX_CUDA_ARCHITECTURES)))
+  target_compile_definitions(mlx PRIVATE MLX_CUDA_SM90A_ENABLED)
+endif()
 
 # Search CUDA libs from installed python packages.
 if(WIN32)
@@ -231,6 +253,9 @@ target_include_directories(mlx PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
 # Use cublasLt.
 target_link_libraries(mlx PRIVATE CUDA::cublasLt)
 
+# Use cuFFT.
+target_link_libraries(mlx PRIVATE CUDA::cufft)
+
 # Use NVRTC and driver APIs.
 target_link_libraries(mlx PRIVATE CUDA::nvrtc CUDA::cuda_driver)
 
@@ -254,9 +279,9 @@ target_link_libraries(mlx PRIVATE CUDNN::cudnn_all)
 FetchContent_Declare(
   cutlass
   GIT_REPOSITORY https://github.com/NVIDIA/cutlass.git
-  GIT_TAG v4.3.2
+  GIT_TAG v4.3.5
   GIT_SHALLOW TRUE
   SOURCE_SUBDIR include EXCLUDE_FROM_ALL)
 FetchContent_MakeAvailable(cutlass)
 target_include_directories(
-  mlx PRIVATE $<BUILD_INTERFACE:${cutlass_SOURCE_DIR}/include>)
+  mlx SYSTEM PRIVATE $<BUILD_INTERFACE:${cutlass_SOURCE_DIR}/include>)

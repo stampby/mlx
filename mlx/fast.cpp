@@ -332,7 +332,7 @@ std::vector<array> LayerNorm::vjp(
 
     // df/db
     if (b.ndim() == 0) {
-      vjps.push_back(zeros_like(w, s));
+      vjps.push_back(zeros_like(b, s));
     } else {
       vjps.push_back(sum(g, axes, /* keepdims= */ false, s));
     }
@@ -406,6 +406,23 @@ array rope(
   if (offset.dtype().size() != 4) {
     inputs[1] = astype(offset, int32, s);
   }
+  if (dims <= 0) {
+    std::ostringstream msg;
+    msg << "[rope] dims must be positive but got " << dims << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (dims % 2 != 0) {
+    std::ostringstream msg;
+    msg << "[rope] dims must be even but got " << dims << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (dims > x.shape(-1)) {
+    std::ostringstream msg;
+    msg << "[rope] dims must not exceed the input's last dimension ("
+        << x.shape(-1) << ") but got " << dims << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
   if (inputs.size() == 3 &&
       (inputs[2].ndim() != 1 || inputs[2].shape(0) != dims / 2)) {
     std::ostringstream msg;
@@ -720,8 +737,8 @@ array scaled_dot_product_attention(
         if (do_causal) {
           int kL = k.shape(-2);
           int qL = q.shape(-2);
-          int q_off = (kL - qL) < 0 ? 0 : (kL - qL);
-          auto q_idx = arange(q_off, q_off + qL, s);
+          int offset = kL - qL;
+          auto q_idx = arange(offset, qL + offset, s);
           auto k_idx = arange(0, kL, s);
           q_idx = expand_dims(q_idx, 1, s);
           k_idx = expand_dims(k_idx, 0, s);

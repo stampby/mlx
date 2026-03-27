@@ -8,6 +8,7 @@
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 #include <cub/block/block_load.cuh>
+#include <cub/cub.cuh>
 
 namespace mlx::core {
 
@@ -295,7 +296,6 @@ void col_reduce_looped(
             kernel,
             grid,
             blocks,
-            0,
             indata,
             gpu_ptr<U>(out),
             static_cast<cu::ColReduceArgs>(args),
@@ -333,7 +333,6 @@ void col_reduce_small(
           kernel,
           grid,
           block,
-          0,
           gpu_ptr<T>(in),
           gpu_ptr<U>(out),
           static_cast<cu::ColReduceArgs>(args),
@@ -404,7 +403,6 @@ void col_reduce_two_pass(
             kernel,
             grid,
             blocks,
-            0,
             indata,
             gpu_ptr<U>(intermediate),
             static_cast<cu::ColReduceArgs>(args),
@@ -443,7 +441,6 @@ void col_reduce_two_pass(
             kernel,
             grid,
             blocks,
-            0,
             gpu_ptr<T>(intermediate),
             gpu_ptr<U>(out),
             second_args,

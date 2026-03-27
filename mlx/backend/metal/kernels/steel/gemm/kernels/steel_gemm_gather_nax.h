@@ -25,14 +25,11 @@ gather_mm_rhs_nax(
     const constant GEMMParams* params [[buffer(4)]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]]) {
-  constexpr short UM = 16;
-  constexpr short UN = 32;
-  constexpr short UK = 16;
   constexpr short SM = BM / WM;
   constexpr short SN = BN / WN;
   constexpr short SK = 32;
-  constexpr short TM = SM / UM;
-  constexpr short TN = SN / UN;
+  constexpr short TM = SM / 16;
+  constexpr short TN = SN / 16;
 
   if (params->tiles_n <= static_cast<int>(tid.x) ||
       params->tiles_m <= static_cast<int>(tid.y)) {
@@ -53,10 +50,14 @@ gather_mm_rhs_nax(
   const short tm = SM * (simd_group_id / WN);
   const short tn = SN * (simd_group_id % WN);
 
-  const short sgp_sm = align_M ? SM : min(SM, short(params->M - (c_row + tm)));
+  const int sgp_sm_int =
+      align_M ? int(SM) : min(int(SM), params->M - (c_row + tm));
+  const short sgp_sm = short(sgp_sm_int);
   const bool is_unaligned_sm = align_M ? false : (sgp_sm != SM);
 
-  const short sgp_sn = align_N ? SN : min(SN, short(params->N - (c_col + tn)));
+  const int sgp_sn_int =
+      align_N ? int(SN) : min(int(SN), params->N - (c_col + tn));
+  const short sgp_sn = short(sgp_sn_int);
   const bool is_unaligned_sn = align_N ? false : (sgp_sn != SN);
 
   A += transpose_a ? tm : (tm * params->lda);
@@ -84,13 +85,12 @@ gather_mm_rhs_nax(
     }
     threadgroup_barrier(mem_flags::mem_none);
 
-    using DSubTile = NAXSubTile<AccumType, UM, UN>;
-    NAXTile<AccumType, TM, TN, DSubTile> Ctile;
+    NAXTile<AccumType, TM, TN> Ctile;
 
     dispatch_bool(align_K, [&](auto kAlignedK) {
       dispatch_bool(align_M || !is_unaligned_sm, [&](auto kAlignedM) {
         dispatch_bool(align_N || !is_unaligned_sn, [&](auto kAlignedN) {
-          auto do_gemm = gemm_loop<
+          auto do_gemm = gemm_loop< // Matmul for partial BM, full BN and full K
               T,
               SM,
               SN,
@@ -101,9 +101,6 @@ gather_mm_rhs_nax(
               kAlignedM.value,
               kAlignedN.value,
               kAlignedK.value,
-              UM,
-              UN,
-              UK,
               AccumType>;
           Ctile = do_gemm(
               A,

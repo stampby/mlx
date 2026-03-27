@@ -160,6 +160,51 @@ class TestQuantized(mlx_tests.MLXTestCase):
         w_hat = mx.dequantize(w_q, scales, mode="nvfp4")
         self.assertTrue(mx.all(w_hat == 0))
 
+        # Test nvfp4 quantize/dequantize with tensor-scale global_scale
+        # currently supported only on cpu and cuda
+        if not mx.metal.is_available():
+            global_scale = w.abs().max().astype(mx.float32)
+        else:
+            global_scale = None
+
+        w_q, scales = mx.quantize(w, mode="nvfp4", global_scale=global_scale)
+        w_hat = mx.dequantize(
+            w_q, scales, group_size=16, bits=4, mode="nvfp4", global_scale=global_scale
+        )
+        self.assertTrue(mx.allclose(w, w_hat, rtol=1e-5, atol=1e-5))
+
+    def test_qqmv(self):
+        key = mx.random.key(0)
+        k1, k2 = mx.random.split(key)
+        tests = product(
+            [256, 512, 67],  # M
+            [64, 256],  # N
+        )
+        modes = ["nvfp4", "mxfp8"]
+        for M, N in tests:
+            for mode in modes:
+                with self.subTest(shape=(M, N), mode=mode):
+                    x_shape = (1, N)
+                    w_shape = (M, N)
+
+                    x = mx.random.normal(shape=x_shape, key=k1)
+                    x_hat = mx.dequantize(
+                        *mx.quantize(x, mode=mode), mode=mode, dtype=mx.float32
+                    )
+
+                    w = mx.random.normal(shape=w_shape, key=k2)
+                    w_q, scales = mx.quantize(w, mode=mode)
+                    w_hat = mx.dequantize(w_q, scales, mode=mode, dtype=mx.float32)
+                    y_q = mx.qqmm(
+                        x,
+                        w_q,
+                        scales,
+                        mode=mode,
+                    )
+                    y_hat = x_hat @ mx.swapaxes(w_hat, -1, -2)
+                    self.assertEqual(y_q.shape, y_hat.shape)
+                    self.assertLess((y_q - y_hat).abs().max(), 1e-3)
+
     def test_qmm(self):
         key = mx.random.key(0)
         k1, k2 = mx.random.split(key)
@@ -337,6 +382,28 @@ class TestQuantized(mlx_tests.MLXTestCase):
                     y_hat = x @ mx.swapaxes(w_hat, -1, -2)
                     self.assertEqual(y_q.shape, y_hat.shape)
                     self.assertLess((y_q - y_hat).abs().max(), 1e-3)
+
+        # Test multiple of 16 but not 32
+        M = 128
+        N = 48
+        mode = "nvfp4"
+        with self.subTest(shape=(B, M, N), mode=mode):
+            x_shape = (1, N)
+            w_shape = (M, N)
+            x = mx.random.normal(shape=x_shape, key=k1)
+            w = mx.random.normal(shape=w_shape, key=k2)
+            w_q, scales = mx.quantize(w, mode=mode)
+            w_hat = mx.dequantize(w_q, scales, mode=mode)
+            y_q = mx.quantized_matmul(
+                x,
+                w_q,
+                scales,
+                transpose=True,
+                mode=mode,
+            )
+            y_hat = x @ mx.swapaxes(w_hat, -1, -2)
+            self.assertEqual(y_q.shape, y_hat.shape)
+            self.assertLess((y_q - y_hat).abs().max(), 1e-3)
 
     def test_qvm(self):
         key = mx.random.key(0)
@@ -627,6 +694,65 @@ class TestQuantized(mlx_tests.MLXTestCase):
         self.assertEqual(y_q.shape, y_hat.shape)
         self.assertLess((y_q - y_hat).abs().max(), 1e-3)
 
+    def test_qmv_small_non_multiples(self):
+        # Test very small K and N dimensions (e.g., [MxK] x [NxK].T = [MxN])
+        # Each tuple is (M, K, N) representing input rows, weight cols, weight rows
+        test_cases = [
+            (1, 32, 3),
+            (2, 32, 10),
+            (1, 32, 5),
+            (4, 32, 7),
+        ]
+
+        # Test different quantization settings (bits, group_size, mode)
+        quantization_settings = [
+            (4, 32, "affine"),
+            (6, 32, "affine"),
+            (4, 16, "nvfp4"),
+        ]
+
+        for M, K, N in test_cases:
+            for bits, group_size, mode in quantization_settings:
+                # Test without batch dimension
+                with self.subTest(
+                    M=M,
+                    K=K,
+                    N=N,
+                    batch=None,
+                    group_size=group_size,
+                    bits=bits,
+                    mode=mode,
+                ):
+                    w = mx.random.normal(shape=(N, K))
+                    w_q, *sb = mx.quantize(
+                        w,
+                        group_size=group_size,
+                        bits=bits,
+                        mode=mode,
+                    )
+                    w_hat = mx.dequantize(
+                        w_q,
+                        *sb,
+                        group_size=group_size,
+                        bits=bits,
+                        mode=mode,
+                    )
+
+                    # Test qmv/qmm_t (transpose=True): [MxK] @ [NxK].T = [MxN]
+                    x = mx.random.normal(shape=(M, K))
+                    y_q = mx.quantized_matmul(
+                        x,
+                        w_q,
+                        *sb,
+                        transpose=True,
+                        group_size=group_size,
+                        bits=bits,
+                        mode=mode,
+                    )
+                    y_hat = x @ mx.swapaxes(w_hat, -1, -2)
+                    self.assertEqual(y_q.shape, y_hat.shape)
+                    self.assertLess((y_q - y_hat).abs().max(), 1e-3)
+
     def test_gather_qmm(self):
         def quantize(w, transpose=True, group_size=None, bits=None, mode="affine"):
             if mode == "affine":
@@ -903,7 +1029,7 @@ class TestQuantized(mlx_tests.MLXTestCase):
                     group_size=group_size,
                     mode=mode,
                     transpose=transpose,
-                    rhs_indices=indices
+                    rhs_indices=indices,
                 )
                 xs, idx, inv_order = gather_sort(x, indices)
                 y3 = mx.gather_mm(xs, w, rhs_indices=idx, sorted_indices=True)
@@ -915,7 +1041,7 @@ class TestQuantized(mlx_tests.MLXTestCase):
                     mode=mode,
                     rhs_indices=idx,
                     transpose=transpose,
-                    sorted_indices=True
+                    sorted_indices=True,
                 )
                 y3 = scatter_unsort(y3, inv_order, indices.shape)
                 y4 = scatter_unsort(y4, inv_order, indices.shape)

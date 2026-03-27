@@ -157,6 +157,10 @@ if(MLX_BUILD_CUDA)
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
   find_package(CUDNN REQUIRED)
+  if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.1" AND CUDAToolkit_VERSION
+                                                          VERSION_LESS "13.2")
+    message(FATAL_ERROR "CUDA Toolkit 13.1 is not supported.")
+  endif()
 endif()
 
 if(MLX_BUILD_ROCM)
@@ -369,7 +373,7 @@ else()
   FetchContent_Declare(
     fmt
     GIT_REPOSITORY https://github.com/fmtlib/fmt.git
-    GIT_TAG 10.2.1
+    GIT_TAG 12.1.0
     EXCLUDE_FROM_ALL)
   FetchContent_MakeAvailable(fmt)
 endif()

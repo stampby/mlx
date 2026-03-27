@@ -204,6 +204,15 @@ void steel_matmul_regular_axpby_nax(
   int bm = 128, bn = 128, bk = 512;
   int wm = 4, wn = 4;
 
+  // Temp routing for larger devices
+  char devc = d.get_architecture().back();
+  if (devc == 's' || devc == 'c' || devc == 'd') {
+    bk = (K >= 8192 && K > (M + N)) ? 64 : 256;
+
+    bm = 64;
+    wm = 2;
+  }
+
   // Prepare kernel name
   std::ostringstream kname;
 
@@ -268,6 +277,9 @@ void steel_matmul_regular_axpby_nax(
 
   // TODO: Explore device-based tuning for swizzle
   int swizzle_log = tm <= 3 ? 0 : 1;
+  if (devc == 's' || devc == 'c' || devc == 'd') {
+    swizzle_log = 2;
+  }
 
   // Prepare steel matmul params
   GEMMParams params{/* const int M = */ M,
@@ -535,6 +547,8 @@ void steel_gemm_splitk_axpby(
     float beta = 0.0f) {
   using namespace mlx::steel;
 
+  int _tm = (M + 32 - 1) / 32;
+  int _tn = (N + 32 - 1) / 32;
   int _tk = K / 16;
 
   int bm = M < 40 ? 16 : 32;
@@ -542,7 +556,9 @@ void steel_gemm_splitk_axpby(
   int bk = 16;
   int wm = 2, wn = 2;
 
-  int split_k_partitions = _tk < 16 ? 2 : (_tk < 32 ? 4 : (_tk < 64 ? 8 : 16));
+  // As _tk grows use more partitions, as _tm * _tn grow use fewer partitions
+  int split_k_partitions =
+      std::min(std::max(2, next_power_of_2(_tk / (_tm * _tn))), 32);
   int split_k_partition_stride = M * N;
   int gemm_k_iterations = (K / bk) / split_k_partitions;
   int split_k_partition_size = gemm_k_iterations * bk;
@@ -909,12 +925,16 @@ void steel_matmul_axpby(
   /////////////////////////////////////////////////////////////////////////////
   // Split K specialization
 
-  int _tm = M / 16;
-  int _tn = N / 16;
+  int _tm = (M + 16 - 1) / 16;
+  int _tn = (N + 16 - 1) / 16;
   int _tk = K / 16;
 
   // Case 1: Small M×N with large K, use SIMD split-K
-  if (batch_size_out == 1 && (_tm * _tn) <= 32 && _tk >= 8) {
+  char devc = d.get_architecture().back();
+  // Max and Ultra dispatch larger sizes to splitk
+  int min_tmn_threshold = (devc == 's' || devc == 'd') ? 2048 : 1024;
+  if (batch_size_out == 1 && (_tm * _tn) <= min_tmn_threshold && _tk >= 8 &&
+      K >= std::max(M, N)) {
     return steel_gemm_splitk_axpby<CHECK_AB>(
         /* const Stream& s = */ s,
         /* metal::Device& d = */ d,

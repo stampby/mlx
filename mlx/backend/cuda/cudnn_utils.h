@@ -2,6 +2,10 @@
 
 #pragma once
 
+#include <cassert>
+#include <optional>
+
+#include "mlx/backend/cuda/cuda_utils.h"
 #include "mlx/backend/cuda/device/config.h"
 #include "mlx/backend/cuda/utils.h"
 #include "mlx/dtype_utils.h"
@@ -123,6 +127,20 @@ class DnnGraph : public fe::graph::Graph {
     return attrs;
   }
 
+  // Create a 4D cuDNN tensor from 1D array, with |axis| being contiguous dim.
+  auto tensor_4d(const char* name, int64_t uid, const array& x, int axis) {
+    assert(x.ndim() == 1);
+    auto attrs = Graph::tensor(fe::graph::Tensor_attributes().set_name(name));
+    std::vector<int64_t> shape(4, 1);
+    std::vector<int64_t> strides(4, 1);
+    shape.at(axis) = x.size();
+    if (axis > 0) {
+      strides.at(axis - 1) = x.size();
+    }
+    set_tensor_attrs(attrs, uid, x, shape, strides);
+    return attrs;
+  }
+
   // Create a cuDNN tensor for scalar.
   auto scalar(const char* name, int64_t uid, Dtype dtype) {
     return Graph::tensor(
@@ -168,6 +186,9 @@ class DnnGraph : public fe::graph::Graph {
       const array& x);
 
   cudnnHandle_t handle_;
+  std::optional<CudaGraph> cached_cuda_graph_;
+  std::string cached_subgraph_key_;
+  bool cached_is_updatable_{true};
 };
 
 } // namespace mlx::core

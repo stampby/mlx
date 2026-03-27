@@ -103,7 +103,7 @@ std::optional<DnnGraph> build_conv_graph(
     const std::vector<int64_t>& dilation) {
   auto compute_dtype =
       (dtype == float16 || dtype == bfloat16) ? float32 : dtype;
-  DnnGraph graph(encoder.device().cudnn_handle(), dtype, compute_dtype);
+  DnnGraph graph(encoder.device().get_cudnn_handle(), dtype, compute_dtype);
   auto x_ = graph.tensor_nchw("X", 'x', x);
   auto w_ = graph.tensor_nchw("W", 'w', w);
 
@@ -269,20 +269,19 @@ void Convolution::eval_gpu(const std::vector<array>& inputs, array& out_) {
 
   // Search cache.
   BytesKey<ConvCacheKey> cache_key;
-  cache_key.pod = {
-      encoder.device().cuda_device(),
-      dtype_to_cudnn_type(dtype),
-      vector_key(in.shape()),
-      vector_key(wt.shape()),
-      vector_key(kernel_strides_),
-      vector_key(padding_lo_),
-      vector_key(padding_hi_),
-      vector_key(kernel_dilation_),
-      groups_,
-      flip_,
-      get_alignment(in),
-      get_alignment(wt),
-      get_alignment(out)};
+  cache_key.pod.device_id = encoder.device().cuda_device();
+  cache_key.pod.cudnn_dtype = dtype_to_cudnn_type(dtype);
+  cache_key.pod.input_shape = vector_key(in.shape());
+  cache_key.pod.weight_shape = vector_key(wt.shape());
+  cache_key.pod.stride = vector_key(kernel_strides_);
+  cache_key.pod.padding_lo = vector_key(padding_lo_);
+  cache_key.pod.padding_hi = vector_key(padding_hi_);
+  cache_key.pod.dilation = vector_key(kernel_dilation_);
+  cache_key.pod.groups = groups_;
+  cache_key.pod.flip = flip_;
+  cache_key.pod.input_alignment = get_alignment(in);
+  cache_key.pod.weight_alignment = get_alignment(wt);
+  cache_key.pod.output_alignment = get_alignment(out);
   if (auto it = conv_cache().find(cache_key); it != conv_cache().end()) {
     auto& [backend_type, graph] = it->second;
     if (graph) {
