@@ -2562,34 +2562,13 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   const void* biases_ptr = has_bias ? gpu_ptr<void>(*biases) : nullptr;
   void* out_ptr = gpu_ptr<void>(out);
 
-  bool use_alignment_qmv = should_use_alignment_qmv_noshared_path(
-      M,
-      N,
-      K,
-      batch_count,
-      transpose_,
-      can_use_batched_qmv,
-      bits_,
-      mode_,
-      x_ptr,
-      w_ptr,
-      scales_ptr,
-      biases_ptr,
-      has_bias);
-  bool use_noshared_qmv_variant = use_tiny_k_qmv || use_alignment_qmv;
+  // The noshared variant reads x from global memory redundantly per warp.
+  // The shared variant caches x in LDS and is ~15x faster for decode shapes.
+  // Always prefer shared unless K is tiny (where LDS overhead isn't worth it).
+  bool use_noshared_qmv_variant = use_tiny_k_qmv;
 
-  if (use_alignment_qmv) {
-    fast_cols_per_block = std::max(fast_cols_per_block, 64);
-    while (fast_cols_per_block > max_cols_per_block) {
-      fast_cols_per_block /= 2;
-    }
-    while (fast_cols_per_block > 1 && (N % fast_cols_per_block) != 0 &&
-           fast_cols_per_block > 8) {
-      fast_cols_per_block /= 2;
-    }
-    fast_block = dim3(fast_threads_per_col, fast_cols_per_block);
-    fast_grid = dim3((N + fast_cols_per_block - 1) / fast_cols_per_block, M);
-  }
+  // The noshared path used to increase cols_per_block for aligned data.
+  // Since we always use the shared variant now, no special grid adjustment needed.
 
   enc.launch_kernel([&,
                      x_ptr,
