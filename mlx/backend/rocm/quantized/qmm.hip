@@ -39,6 +39,111 @@
 
 namespace mlx::core {
 
+namespace rocm {
+
+// Strided 2D row-copy kernel: copies rows from a source with row_stride != cols
+// into a contiguous destination.
+// src layout: row i starts at src + i * src_row_stride (elements contiguous within row)
+// dst layout: row i starts at dst + i * cols (fully contiguous)
+//
+// When both row strides and cols_bytes are 4-byte aligned, uses uint32_t
+// copies (one 4-byte word per thread iteration) for good throughput without
+// alignment concerns. Falls back to byte-by-byte for the non-aligned tail.
+__global__ void strided_row_copy_kernel(
+    const char* __restrict__ src,
+    char* __restrict__ dst,
+    int64_t num_rows,
+    int64_t cols_bytes,
+    int64_t src_row_stride_bytes,
+    int64_t dst_row_stride_bytes,
+    bool use_word_copy) {
+  int64_t tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t grid_stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+
+  if (use_word_copy) {
+    // Fast path: 4-byte word copies. All row strides are 4-byte aligned.
+    constexpr int64_t WORD = 4;
+    int64_t cols_words = cols_bytes / WORD;
+    int64_t total_words = num_rows * cols_words;
+    for (int64_t i = tid; i < total_words; i += grid_stride) {
+      int64_t row = i / cols_words;
+      int64_t word_in_row = i % cols_words;
+      int64_t src_off = row * src_row_stride_bytes + word_in_row * WORD;
+      int64_t dst_off = row * dst_row_stride_bytes + word_in_row * WORD;
+      *reinterpret_cast<uint32_t*>(dst + dst_off) =
+          *reinterpret_cast<const uint32_t*>(src + src_off);
+    }
+    // Handle remainder bytes (cols_bytes % 4)
+    int64_t remainder_start = cols_words * WORD;
+    int64_t remainder_bytes = cols_bytes - remainder_start;
+    if (remainder_bytes > 0) {
+      for (int64_t i = tid; i < num_rows * remainder_bytes; i += grid_stride) {
+        int64_t row = i / remainder_bytes;
+        int64_t byte_in_tail = i % remainder_bytes;
+        int64_t src_off = row * src_row_stride_bytes + remainder_start + byte_in_tail;
+        int64_t dst_off = row * dst_row_stride_bytes + remainder_start + byte_in_tail;
+        dst[dst_off] = src[src_off];
+      }
+    }
+  } else {
+    // Slow path: byte-by-byte copy for non-aligned strides.
+    int64_t total_bytes = num_rows * cols_bytes;
+    for (int64_t i = tid; i < total_bytes; i += grid_stride) {
+      int64_t row = i / cols_bytes;
+      int64_t byte_in_row = i % cols_bytes;
+      int64_t src_off = row * src_row_stride_bytes + byte_in_row;
+      int64_t dst_off = row * dst_row_stride_bytes + byte_in_row;
+      dst[dst_off] = src[src_off];
+    }
+  }
+}
+
+// General strided copy kernel with strides passed as kernel arguments
+// (by-value hip_array structs). Avoids device memory allocation +
+// hipMemcpyAsync overhead that contiguous_copy_gpu -> copy_general_input
+// would incur. Falls back to contiguous_copy_gpu only for ndim > MAX_NDIM.
+__global__ void strided_general_copy_kernel(
+    const char* __restrict__ src,
+    char* __restrict__ dst,
+    int64_t total_elems,
+    int elem_bytes,
+    int ndim,
+    hip_array<int64_t, MAX_NDIM> shapes,
+    hip_array<int64_t, MAX_NDIM> strides_bytes) {
+  int64_t tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t grid_stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (int64_t idx = tid; idx < total_elems; idx += grid_stride) {
+    // Convert linear index to strided source offset
+    int64_t src_offset = 0;
+    int64_t remaining = idx;
+    for (int d = ndim - 1; d >= 0; --d) {
+      int64_t coord = remaining % shapes[d];
+      remaining /= shapes[d];
+      src_offset += coord * strides_bytes[d];
+    }
+    // Copy element bytes -- specialize for common QMM element sizes
+    int64_t dst_offset = idx * elem_bytes;
+    if (elem_bytes == 2) {
+      *reinterpret_cast<uint16_t*>(dst + dst_offset) =
+          *reinterpret_cast<const uint16_t*>(src + src_offset);
+    } else if (elem_bytes == 4) {
+      *reinterpret_cast<uint32_t*>(dst + dst_offset) =
+          *reinterpret_cast<const uint32_t*>(src + src_offset);
+    } else if (elem_bytes == 1) {
+      dst[dst_offset] = src[src_offset];
+    } else if (elem_bytes == 8) {
+      *reinterpret_cast<uint64_t*>(dst + dst_offset) =
+          *reinterpret_cast<const uint64_t*>(src + src_offset);
+    } else {
+      for (int b = 0; b < elem_bytes; ++b) {
+        dst[dst_offset + b] = src[src_offset + b];
+      }
+    }
+  }
+}
+
+} // namespace rocm
+
 namespace {
 
 template <typename T>
@@ -46,6 +151,32 @@ struct local_type_identity {
   using type = T;
 };
 
+// Fast contiguous-copy helper for QMM inputs.
+//
+// Design goals vs the previous implementation (which called contiguous_copy_gpu
+// unconditionally when strides didn't match row-major):
+//
+//   1. **Already contiguous** -- return immediately (unchanged).
+//
+//   2. **Inner-contiguous with outer stride gap** -- the most common
+//      non-contiguous pattern from `take` / `gather_sort`.  The inner N-1
+//      dimensions are packed (stride-1 on the last dim, products match for
+//      the rest), but the outermost dimension has a stride larger than the
+//      product of inner shapes.  We handle this with a single
+//      `strided_row_copy_kernel` launch -- no device memory allocation for
+//      shapes/strides, no hipMemcpyAsync.  One kernel dispatch total.
+//
+//   3. **General non-contiguous** (rare for QMM inputs) -- uses
+//      `strided_general_copy_kernel` which takes shapes and strides as
+//      kernel arguments (up to QMM_COPY_MAX_DIMS dimensions).  This avoids
+//      the 2x allocator::malloc + 2x hipMemcpyAsync that
+//      `contiguous_copy_gpu -> copy_general_input` would issue.  One kernel
+//      dispatch total.  Falls back to `contiguous_copy_gpu` only for arrays
+//      with more than MAX_NDIM (10) dimensions (extremely unlikely for
+//      QMM operands).
+//
+// Net effect: non-contiguous copies go from 5 GPU operations (2 allocs +
+// 2 memcpy + 1 kernel) down to 1 kernel launch.
 inline array ensure_row_contiguous_matrix(
     const array& x,
     rocm::CommandEncoder& enc,
@@ -54,12 +185,19 @@ inline array ensure_row_contiguous_matrix(
     return x;
   }
 
+  // --- Fast path 1: already row-major contiguous ---
+  int ndim = x.ndim();
+  const auto& strides = x.strides();
   bool row_major_contiguous = true;
   int64_t expected_stride = 1;
-  for (int i = x.ndim() - 1; i >= 0; --i) {
+  // Track the innermost contiguous dimensions while checking.
+  // If we break at dimension i, dimensions [i+1 .. ndim-1] are packed.
+  int first_noncontig_dim = -1;
+  for (int i = ndim - 1; i >= 0; --i) {
     if (x.shape(i) > 1) {
-      if (x.strides()[i] != expected_stride) {
+      if (strides[i] != expected_stride) {
         row_major_contiguous = false;
+        first_noncontig_dim = i;
         break;
       }
       expected_stride *= x.shape(i);
@@ -70,6 +208,174 @@ inline array ensure_row_contiguous_matrix(
     return x;
   }
 
+  // Empty arrays don't need copying.
+  if (x.size() == 0) {
+    return x;
+  }
+
+  size_t elem_bytes = x.itemsize();
+
+  // Helper: allocate a contiguous output array and return src/dst pointers.
+  // Deferred until we know a copy is actually needed and which path to use.
+  auto make_output = [&]() -> array {
+    array out(x.shape(), x.dtype(), nullptr, {});
+    out.set_data(allocator::malloc(out.nbytes()));
+    enc.add_temporary(out);
+    return out;
+  };
+
+  // --- Fast path 2: inner-contiguous, only outermost dim has a stride gap ---
+  // This covers the common case where x comes from take/gather of a [E, K]
+  // or [B, M, K] array -- inner dims are packed, outer dim stride > product.
+  // We also handle the case where the gap is at any single dimension (not
+  // just dim 0) as long as all dimensions below it are packed.
+  if (first_noncontig_dim >= 0) {
+    // Verify that all dimensions below first_noncontig_dim are packed,
+    // and only first_noncontig_dim itself has a non-standard stride.
+    // Dimensions above first_noncontig_dim (if any) must also be consistent
+    // with first_noncontig_dim's layout.
+    bool is_simple_outer_gap = true;
+    // Check: first_noncontig_dim's stride must be >= expected_stride
+    // (i.e. the inner block is correct, just spaced further apart).
+    if (strides[first_noncontig_dim] < expected_stride) {
+      is_simple_outer_gap = false;
+    }
+    // Check dimensions above first_noncontig_dim: their strides must be
+    // consistent with first_noncontig_dim's stride * shape products.
+    if (is_simple_outer_gap) {
+      int64_t outer_expected = strides[first_noncontig_dim] * x.shape(first_noncontig_dim);
+      for (int i = first_noncontig_dim - 1; i >= 0; --i) {
+        if (x.shape(i) <= 1) continue;
+        if (strides[i] != outer_expected) {
+          is_simple_outer_gap = false;
+          break;
+        }
+        outer_expected *= x.shape(i);
+      }
+    }
+
+    if (is_simple_outer_gap && first_noncontig_dim == 0) {
+      // Simplest case: only the outermost dim has extra stride.
+      // inner_size = product of shapes[1..ndim-1]
+      array x_copy = make_output();
+      const char* src = reinterpret_cast<const char*>(gpu_ptr<const void>(x));
+      char* dst = reinterpret_cast<char*>(gpu_ptr<void>(x_copy));
+
+      int64_t inner_size = 1;
+      for (int i = 1; i < ndim; ++i) {
+        inner_size *= x.shape(i);
+      }
+      int64_t num_rows = x.shape(0);
+      int64_t cols_bytes = inner_size * static_cast<int64_t>(elem_bytes);
+      int64_t src_row_stride_bytes = strides[0] * static_cast<int64_t>(elem_bytes);
+      int64_t dst_row_stride_bytes = cols_bytes;
+      bool word_copy = (cols_bytes % 4 == 0) &&
+                       (src_row_stride_bytes % 4 == 0) &&
+                       (dst_row_stride_bytes % 4 == 0);
+
+      int block_size = 256;
+      int64_t work_items = word_copy
+          ? num_rows * (cols_bytes / 4)
+          : num_rows * cols_bytes;
+      int num_blocks = static_cast<int>(
+          std::min<int64_t>((work_items + block_size - 1) / block_size, 65535));
+
+      enc.launch_kernel([=](hipStream_t stream) {
+        hipLaunchKernelGGL(
+            rocm::strided_row_copy_kernel,
+            dim3(num_blocks), dim3(block_size), 0, stream,
+            src, dst,
+            num_rows, cols_bytes,
+            src_row_stride_bytes, dst_row_stride_bytes,
+            word_copy);
+      });
+      return x_copy;
+    }
+
+    if (is_simple_outer_gap) {
+      // Gap at an interior dimension. batch_count == 1 is common here.
+      int64_t batch_count = 1;
+      for (int i = 0; i < first_noncontig_dim; ++i) {
+        batch_count *= x.shape(i);
+      }
+      if (batch_count == 1) {
+        array x_copy = make_output();
+        const char* src = reinterpret_cast<const char*>(gpu_ptr<const void>(x));
+        char* dst = reinterpret_cast<char*>(gpu_ptr<void>(x_copy));
+
+        int64_t inner_size = 1;
+        for (int i = first_noncontig_dim + 1; i < ndim; ++i) {
+          inner_size *= x.shape(i);
+        }
+        int64_t slab_rows = x.shape(first_noncontig_dim);
+        int64_t cols_bytes = inner_size * static_cast<int64_t>(elem_bytes);
+        int64_t src_row_stride_bytes = strides[first_noncontig_dim] * static_cast<int64_t>(elem_bytes);
+        int64_t dst_row_stride_bytes = cols_bytes;
+        bool word_copy = (cols_bytes % 4 == 0) &&
+                         (src_row_stride_bytes % 4 == 0) &&
+                         (dst_row_stride_bytes % 4 == 0);
+
+        int block_size = 256;
+        int64_t work_items = word_copy
+            ? slab_rows * (cols_bytes / 4)
+            : slab_rows * cols_bytes;
+        int num_blocks = static_cast<int>(
+            std::min<int64_t>((work_items + block_size - 1) / block_size, 65535));
+
+        enc.launch_kernel([=](hipStream_t stream) {
+          hipLaunchKernelGGL(
+              rocm::strided_row_copy_kernel,
+              dim3(num_blocks), dim3(block_size), 0, stream,
+              src, dst,
+              slab_rows, cols_bytes,
+              src_row_stride_bytes, dst_row_stride_bytes,
+              word_copy);
+        });
+        return x_copy;
+      }
+      // batch_count > 1 with interior gap: fall through to general path
+    }
+  }
+
+  // --- Fast path 3: general non-contiguous, strides as kernel args ---
+  // Handles arbitrary stride patterns with up to MAX_NDIM dimensions.
+  // Shapes and byte-strides are passed as hip_array structs (by value),
+  // so no device memory allocation or hipMemcpyAsync is needed.
+  // One kernel launch total.
+  if (ndim <= MAX_NDIM) {
+    array x_copy = make_output();
+    const char* src = reinterpret_cast<const char*>(gpu_ptr<const void>(x));
+    char* dst = reinterpret_cast<char*>(gpu_ptr<void>(x_copy));
+
+    int64_t total_elems = x.size();
+    int eb = static_cast<int>(elem_bytes);
+
+    int block_size = 256;
+    int num_blocks = static_cast<int>(
+        std::min<int64_t>((total_elems + block_size - 1) / block_size, 65535));
+
+    // Pack into hip_array structs that can be passed by value to the kernel.
+    rocm::hip_array<int64_t, MAX_NDIM> shapes_arg = {};
+    rocm::hip_array<int64_t, MAX_NDIM> strides_bytes_arg = {};
+    for (int i = 0; i < ndim; ++i) {
+      shapes_arg.data_[i] = x.shape(i);
+      strides_bytes_arg.data_[i] = strides[i] * static_cast<int64_t>(elem_bytes);
+    }
+
+    enc.launch_kernel([=](hipStream_t stream) {
+      hipLaunchKernelGGL(
+          rocm::strided_general_copy_kernel,
+          dim3(num_blocks), dim3(block_size), 0, stream,
+          src, dst,
+          total_elems, eb, ndim,
+          shapes_arg, strides_bytes_arg);
+    });
+    return x_copy;
+  }
+
+  // --- Fallback: ndim > MAX_NDIM (extremely rare for QMM) ---
+  // Use the generic copy infrastructure which allocates device buffers
+  // for shape/strides arrays (2 allocs + 2 hipMemcpyAsync + 1 kernel).
   array x_copy = contiguous_copy_gpu(x, s);
   enc.add_temporary(x_copy);
   return x_copy;
