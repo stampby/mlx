@@ -236,7 +236,8 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/utils.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/worker.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/conv/conv.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/gemms/rocblas_gemm.cpp)
+          ${CMAKE_CURRENT_SOURCE_DIR}/gemms/rocblas_gemm.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/gemms/hipblaslt_gemm.cpp)
 
 target_compile_definitions(mlx PRIVATE MLX_USE_ROCM)
 
@@ -272,16 +273,21 @@ find_library(AMDHIP64_LIB amdhip64 PATHS ${ROCM_PATH}/lib /opt/rocm/lib
 find_library(HIPRTC_LIB hiprtc PATHS ${ROCM_PATH}/lib /opt/rocm/lib
                                      /opt/rocm-6.0.0/lib)
 
+# Find hipBLASLt library (optimized GEMM for half-precision)
+find_library(HIPBLASLT_LIB hipblaslt PATHS ${ROCM_PATH}/lib /opt/rocm/lib
+                                           /opt/rocm-6.0.0/lib)
+
 message(
   STATUS
-    "ROCm libraries: rocblas=${ROCBLAS_LIB}, hiprand=${HIPRAND_LIB}, amdhip64=${AMDHIP64_LIB}, hiprtc=${HIPRTC_LIB}"
+    "ROCm libraries: rocblas=${ROCBLAS_LIB}, hiprand=${HIPRAND_LIB}, amdhip64=${AMDHIP64_LIB}, hiprtc=${HIPRTC_LIB}, hipblaslt=${HIPBLASLT_LIB}"
 )
 
 # Link the static library and ROCm libraries to mlx We link directly to the .so
 # files instead of using CMake targets to avoid propagating compile options like
 # -x hip
 target_link_libraries(mlx PRIVATE ${HIP_STATIC_LIB} ${AMDHIP64_LIB}
-                                  ${ROCBLAS_LIB} ${HIPRAND_LIB} ${HIPRTC_LIB})
+                                  ${ROCBLAS_LIB} ${HIPRAND_LIB} ${HIPRTC_LIB}
+                                  ${HIPBLASLT_LIB})
 
 # Include ROCm headers for mlx C++ files Get the HIP include directory from the
 # hip package
