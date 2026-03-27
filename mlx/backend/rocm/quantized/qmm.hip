@@ -12,6 +12,8 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <rocblas/rocblas.h>
+#include <algorithm>
+#include <numeric>
 // rocWMMA is only supported on CDNA (gfx9xx) and RDNA 3+ (gfx11xx, gfx12xx).
 // Guard the include so it doesn't trigger static_assert on RDNA 1/2 (gfx10xx).
 // During host compilation __HIP_DEVICE_COMPILE__ is 0 so rocwmma defines
@@ -3091,6 +3093,7 @@ __global__ void __launch_bounds__(1024) gather_qmv_prefill_kernel(
     const uint32_t* __restrict__ rhs_indices,
     const int* __restrict__ run_starts,   // [num_runs]: start batch idx of each run
     const int* __restrict__ run_lengths,  // [num_runs]: length of each run
+    const int* __restrict__ out_perm,     // [B]: sorted batch idx → original batch idx
     T* __restrict__ out,
     int B,
     int M,
@@ -3240,7 +3243,8 @@ __global__ void __launch_bounds__(1024) gather_qmv_prefill_kernel(
     }
 
     if (lane == 0) {
-      out[static_cast<int64_t>(batch) * M * N + static_cast<int64_t>(row) * N + col] = static_cast<T>(acc);
+      const int orig_batch = out_perm[batch];
+      out[static_cast<int64_t>(orig_batch) * M * N + static_cast<int64_t>(row) * N + col] = static_cast<T>(acc);
     }
   }
 }
@@ -3818,6 +3822,7 @@ __global__ void __launch_bounds__(32) gather_qmv_wmma_prefill_kernel(
     const uint32_t* __restrict__ rhs_indices,
     const int* __restrict__ run_starts,
     const int* __restrict__ run_lengths,
+    const int* __restrict__ out_perm,  // maps sorted batch idx → original batch idx
     T* __restrict__ out,
     int B, int M, int N, int K, int E,
     bool has_bias, int64_t x_batch_stride) {
@@ -3888,14 +3893,16 @@ __global__ void __launch_bounds__(32) gather_qmv_wmma_prefill_kernel(
     for (int k_base = 0; k_base < K; k_base += WMMA_K) {
       // --- Load x tile [WMMA_M x WMMA_K] into shared memory ---
       // 32 lanes load 256 elements (16x16) -> 8 elements per lane
+      // Pad with zero for rows beyond M (handles non-16-aligned M)
       #pragma unroll
       for (int i = 0; i < (WMMA_M * WMMA_K + 31) / 32; ++i) {
         int idx = lane + i * 32;
         if (idx < WMMA_M * WMMA_K) {
           int m_local = idx / WMMA_K;
           int k_local = idx % WMMA_K;
+          int m_global = tile_row + m_local;
           int k_global = k_base + k_local;
-          if (k_global < K) {
+          if (m_global < M && k_global < K) {
             smem_x[idx] = x_base[m_local * K + k_global];
           } else {
             smem_x[idx] = static_cast<hip_bfloat16>(0.0f);
@@ -3964,8 +3971,10 @@ __global__ void __launch_bounds__(32) gather_qmv_wmma_prefill_kernel(
     rocwmma::store_matrix_sync(smem_out_f32, acc, WMMA_N, rocwmma::mem_row_major);
     __syncthreads();
 
-    // Convert f32 -> bf16 and write to global output
-    T* out_base = out + static_cast<int64_t>(batch) * M * N
+    // Convert f32 -> bf16 and write to global output (mask out-of-bounds rows)
+    // Use out_perm to map sorted batch position back to original output position
+    const int orig_batch = out_perm[batch];
+    T* out_base = out + static_cast<int64_t>(orig_batch) * M * N
                       + static_cast<int64_t>(tile_row) * N
                       + tile_col;
     #pragma unroll
@@ -3974,7 +3983,9 @@ __global__ void __launch_bounds__(32) gather_qmv_wmma_prefill_kernel(
       if (idx < WMMA_M * WMMA_N) {
         int m_local = idx / WMMA_N;
         int n_local = idx % WMMA_N;
-        out_base[m_local * N + n_local] = static_cast<T>(smem_out_f32[idx]);
+        if (tile_row + m_local < M) {
+          out_base[m_local * N + n_local] = static_cast<T>(smem_out_f32[idx]);
+        }
       }
     }
     __syncthreads();
@@ -4058,24 +4069,61 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   bool use_fast_gather_qmv = transpose_ && bits_supported_by_fast;
   use_fast_gather_qmv = parse_warp_kernel_env(
       "MLX_ROCM_GATHER_QMV_USE_WARP", use_fast_gather_qmv);
-  // ---- Prefill optimization: group by expert for M>1 with sorted indices ----
-  if (M > 1 && transpose_ && right_sorted_ && E > 0 && batch_ndim == 1 &&
+  // ---- Prefill optimization: group by expert for M>1 ----
+  // Works with both sorted and unsorted rhs_indices; we sort on CPU.
+  // NOTE: MLX's MoE expands tokens to B individual M=1 calls, so M>1 is rare.
+  // The WMMA prefill kernel is used when upstream batching produces M>1.
+  if (M > 1 && transpose_ && E > 0 && batch_ndim == 1 &&
       mode_ == QuantizationMode::Affine && x.dtype() == bfloat16 &&
       group_size_ == 64 && (bits_ == 4 || bits_ == 8)) {
-    // Compute contiguous runs of same-expert batches on CPU.
+    // Sort batch elements by expert to form contiguous runs.
+    // This allows the kernel to process all tokens for one expert together,
+    // sharing weight reads. We create a sorted permutation on CPU.
     const auto* ri_cpu = rhs_indices.data<uint32_t>();
+    const auto* li_cpu = lhs_indices.data<uint32_t>();
+
+    // Create sort permutation by expert index
+    std::vector<int> perm(B);
+    std::iota(perm.begin(), perm.end(), 0);
+    std::sort(perm.begin(), perm.end(), [&](int a, int b) {
+      return ri_cpu[a] < ri_cpu[b];
+    });
+
+    // Build sorted index arrays and compute runs
+    std::vector<uint32_t> sorted_ri(B), sorted_li(B);
+    for (int i = 0; i < B; ++i) {
+      sorted_ri[i] = ri_cpu[perm[i]];
+      sorted_li[i] = li_cpu[perm[i]];
+    }
+
     std::vector<int> run_starts_vec, run_lengths_vec;
     run_starts_vec.reserve(E);
     run_lengths_vec.reserve(E);
     int run_begin = 0;
     for (int b = 1; b <= B; ++b) {
-      if (b == B || ri_cpu[b] != ri_cpu[run_begin]) {
+      if (b == B || sorted_ri[b] != sorted_ri[run_begin]) {
         run_starts_vec.push_back(run_begin);
         run_lengths_vec.push_back(b - run_begin);
         run_begin = b;
       }
     }
     int num_runs = static_cast<int>(run_starts_vec.size());
+
+    // Upload sorted indices to GPU
+    array sorted_ri_arr({B}, uint32, nullptr, {});
+    array sorted_li_arr({B}, uint32, nullptr, {});
+    sorted_ri_arr.set_data(allocator::malloc(sorted_ri_arr.nbytes()));
+    sorted_li_arr.set_data(allocator::malloc(sorted_li_arr.nbytes()));
+    std::memcpy(sorted_ri_arr.data<uint32_t>(), sorted_ri.data(), B * sizeof(uint32_t));
+    std::memcpy(sorted_li_arr.data<uint32_t>(), sorted_li.data(), B * sizeof(uint32_t));
+    enc.set_input_array(sorted_ri_arr);
+    enc.set_input_array(sorted_li_arr);
+
+    // Also need a mapping from sorted position back to original batch index for output
+    array perm_arr({B}, int32, nullptr, {});
+    perm_arr.set_data(allocator::malloc(perm_arr.nbytes()));
+    std::memcpy(perm_arr.data<int>(), perm.data(), B * sizeof(int));
+    enc.set_input_array(perm_arr);
 
     // Upload run info to GPU
     array run_starts_arr({num_runs}, int32, nullptr, {});
@@ -4090,7 +4138,9 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     int64_t x_bs = (x_batch_count == 1) ? 0 : static_cast<int64_t>(M) * K;
 
     // ---- WMMA path: use 16x16x16 wave matrix multiply when tiles align ----
-    bool use_wmma = (M >= 16) && (M % 16 == 0) && (N % 16 == 0) && (bits_ == 4);
+    // WMMA tiles are 16x16; kernel handles non-aligned M with bounds masking.
+    // N must be 16-aligned (typical for transformer hidden dimensions).
+    bool use_wmma = (M >= 2) && (N % 16 == 0) && (bits_ == 4);
     use_wmma = parse_warp_kernel_env("MLX_ROCM_GATHER_QMV_USE_WMMA", use_wmma);
 
     if (use_wmma) {
@@ -4109,10 +4159,11 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
             gpu_ptr<const uint8_t>(w),
             gpu_ptr<const hip_bfloat16>(scales),
             has_bias ? gpu_ptr<const hip_bfloat16>(*biases) : nullptr,
-            gpu_ptr<const uint32_t>(lhs_indices),
-            gpu_ptr<const uint32_t>(rhs_indices),
+            gpu_ptr<const uint32_t>(sorted_li_arr),
+            gpu_ptr<const uint32_t>(sorted_ri_arr),
             gpu_ptr<const int>(run_starts_arr),
             gpu_ptr<const int>(run_lengths_arr),
+            gpu_ptr<const int>(perm_arr),
             gpu_ptr<hip_bfloat16>(out),
             B, M, N, K, E, has_bias, x_bs);
       });
@@ -4140,10 +4191,11 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
             gpu_ptr<const uint8_t>(w),
             gpu_ptr<const hip_bfloat16>(scales),
             has_bias ? gpu_ptr<const hip_bfloat16>(*biases) : nullptr,
-            gpu_ptr<const uint32_t>(lhs_indices),
-            gpu_ptr<const uint32_t>(rhs_indices),
+            gpu_ptr<const uint32_t>(sorted_li_arr),
+            gpu_ptr<const uint32_t>(sorted_ri_arr),
             gpu_ptr<const int>(run_starts_arr),
             gpu_ptr<const int>(run_lengths_arr),
+            gpu_ptr<const int>(perm_arr),
             gpu_ptr<hip_bfloat16>(out),
             B, M, N, K, E, has_bias, x_bs);
       };
