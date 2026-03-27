@@ -3699,7 +3699,7 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   enc.launch_kernel([&](hipStream_t stream) {
     if (use_fast_gather_qmv && mode_ == QuantizationMode::Affine &&
         x.dtype() == bfloat16 && group_size_ == 64 &&
-        (bits_ == 6 || bits_ == 8)) {
+        (bits_ == 4 || bits_ == 6 || bits_ == 8)) {
       auto launch_fast_kernel = [&](auto bits_tag) {
         constexpr int BITS = decltype(bits_tag)::value;
         if (fast_threads_per_col == 16) {
@@ -3769,7 +3769,9 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         }
       };
 
-      if (bits_ == 6) {
+      if (bits_ == 4) {
+        launch_fast_kernel(std::integral_constant<int, 4>{});
+      } else if (bits_ == 6) {
         launch_fast_kernel(std::integral_constant<int, 6>{});
       } else {
         launch_fast_kernel(std::integral_constant<int, 8>{});
