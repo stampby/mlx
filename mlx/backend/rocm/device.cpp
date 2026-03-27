@@ -267,6 +267,59 @@ void CommandEncoder::synchronize() {
   f.wait();
 }
 
+void CommandEncoder::begin_capture() {
+  if (capturing_) return;
+  device_.make_current();
+  // hipStreamBeginCapture records all subsequent operations on this stream
+  // into a graph instead of executing them.
+  hipError_t err = hipStreamBeginCapture(stream_, hipStreamCaptureModeGlobal);
+  if (err == hipSuccess) {
+    capturing_ = true;
+  }
+}
+
+bool CommandEncoder::end_capture() {
+  if (!capturing_) return false;
+  capturing_ = false;
+
+  hipGraph_t new_graph = nullptr;
+  hipError_t err = hipStreamEndCapture(stream_, &new_graph);
+  if (err != hipSuccess || new_graph == nullptr) {
+    return false;
+  }
+
+  // Destroy previous graph if any
+  reset_graph();
+
+  graph_ = new_graph;
+  err = hipGraphInstantiate(&graph_exec_, graph_, nullptr, nullptr, 0);
+  if (err != hipSuccess) {
+    hipGraphDestroy(graph_);
+    graph_ = nullptr;
+    graph_exec_ = nullptr;
+    return false;
+  }
+  return true;
+}
+
+bool CommandEncoder::replay() {
+  if (!graph_exec_) return false;
+  device_.make_current();
+  hipError_t err = hipGraphLaunch(graph_exec_, stream_);
+  return err == hipSuccess;
+}
+
+void CommandEncoder::reset_graph() {
+  if (graph_exec_) {
+    hipGraphExecDestroy(graph_exec_);
+    graph_exec_ = nullptr;
+  }
+  if (graph_) {
+    hipGraphDestroy(graph_);
+    graph_ = nullptr;
+  }
+}
+
 Device& device(mlx::core::Device device) {
   static std::unordered_map<int, Device> devices;
   static bool flags_set = false;

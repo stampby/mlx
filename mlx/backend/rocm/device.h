@@ -58,6 +58,25 @@ class CommandEncoder {
   // Wait until kernels and completion handlers are finished
   void synchronize();
 
+  // --- Graph capture API ---
+  // Begin recording all kernel launches into a HIP graph.
+  // While capturing, launch_kernel dispatches are recorded (not executed).
+  void begin_capture();
+
+  // End recording and instantiate the captured graph.
+  // Returns true if capture succeeded (graph is ready to replay).
+  bool end_capture();
+
+  // Replay the previously captured graph. All recorded kernels execute
+  // in a single GPU dispatch. Returns false if no graph is available.
+  bool replay();
+
+  // Returns true if a captured graph is ready to replay.
+  bool has_graph() const { return graph_exec_ != nullptr; }
+
+  // Discard the captured graph.
+  void reset_graph();
+
  private:
   Device& device_;
   HipStream stream_;
@@ -65,6 +84,9 @@ class CommandEncoder {
   int node_count_{0};
   std::vector<std::shared_ptr<array::Data>> temporaries_;
   std::unordered_set<const array::Data*> temporary_ptrs_;
+  bool capturing_{false};
+  hipGraph_t graph_{nullptr};
+  hipGraphExec_t graph_exec_{nullptr};
 };
 
 class Device {
@@ -119,6 +141,9 @@ inline auto thrust_policy(hipStream_t stream) {
 template <typename F>
 void CommandEncoder::launch_kernel(F&& func) {
   device_.make_current();
+  // When capturing, kernel launches are recorded into the HIP graph
+  // automatically via hipStreamBeginCapture. No special handling needed —
+  // hipLaunchKernel on a capturing stream records instead of executing.
   func(static_cast<hipStream_t>(stream_));
   node_count_++;
 }
