@@ -472,102 +472,36 @@ void gemm_and_bias(
           beta);
     }
   } else {
-    // Fallback: loop over batches for non-uniform strides
-    if (use_rocblas) {
-      for (int64_t batch = 0; batch < batch_count; ++batch) {
-        int64_t a_offset = 0, b_offset = 0;
-        int64_t batch_idx = batch;
-        for (int i = batch_shape.size() - 1; i >= 0; --i) {
-          int64_t idx = batch_idx % batch_shape[i];
-          batch_idx /= batch_shape[i];
-          a_offset += idx * a_batch_strides[i];
-          b_offset += idx * b_batch_strides[i];
-        }
-
-        encoder.launch_kernel(
-            [&, a_offset, b_offset, batch](hipStream_t stream) {
-              auto& device = encoder.device();
-              rocblas_handle handle = device.get_rocblas_handle();
-              rocblas_set_stream(handle, stream);
-
-              rocblas_operation trans_a = b_transposed
-                  ? rocblas_operation_none
-                  : rocblas_operation_transpose;
-              rocblas_operation trans_b = a_transposed
-                  ? rocblas_operation_none
-                  : rocblas_operation_transpose;
-
-              float alpha_f = alpha, beta_f = beta;
-
-              if (a.dtype() == float32) {
-                rocblas_sgemm(
-                    handle,
-                    trans_a,
-                    trans_b,
-                    N,
-                    M,
-                    K,
-                    &alpha_f,
-                    b.data<float>() + b_offset,
-                    b_transposed ? K : N,
-                    a.data<float>() + a_offset,
-                    a_transposed ? M : K,
-                    &beta_f,
-                    out.data<float>() + batch * M * N,
-                    N);
-              } else if (a.dtype() == float64) {
-                double alpha_d = static_cast<double>(alpha);
-                double beta_d = static_cast<double>(beta);
-                rocblas_dgemm(
-                    handle,
-                    trans_a,
-                    trans_b,
-                    N,
-                    M,
-                    K,
-                    &alpha_d,
-                    b.data<double>() + b_offset,
-                    b_transposed ? K : N,
-                    a.data<double>() + a_offset,
-                    a_transposed ? M : K,
-                    &beta_d,
-                    out.data<double>() + batch * M * N,
-                    N);
-              }
-            });
+    // Loop over batches for non-uniform strides (e.g. GQA broadcasting).
+    // Always use naive GEMM — the direct rocBLAS path was missing bfloat16/
+    // float16 support, leaving outputs uninitialized for those dtypes.
+    for (int64_t batch = 0; batch < batch_count; ++batch) {
+      int64_t a_offset = 0, b_offset = 0;
+      int64_t batch_idx = batch;
+      for (int i = batch_shape.size() - 1; i >= 0; --i) {
+        int64_t idx = batch_idx % batch_shape[i];
+        batch_idx /= batch_shape[i];
+        a_offset += idx * a_batch_strides[i];
+        b_offset += idx * b_batch_strides[i];
       }
-    } else {
-      // Use naive GEMM for each batch when rocBLAS is not available
-      // This is less efficient but provides correctness
-      for (int64_t batch = 0; batch < batch_count; ++batch) {
-        int64_t a_offset = 0, b_offset = 0;
-        int64_t batch_idx = batch;
-        for (int i = batch_shape.size() - 1; i >= 0; --i) {
-          int64_t idx = batch_idx % batch_shape[i];
-          batch_idx /= batch_shape[i];
-          a_offset += idx * a_batch_strides[i];
-          b_offset += idx * b_batch_strides[i];
-        }
 
-        // Use naive GEMM with explicit offsets
-        rocm::naive_gemm_with_offset(
-            encoder,
-            a,
-            b,
-            out,
-            M,
-            N,
-            K,
-            a_transposed,
-            lda,
-            a_offset,
-            b_transposed,
-            ldb,
-            b_offset,
-            batch * M * N,
-            alpha,
-            beta);
-      }
+      rocm::naive_gemm_with_offset(
+          encoder,
+          a,
+          b,
+          out,
+          M,
+          N,
+          K,
+          a_transposed,
+          lda,
+          a_offset,
+          b_transposed,
+          ldb,
+          b_offset,
+          batch * M * N,
+          alpha,
+          beta);
     }
   }
 }
