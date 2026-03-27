@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <optional>
 #include "mlx/array.h"
 #include "mlx/backend/rocm/device.h"
 
@@ -21,7 +22,7 @@ void affine_quantize(
 void affine_dequantize(
     const array& wq,
     const array& scales,
-    const array& biases,
+    const std::optional<array>& biases,
     array& w,
     int group_size,
     int bits,

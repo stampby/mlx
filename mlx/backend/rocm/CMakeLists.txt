@@ -131,6 +131,7 @@ set(HIP_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/rms_norm.hip
     ${CMAKE_CURRENT_SOURCE_DIR}/rope.hip
     ${CMAKE_CURRENT_SOURCE_DIR}/scaled_dot_product_attention.hip
+    ${CMAKE_CURRENT_SOURCE_DIR}/flash_attention.hip
     ${CMAKE_CURRENT_SOURCE_DIR}/scan.hip
     ${CMAKE_CURRENT_SOURCE_DIR}/softmax.hip
     ${CMAKE_CURRENT_SOURCE_DIR}/sort.hip

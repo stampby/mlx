@@ -3,15 +3,17 @@
 #include "mlx/backend/common/matmul.h"
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/rocm/device.h"
-#include "mlx/backend/rocm/kernel_utils.hpp"
 #include "mlx/backend/rocm/gemms/gemv.h"
 #include "mlx/backend/rocm/gemms/naive_gemm.h"
+#include "mlx/backend/rocm/kernel_utils.hpp"
 #include "mlx/primitives.h"
 #include "mlx/types/half_types.h"
 
 #include <hip/hip_runtime.h>
 #include <rocblas/rocblas.h>
 
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 
@@ -55,6 +57,67 @@ std::tuple<bool, int64_t, array> ensure_batch_contiguous(
   return std::make_tuple(false, x_copy.strides(-2), x_copy);
 }
 
+std::pair<bool, int64_t> get_uniform_batch_stride(
+    const Shape& batch_shape,
+    const Strides& batch_strides) {
+  if (batch_shape.empty() || batch_shape.size() != batch_strides.size()) {
+    return {false, 0};
+  }
+
+  if (batch_shape.size() == 1) {
+    return {true, batch_strides.back()};
+  }
+
+  for (int i = batch_shape.size() - 2; i >= 0; --i) {
+    int64_t cur = batch_strides[i];
+    int64_t next = batch_strides[i + 1];
+    if (cur == 0 && next == 0) {
+      continue;
+    }
+    if (cur != next * batch_shape[i + 1]) {
+      return {false, 0};
+    }
+  }
+
+  return {true, batch_strides.back()};
+}
+
+int parse_non_negative_int_env(const char* env_name, int default_value) {
+  const char* raw = std::getenv(env_name);
+  if (raw == nullptr || *raw == '\0') {
+    return default_value;
+  }
+
+  char* end = nullptr;
+  long value = std::strtol(raw, &end, 10);
+  if (end == raw || *end != '\0' || value < 0) {
+    return default_value;
+  }
+  return static_cast<int>(value);
+}
+
+int gemm_solution_index_f32(bool batched) {
+  static int single_index =
+      parse_non_negative_int_env("MLX_ROCM_GEMM_F32_SOLUTION_INDEX", 0);
+  static int batched_index = parse_non_negative_int_env(
+      "MLX_ROCM_GEMM_F32_BATCHED_SOLUTION_INDEX", -1);
+  if (!batched) {
+    return single_index;
+  }
+  return batched_index >= 0 ? batched_index : single_index;
+}
+
+int gemm_solution_index_bf16(bool batched) {
+  static int single_index =
+      parse_non_negative_int_env("MLX_ROCM_GEMM_BF16_SOLUTION_INDEX", 0);
+  static int batched_index = parse_non_negative_int_env(
+      "MLX_ROCM_GEMM_BF16_BATCHED_SOLUTION_INDEX", -1);
+  if (!batched) {
+    return single_index;
+  }
+  return batched_index >= 0 ? batched_index : single_index;
+}
+
 void gemm_rocblas(
     rocm::CommandEncoder& encoder,
     int M,
@@ -70,60 +133,102 @@ void gemm_rocblas(
     float alpha = 1.0f,
     float beta = 0.0f) {
   auto& device = encoder.device();
-
-  // Use naive_gemm for all types to avoid rocBLAS Tensile initialization
-  // being affected by pending GPU errors from other kernels.
-  // TODO: Re-enable rocBLAS once gather_qmm memory corruption is resolved.
-  // The naive_gemm (tiled shared-memory) is correct for all types and archs.
-  {
-    naive_gemm(
-        encoder, a, b, out, M, N, K,
-        a_transposed, a_transposed ? M : K,
-        b_transposed, b_transposed ? K : N,
-        alpha, beta);
-    return;
-  }
-
   rocblas_handle handle = device.get_rocblas_handle();
 
+  // rocBLAS uses column-major, so we swap A and B and compute B^T * A^T = (A *
+  // B)^T But since we want row-major output, we compute C = A * B by doing C^T
+  // = B^T * A^T
   rocblas_operation trans_a =
-      b_transposed ? rocblas_operation_none : rocblas_operation_transpose;
+      b_transposed ? rocblas_operation_transpose : rocblas_operation_none;
   rocblas_operation trans_b =
-      a_transposed ? rocblas_operation_none : rocblas_operation_transpose;
+      a_transposed ? rocblas_operation_transpose : rocblas_operation_none;
 
-  // Try rocBLAS first; if it fails (e.g., missing Tensile kernel for this
-  // GPU arch + GEMM config), fall back to naive_gemm.
-  bool rocblas_ok = true;
+  // We pass B then A (swapped) to compute C^T = B^T * A^T. The leading
+  // dimensions come directly from check_transpose() for each operand.
+  const int64_t ld_b = ldb;
+  const int64_t ld_a = lda;
+  const void* a_ptr = gpu_ptr<void>(a);
+  const void* b_ptr = gpu_ptr<void>(b);
+  void* out_ptr = gpu_ptr<void>(out);
 
-  encoder.launch_kernel([&](hipStream_t stream) {
-    rocblas_set_stream(handle, stream);
-    rocblas_status status = rocblas_status_not_implemented;
+  encoder.launch_kernel([&, a_ptr, b_ptr, out_ptr](hipStream_t stream) {
+    encoder.device().set_rocblas_stream(stream);
 
     switch (a.dtype()) {
       case float32: {
         float alpha_f = alpha;
         float beta_f = beta;
-        status = rocblas_sgemm(
-            handle,
-            trans_a,
-            trans_b,
-            N,
-            M,
-            K,
-            &alpha_f,
-            gpu_ptr<float>(b),
-            b_transposed ? K : N,
-            gpu_ptr<float>(a),
-            a_transposed ? M : K,
-            &beta_f,
-            gpu_ptr<float>(out),
-            N);
+        int solution_index = gemm_solution_index_f32(false);
+        static std::atomic<bool> solution_valid{true};
+
+        if (solution_index > 0 &&
+            solution_valid.load(std::memory_order_relaxed)) {
+          rocblas_status status = rocblas_gemm_ex(
+              handle,
+              trans_a,
+              trans_b,
+              N,
+              M,
+              K,
+              &alpha_f,
+              b_ptr,
+              rocblas_datatype_f32_r,
+              ld_b,
+              a_ptr,
+              rocblas_datatype_f32_r,
+              ld_a,
+              &beta_f,
+              out_ptr,
+              rocblas_datatype_f32_r,
+              N,
+              out_ptr,
+              rocblas_datatype_f32_r,
+              N,
+              rocblas_datatype_f32_r,
+              rocblas_gemm_algo_solution_index,
+              solution_index,
+              0);
+          if (status != rocblas_status_success) {
+            solution_valid.store(false, std::memory_order_relaxed);
+            rocblas_sgemm(
+                handle,
+                trans_a,
+                trans_b,
+                N,
+                M,
+                K,
+                &alpha_f,
+                static_cast<const float*>(b_ptr),
+                ld_b,
+                static_cast<const float*>(a_ptr),
+                ld_a,
+                &beta_f,
+                static_cast<float*>(out_ptr),
+                N);
+          }
+        } else {
+          rocblas_sgemm(
+              handle,
+              trans_a,
+              trans_b,
+              N,
+              M,
+              K,
+              &alpha_f,
+              static_cast<const float*>(b_ptr),
+              ld_b,
+              static_cast<const float*>(a_ptr),
+              ld_a,
+              &beta_f,
+              static_cast<float*>(out_ptr),
+              N);
+        }
         break;
       }
       case float64: {
         double alpha_d = static_cast<double>(alpha);
         double beta_d = static_cast<double>(beta);
-        status = rocblas_dgemm(
+        rocblas_dgemm(
             handle,
             trans_a,
             trans_b,
@@ -131,22 +236,23 @@ void gemm_rocblas(
             M,
             K,
             &alpha_d,
-            gpu_ptr<double>(b),
-            b_transposed ? K : N,
-            gpu_ptr<double>(a),
-            a_transposed ? M : K,
+            static_cast<const double*>(b_ptr),
+            ld_b,
+            static_cast<const double*>(a_ptr),
+            ld_a,
             &beta_d,
-            gpu_ptr<double>(out),
+            static_cast<double*>(out_ptr),
             N);
         break;
       }
       case float16: {
         rocblas_half alpha_h, beta_h;
+        // Convert float to rocblas_half using memcpy
         float16_t alpha_f16 = static_cast<float16_t>(alpha);
         float16_t beta_f16 = static_cast<float16_t>(beta);
         std::memcpy(&alpha_h, &alpha_f16, sizeof(rocblas_half));
         std::memcpy(&beta_h, &beta_f16, sizeof(rocblas_half));
-        status = rocblas_hgemm(
+        rocblas_hgemm(
             handle,
             trans_a,
             trans_b,
@@ -154,19 +260,32 @@ void gemm_rocblas(
             M,
             K,
             &alpha_h,
-            reinterpret_cast<const rocblas_half*>(gpu_ptr<void>(b)),
-            b_transposed ? K : N,
-            reinterpret_cast<const rocblas_half*>(gpu_ptr<void>(a)),
-            a_transposed ? M : K,
+            reinterpret_cast<const rocblas_half*>(
+                static_cast<const float16_t*>(b_ptr)),
+            ld_b,
+            reinterpret_cast<const rocblas_half*>(
+                static_cast<const float16_t*>(a_ptr)),
+            ld_a,
             &beta_h,
-            reinterpret_cast<rocblas_half*>(gpu_ptr<void>(out)),
+            reinterpret_cast<rocblas_half*>(static_cast<float16_t*>(out_ptr)),
             N);
         break;
       }
       case bfloat16: {
         float alpha_f = alpha;
         float beta_f = beta;
-        status = rocblas_gemm_ex(
+        int solution_index = gemm_solution_index_bf16(false);
+        static std::atomic<bool> solution_valid{true};
+
+        rocblas_gemm_algo algo = rocblas_gemm_algo_standard;
+        if (solution_index > 0 &&
+            solution_valid.load(std::memory_order_relaxed)) {
+          algo = rocblas_gemm_algo_solution_index;
+        } else {
+          solution_index = 0;
+        }
+
+        rocblas_status status = rocblas_gemm_ex(
             handle,
             trans_a,
             trans_b,
@@ -174,53 +293,58 @@ void gemm_rocblas(
             M,
             K,
             &alpha_f,
-            gpu_ptr<void>(b),
+            static_cast<const bfloat16_t*>(b_ptr),
             rocblas_datatype_bf16_r,
-            b_transposed ? K : N,
-            gpu_ptr<void>(a),
+            ld_b,
+            static_cast<const bfloat16_t*>(a_ptr),
             rocblas_datatype_bf16_r,
-            a_transposed ? M : K,
+            ld_a,
             &beta_f,
-            gpu_ptr<void>(out),
+            static_cast<bfloat16_t*>(out_ptr),
             rocblas_datatype_bf16_r,
             N,
-            gpu_ptr<void>(out),
+            static_cast<bfloat16_t*>(out_ptr),
             rocblas_datatype_bf16_r,
             N,
             rocblas_datatype_f32_r,
-            rocblas_gemm_algo_standard,
-            0,
+            algo,
+            solution_index,
             0);
+        if (status != rocblas_status_success &&
+            algo == rocblas_gemm_algo_solution_index) {
+          solution_valid.store(false, std::memory_order_relaxed);
+          rocblas_gemm_ex(
+              handle,
+              trans_a,
+              trans_b,
+              N,
+              M,
+              K,
+              &alpha_f,
+              static_cast<const bfloat16_t*>(b_ptr),
+              rocblas_datatype_bf16_r,
+              ld_b,
+              static_cast<const bfloat16_t*>(a_ptr),
+              rocblas_datatype_bf16_r,
+              ld_a,
+              &beta_f,
+              static_cast<bfloat16_t*>(out_ptr),
+              rocblas_datatype_bf16_r,
+              N,
+              static_cast<bfloat16_t*>(out_ptr),
+              rocblas_datatype_bf16_r,
+              N,
+              rocblas_datatype_f32_r,
+              rocblas_gemm_algo_standard,
+              0,
+              0);
+        }
         break;
       }
       default:
         throw std::runtime_error("Unsupported dtype for matmul on ROCm");
     }
-
-    if (status != rocblas_status_success) {
-      rocblas_ok = false;
-    }
   });
-
-  if (!rocblas_ok) {
-    // Clear any GPU error state from the failed rocBLAS call
-    (void)hipGetLastError();
-    // Fall back to naive GEMM
-    naive_gemm(
-        encoder,
-        a,
-        b,
-        out,
-        M,
-        N,
-        K,
-        a_transposed,
-        a_transposed ? M : K,
-        b_transposed,
-        b_transposed ? K : N,
-        alpha,
-        beta);
-  }
 }
 
 void gemm_strided_batched_rocblas(
@@ -242,49 +366,128 @@ void gemm_strided_batched_rocblas(
     float alpha = 1.0f,
     float beta = 0.0f) {
   auto& device = encoder.device();
-
-  // Use naive_gemm for all types (see single GEMM comment above).
-  {
-    naive_gemm_batched(
-        encoder, a, b, out, M, N, K,
-        a_transposed, a_transposed ? M : K, stride_a,
-        b_transposed, b_transposed ? K : N, stride_b,
-        stride_c, batch_count, alpha, beta);
-    return;
-  }
-
   rocblas_handle handle = device.get_rocblas_handle();
 
   rocblas_operation trans_a =
-      b_transposed ? rocblas_operation_none : rocblas_operation_transpose;
+      b_transposed ? rocblas_operation_transpose : rocblas_operation_none;
   rocblas_operation trans_b =
-      a_transposed ? rocblas_operation_none : rocblas_operation_transpose;
+      a_transposed ? rocblas_operation_transpose : rocblas_operation_none;
 
-  bool rocblas_ok = true;
+  const int64_t ld_b = ldb;
+  const int64_t ld_a = lda;
+  const void* a_ptr = gpu_ptr<void>(a);
+  const void* b_ptr = gpu_ptr<void>(b);
+  void* out_ptr = gpu_ptr<void>(out);
 
-  encoder.launch_kernel([&](hipStream_t stream) {
-    rocblas_set_stream(handle, stream);
-    rocblas_status status = rocblas_status_not_implemented;
+  encoder.launch_kernel([&, a_ptr, b_ptr, out_ptr](hipStream_t stream) {
+    encoder.device().set_rocblas_stream(stream);
 
     switch (a.dtype()) {
       case float32: {
         float alpha_f = alpha;
         float beta_f = beta;
-        status = rocblas_sgemm_strided_batched(
-            handle, trans_a, trans_b, N, M, K,
-            &alpha_f, gpu_ptr<float>(b), b_transposed ? K : N, stride_b,
-            gpu_ptr<float>(a), a_transposed ? M : K, stride_a,
-            &beta_f, gpu_ptr<float>(out), N, stride_c, batch_count);
+        int solution_index = gemm_solution_index_f32(true);
+        static std::atomic<bool> solution_valid{true};
+
+        if (solution_index > 0 &&
+            solution_valid.load(std::memory_order_relaxed)) {
+          rocblas_status status = rocblas_gemm_strided_batched_ex(
+              handle,
+              trans_a,
+              trans_b,
+              N,
+              M,
+              K,
+              &alpha_f,
+              b_ptr,
+              rocblas_datatype_f32_r,
+              ld_b,
+              stride_b,
+              a_ptr,
+              rocblas_datatype_f32_r,
+              ld_a,
+              stride_a,
+              &beta_f,
+              out_ptr,
+              rocblas_datatype_f32_r,
+              N,
+              stride_c,
+              out_ptr,
+              rocblas_datatype_f32_r,
+              N,
+              stride_c,
+              batch_count,
+              rocblas_datatype_f32_r,
+              rocblas_gemm_algo_solution_index,
+              solution_index,
+              0);
+          if (status != rocblas_status_success) {
+            solution_valid.store(false, std::memory_order_relaxed);
+            rocblas_sgemm_strided_batched(
+                handle,
+                trans_a,
+                trans_b,
+                N,
+                M,
+                K,
+                &alpha_f,
+                static_cast<const float*>(b_ptr),
+                ld_b,
+                stride_b,
+                static_cast<const float*>(a_ptr),
+                ld_a,
+                stride_a,
+                &beta_f,
+                static_cast<float*>(out_ptr),
+                N,
+                stride_c,
+                batch_count);
+          }
+        } else {
+          rocblas_sgemm_strided_batched(
+              handle,
+              trans_a,
+              trans_b,
+              N,
+              M,
+              K,
+              &alpha_f,
+              static_cast<const float*>(b_ptr),
+              ld_b,
+              stride_b,
+              static_cast<const float*>(a_ptr),
+              ld_a,
+              stride_a,
+              &beta_f,
+              static_cast<float*>(out_ptr),
+              N,
+              stride_c,
+              batch_count);
+        }
         break;
       }
       case float64: {
         double alpha_d = static_cast<double>(alpha);
         double beta_d = static_cast<double>(beta);
-        status = rocblas_dgemm_strided_batched(
-            handle, trans_a, trans_b, N, M, K,
-            &alpha_d, gpu_ptr<double>(b), b_transposed ? K : N, stride_b,
-            gpu_ptr<double>(a), a_transposed ? M : K, stride_a,
-            &beta_d, gpu_ptr<double>(out), N, stride_c, batch_count);
+        rocblas_dgemm_strided_batched(
+            handle,
+            trans_a,
+            trans_b,
+            N,
+            M,
+            K,
+            &alpha_d,
+            static_cast<const double*>(b_ptr),
+            ld_b,
+            stride_b,
+            static_cast<const double*>(a_ptr),
+            ld_a,
+            stride_a,
+            &beta_d,
+            static_cast<double*>(out_ptr),
+            N,
+            stride_c,
+            batch_count);
         break;
       }
       case float16: {
@@ -293,53 +496,114 @@ void gemm_strided_batched_rocblas(
         float16_t beta_f16 = static_cast<float16_t>(beta);
         std::memcpy(&alpha_h, &alpha_f16, sizeof(rocblas_half));
         std::memcpy(&beta_h, &beta_f16, sizeof(rocblas_half));
-        status = rocblas_hgemm_strided_batched(
-            handle, trans_a, trans_b, N, M, K,
+        rocblas_hgemm_strided_batched(
+            handle,
+            trans_a,
+            trans_b,
+            N,
+            M,
+            K,
             &alpha_h,
-            reinterpret_cast<const rocblas_half*>(gpu_ptr<void>(b)),
-            b_transposed ? K : N, stride_b,
-            reinterpret_cast<const rocblas_half*>(gpu_ptr<void>(a)),
-            a_transposed ? M : K, stride_a,
+            reinterpret_cast<const rocblas_half*>(
+                static_cast<const float16_t*>(b_ptr)),
+            ld_b,
+            stride_b,
+            reinterpret_cast<const rocblas_half*>(
+                static_cast<const float16_t*>(a_ptr)),
+            ld_a,
+            stride_a,
             &beta_h,
-            reinterpret_cast<rocblas_half*>(gpu_ptr<void>(out)),
-            N, stride_c, batch_count);
+            reinterpret_cast<rocblas_half*>(static_cast<float16_t*>(out_ptr)),
+            N,
+            stride_c,
+            batch_count);
         break;
       }
       case bfloat16: {
         float alpha_f = alpha;
         float beta_f = beta;
-        status = rocblas_gemm_strided_batched_ex(
-            handle, trans_a, trans_b, N, M, K,
+        int solution_index = gemm_solution_index_bf16(true);
+        static std::atomic<bool> solution_valid{true};
+
+        rocblas_gemm_algo algo = rocblas_gemm_algo_standard;
+        if (solution_index > 0 &&
+            solution_valid.load(std::memory_order_relaxed)) {
+          algo = rocblas_gemm_algo_solution_index;
+        } else {
+          solution_index = 0;
+        }
+
+        rocblas_status status = rocblas_gemm_strided_batched_ex(
+            handle,
+            trans_a,
+            trans_b,
+            N,
+            M,
+            K,
             &alpha_f,
-            gpu_ptr<void>(b), rocblas_datatype_bf16_r,
-            b_transposed ? K : N, stride_b,
-            gpu_ptr<void>(a), rocblas_datatype_bf16_r,
-            a_transposed ? M : K, stride_a,
+            static_cast<const bfloat16_t*>(b_ptr),
+            rocblas_datatype_bf16_r,
+            ld_b,
+            stride_b,
+            static_cast<const bfloat16_t*>(a_ptr),
+            rocblas_datatype_bf16_r,
+            ld_a,
+            stride_a,
             &beta_f,
-            gpu_ptr<void>(out), rocblas_datatype_bf16_r, N, stride_c,
-            gpu_ptr<void>(out), rocblas_datatype_bf16_r, N, stride_c,
+            static_cast<bfloat16_t*>(out_ptr),
+            rocblas_datatype_bf16_r,
+            N,
+            stride_c,
+            static_cast<bfloat16_t*>(out_ptr),
+            rocblas_datatype_bf16_r,
+            N,
+            stride_c,
             batch_count,
-            rocblas_datatype_f32_r, rocblas_gemm_algo_standard, 0, 0);
+            rocblas_datatype_f32_r,
+            algo,
+            solution_index,
+            0);
+        if (status != rocblas_status_success &&
+            algo == rocblas_gemm_algo_solution_index) {
+          solution_valid.store(false, std::memory_order_relaxed);
+          rocblas_gemm_strided_batched_ex(
+              handle,
+              trans_a,
+              trans_b,
+              N,
+              M,
+              K,
+              &alpha_f,
+              static_cast<const bfloat16_t*>(b_ptr),
+              rocblas_datatype_bf16_r,
+              ld_b,
+              stride_b,
+              static_cast<const bfloat16_t*>(a_ptr),
+              rocblas_datatype_bf16_r,
+              ld_a,
+              stride_a,
+              &beta_f,
+              static_cast<bfloat16_t*>(out_ptr),
+              rocblas_datatype_bf16_r,
+              N,
+              stride_c,
+              static_cast<bfloat16_t*>(out_ptr),
+              rocblas_datatype_bf16_r,
+              N,
+              stride_c,
+              batch_count,
+              rocblas_datatype_f32_r,
+              rocblas_gemm_algo_standard,
+              0,
+              0);
+        }
         break;
       }
       default:
         throw std::runtime_error(
             "Unsupported dtype for batched matmul on ROCm");
     }
-
-    if (status != rocblas_status_success) {
-      rocblas_ok = false;
-    }
   });
-
-  if (!rocblas_ok) {
-    (void)hipGetLastError();
-    naive_gemm_batched(
-        encoder, a, b, out, M, N, K,
-        a_transposed, a_transposed ? M : K, stride_a,
-        b_transposed, b_transposed ? K : N, stride_b,
-        stride_c, batch_count, alpha, beta);
-  }
 }
 
 void gemm_and_bias(
@@ -392,6 +656,10 @@ void gemm_and_bias(
 
   // Check if rocBLAS is available
   bool use_rocblas = encoder.device().is_rocblas_available();
+  auto [a_uniform_batch, a_uniform_stride] =
+      get_uniform_batch_stride(batch_shape, a_batch_strides);
+  auto [b_uniform_batch, b_uniform_stride] =
+      get_uniform_batch_stride(batch_shape, b_batch_strides);
 
   if (batch_count == 1) {
     // Simple single GEMM
@@ -427,9 +695,7 @@ void gemm_and_bias(
           alpha,
           beta);
     }
-  } else if (
-      batch_shape.size() == 1 && a_batch_strides.back() > 0 &&
-      b_batch_strides.back() > 0) {
+  } else if (a_uniform_batch && b_uniform_batch) {
     // Use strided batched GEMM for uniform batches
     if (use_rocblas) {
       gemm_strided_batched_rocblas(
@@ -439,10 +705,10 @@ void gemm_and_bias(
           K,
           a_transposed,
           lda,
-          a_batch_strides.back(),
+          a_uniform_stride,
           b_transposed,
           ldb,
-          b_batch_strides.back(),
+          b_uniform_stride,
           M * N,
           batch_count,
           out,
@@ -462,46 +728,186 @@ void gemm_and_bias(
           K,
           a_transposed,
           lda,
-          a_batch_strides.back(),
+          a_uniform_stride,
           b_transposed,
           ldb,
-          b_batch_strides.back(),
+          b_uniform_stride,
           M * N,
           batch_count,
           alpha,
           beta);
     }
   } else {
-    // Loop over batches for non-uniform strides (e.g. GQA broadcasting).
-    // Always use naive GEMM — the direct rocBLAS path was missing bfloat16/
-    // float16 support, leaving outputs uninitialized for those dtypes.
-    for (int64_t batch = 0; batch < batch_count; ++batch) {
-      int64_t a_offset = 0, b_offset = 0;
-      int64_t batch_idx = batch;
-      for (int i = batch_shape.size() - 1; i >= 0; --i) {
-        int64_t idx = batch_idx % batch_shape[i];
-        batch_idx /= batch_shape[i];
-        a_offset += idx * a_batch_strides[i];
-        b_offset += idx * b_batch_strides[i];
-      }
+    // Fallback: loop over batches for non-uniform strides
+    if (use_rocblas) {
+      const void* a_ptr_base = gpu_ptr<void>(a);
+      const void* b_ptr_base = gpu_ptr<void>(b);
+      void* out_ptr_base = gpu_ptr<void>(out);
+      for (int64_t batch = 0; batch < batch_count; ++batch) {
+        int64_t a_offset = 0, b_offset = 0;
+        int64_t batch_idx = batch;
+        for (int i = batch_shape.size() - 1; i >= 0; --i) {
+          int64_t idx = batch_idx % batch_shape[i];
+          batch_idx /= batch_shape[i];
+          a_offset += idx * a_batch_strides[i];
+          b_offset += idx * b_batch_strides[i];
+        }
 
-      rocm::naive_gemm_with_offset(
-          encoder,
-          a,
-          b,
-          out,
-          M,
-          N,
-          K,
-          a_transposed,
-          lda,
-          a_offset,
-          b_transposed,
-          ldb,
-          b_offset,
-          batch * M * N,
-          alpha,
-          beta);
+        encoder.launch_kernel([&,
+                               a_offset,
+                               b_offset,
+                               batch,
+                               a_ptr_base,
+                               b_ptr_base,
+                               out_ptr_base](hipStream_t stream) {
+          auto& device = encoder.device();
+          device.set_rocblas_stream(stream);
+          rocblas_handle handle = device.get_rocblas_handle();
+
+          rocblas_operation trans_a = b_transposed ? rocblas_operation_transpose
+                                                   : rocblas_operation_none;
+          rocblas_operation trans_b = a_transposed ? rocblas_operation_transpose
+                                                   : rocblas_operation_none;
+
+          const int64_t ld_b = ldb;
+          const int64_t ld_a = lda;
+
+          switch (a.dtype()) {
+            case float32: {
+              float alpha_f = alpha, beta_f = beta;
+              rocblas_sgemm(
+                  handle,
+                  trans_a,
+                  trans_b,
+                  N,
+                  M,
+                  K,
+                  &alpha_f,
+                  static_cast<const float*>(b_ptr_base) + b_offset,
+                  ld_b,
+                  static_cast<const float*>(a_ptr_base) + a_offset,
+                  ld_a,
+                  &beta_f,
+                  static_cast<float*>(out_ptr_base) + batch * M * N,
+                  N);
+              break;
+            }
+            case float64: {
+              double alpha_d = static_cast<double>(alpha);
+              double beta_d = static_cast<double>(beta);
+              rocblas_dgemm(
+                  handle,
+                  trans_a,
+                  trans_b,
+                  N,
+                  M,
+                  K,
+                  &alpha_d,
+                  static_cast<const double*>(b_ptr_base) + b_offset,
+                  ld_b,
+                  static_cast<const double*>(a_ptr_base) + a_offset,
+                  ld_a,
+                  &beta_d,
+                  static_cast<double*>(out_ptr_base) + batch * M * N,
+                  N);
+              break;
+            }
+            case float16: {
+              rocblas_half alpha_h, beta_h;
+              float16_t alpha_f16 = static_cast<float16_t>(alpha);
+              float16_t beta_f16 = static_cast<float16_t>(beta);
+              std::memcpy(&alpha_h, &alpha_f16, sizeof(rocblas_half));
+              std::memcpy(&beta_h, &beta_f16, sizeof(rocblas_half));
+              rocblas_hgemm(
+                  handle,
+                  trans_a,
+                  trans_b,
+                  N,
+                  M,
+                  K,
+                  &alpha_h,
+                  reinterpret_cast<const rocblas_half*>(
+                      static_cast<const float16_t*>(b_ptr_base) + b_offset),
+                  ld_b,
+                  reinterpret_cast<const rocblas_half*>(
+                      static_cast<const float16_t*>(a_ptr_base) + a_offset),
+                  ld_a,
+                  &beta_h,
+                  reinterpret_cast<rocblas_half*>(
+                      static_cast<float16_t*>(out_ptr_base) + batch * M * N),
+                  N);
+              break;
+            }
+            case bfloat16: {
+              float alpha_f = alpha;
+              float beta_f = beta;
+              auto* out_ptr =
+                  static_cast<bfloat16_t*>(out_ptr_base) + batch * M * N;
+              rocblas_gemm_ex(
+                  handle,
+                  trans_a,
+                  trans_b,
+                  N,
+                  M,
+                  K,
+                  &alpha_f,
+                  static_cast<const bfloat16_t*>(b_ptr_base) + b_offset,
+                  rocblas_datatype_bf16_r,
+                  ld_b,
+                  static_cast<const bfloat16_t*>(a_ptr_base) + a_offset,
+                  rocblas_datatype_bf16_r,
+                  ld_a,
+                  &beta_f,
+                  out_ptr,
+                  rocblas_datatype_bf16_r,
+                  N,
+                  out_ptr,
+                  rocblas_datatype_bf16_r,
+                  N,
+                  rocblas_datatype_f32_r,
+                  rocblas_gemm_algo_standard,
+                  0,
+                  0);
+              break;
+            }
+            default:
+              throw std::runtime_error(
+                  "Unsupported dtype for non-uniform batched matmul on ROCm");
+          }
+        });
+      }
+    } else {
+      // Use naive GEMM for each batch when rocBLAS is not available
+      // This is less efficient but provides correctness
+      for (int64_t batch = 0; batch < batch_count; ++batch) {
+        int64_t a_offset = 0, b_offset = 0;
+        int64_t batch_idx = batch;
+        for (int i = batch_shape.size() - 1; i >= 0; --i) {
+          int64_t idx = batch_idx % batch_shape[i];
+          batch_idx /= batch_shape[i];
+          a_offset += idx * a_batch_strides[i];
+          b_offset += idx * b_batch_strides[i];
+        }
+
+        // Use naive GEMM with explicit offsets
+        rocm::naive_gemm_with_offset(
+            encoder,
+            a,
+            b,
+            out,
+            M,
+            N,
+            K,
+            a_transposed,
+            lda,
+            a_offset,
+            b_transposed,
+            ldb,
+            b_offset,
+            batch * M * N,
+            alpha,
+            beta);
+      }
     }
   }
 }
@@ -553,8 +959,12 @@ void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto [a_transposed, lda, a] = check_transpose(encoder, s, a_pre);
   auto [b_transposed, ldb, b] = check_transpose(encoder, s, b_pre);
 
-  // Copy C into out first, then do GEMM with beta
-  copy_gpu(c, out, CopyType::General, s);
+  // Copy C into out only when beta uses it.
+  if (beta_ != 0.0f) {
+    copy_gpu(c, out, CopyType::General, s);
+  } else {
+    out.set_data(allocator::malloc(out.nbytes()));
+  }
 
   // Check if rocBLAS is available
   if (encoder.device().is_rocblas_available()) {
@@ -632,97 +1042,24 @@ void GatherMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     return;
   }
 
-  // Check if rocBLAS is available
-  bool use_rocblas = encoder.device().is_rocblas_available();
-
-  // Fallback: loop over batches with individual GEMMs
-  int batch_size = lhs_indices.size();
-
-  // Get indices on CPU (this is not optimal but provides correctness)
-  std::vector<uint32_t> lhs_idx(batch_size);
-  std::vector<uint32_t> rhs_idx(batch_size);
-
-  // Synchronize to get indices
-  hipDeviceSynchronize();
-
-  if (lhs_indices.dtype() == uint32) {
-    std::memcpy(
-        lhs_idx.data(),
-        lhs_indices.data<uint32_t>(),
-        batch_size * sizeof(uint32_t));
-  }
-  if (rhs_indices.dtype() == uint32) {
-    std::memcpy(
-        rhs_idx.data(),
-        rhs_indices.data<uint32_t>(),
-        batch_size * sizeof(uint32_t));
-  }
-
-  if (use_rocblas) {
-    for (int i = 0; i < batch_size; ++i) {
-      int64_t a_offset = lhs_idx[i] * M * K;
-      int64_t b_offset = rhs_idx[i] * K * N;
-      int64_t out_offset = i * M * N;
-
-      encoder.launch_kernel([&, a_offset, b_offset, out_offset](
-                                hipStream_t stream) {
-        auto& device = encoder.device();
-        rocblas_handle handle = device.get_rocblas_handle();
-        rocblas_set_stream(handle, stream);
-
-        rocblas_operation trans_a =
-            transposed_b ? rocblas_operation_none : rocblas_operation_transpose;
-        rocblas_operation trans_b =
-            transposed_a ? rocblas_operation_none : rocblas_operation_transpose;
-
-        float alpha = 1.0f, beta = 0.0f;
-
-        if (a.dtype() == float32) {
-          rocblas_sgemm(
-              handle,
-              trans_a,
-              trans_b,
-              N,
-              M,
-              K,
-              &alpha,
-              b_.data<float>() + b_offset,
-              transposed_b ? K : N,
-              a_.data<float>() + a_offset,
-              transposed_a ? M : K,
-              &beta,
-              out.data<float>() + out_offset,
-              N);
-        }
-      });
-    }
-  } else {
-    // Use naive GEMM for each batch
-    for (int i = 0; i < batch_size; ++i) {
-      int64_t a_offset = lhs_idx[i] * M * K;
-      int64_t b_offset = rhs_idx[i] * K * N;
-      int64_t out_offset = i * M * N;
-
-      // Use naive GEMM with explicit offsets
-      rocm::naive_gemm_with_offset(
-          encoder,
-          a_,
-          b_,
-          out,
-          M,
-          N,
-          K,
-          transposed_a,
-          lda,
-          a_offset,
-          transposed_b,
-          ldb,
-          b_offset,
-          out_offset,
-          1.0f,
-          0.0f);
-    }
-  }
+  // Keep gather indices on device and resolve per-batch matrix offsets inside
+  // the kernel to avoid host synchronization.
+  rocm::naive_gemm_gather(
+      encoder,
+      a_,
+      b_,
+      lhs_indices,
+      rhs_indices,
+      out,
+      M,
+      N,
+      K,
+      transposed_a,
+      lda,
+      transposed_b,
+      ldb,
+      1.0f,
+      0.0f);
 }
 
 } // namespace mlx::core

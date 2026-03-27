@@ -16,7 +16,7 @@ namespace mlx::core::rocm {
 namespace {
 
 // Can be tuned with MLX_MAX_OPS_PER_BUFFER
-constexpr int default_max_ops_per_buffer = 20;
+constexpr int default_max_ops_per_buffer = 2000;
 
 } // namespace
 
@@ -199,6 +199,13 @@ void Device::make_current() {
   }
 }
 
+void Device::set_rocblas_stream(hipStream_t stream) {
+  if (rocblas_stream_ != stream) {
+    rocblas_set_stream(get_rocblas_handle(), stream);
+    rocblas_stream_ = stream;
+  }
+}
+
 CommandEncoder& Device::get_command_encoder(Stream s) {
   auto it = encoders_.find(s.index);
   if (it == encoders_.end()) {
@@ -213,6 +220,14 @@ CommandEncoder::CommandEncoder(Device& d)
     : device_(d), stream_(d), worker_(std::make_unique<Worker>()) {}
 
 CommandEncoder::~CommandEncoder() = default;
+
+void CommandEncoder::add_temporary(const array& arr) {
+  auto data = arr.data_shared_ptr();
+  const array::Data* ptr = data.get();
+  if (temporary_ptrs_.insert(ptr).second) {
+    temporaries_.push_back(std::move(data));
+  }
+}
 
 void CommandEncoder::add_completed_handler(std::function<void()> task) {
   worker_->add_task(std::move(task));
@@ -236,6 +251,7 @@ void CommandEncoder::commit() {
   if (!temporaries_.empty()) {
     add_completed_handler([temporaries = std::move(temporaries_)]() {});
   }
+  temporary_ptrs_.clear();
   node_count_ = 0;
 
   // Put completion handlers in a batch.
@@ -253,6 +269,19 @@ void CommandEncoder::synchronize() {
 
 Device& device(mlx::core::Device device) {
   static std::unordered_map<int, Device> devices;
+  static bool flags_set = false;
+  if (!flags_set) {
+    flags_set = true;
+    // Set blocking sync for all devices to reduce CPU usage
+    int device_count = 0;
+    hipGetDeviceCount(&device_count);
+    for (int i = 0; i < device_count; i++) {
+      hipSetDevice(i);
+      hipSetDeviceFlags(hipDeviceScheduleBlockingSync);
+    }
+    // Restore default device
+    hipSetDevice(0);
+  }
   auto it = devices.find(device.index);
   if (it == devices.end()) {
     it = devices.try_emplace(device.index, device.index).first;

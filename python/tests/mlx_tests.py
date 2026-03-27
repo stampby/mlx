@@ -16,6 +16,23 @@ import mlx.core as mx
 import numpy as np
 
 
+def _get_backend_skip_tests(device):
+    if not (device == mx.gpu and not mx.metal.is_available()):
+        return set(), None
+
+    if mx.cuda.is_available():
+        from cuda_skip import cuda_skip
+
+        return cuda_skip, "CUDA"
+
+    if mx.rocm.is_available():
+        from rocm_skip import rocm_skip
+
+        return rocm_skip, "ROCm"
+
+    return set(), None
+
+
 class MLXTestRunner(unittest.TestProgram):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -24,26 +41,13 @@ class MLXTestRunner(unittest.TestProgram):
         super().createTests(*args, **kwargs)
 
         # Check if we're running on a non-Metal GPU backend (CUDA or ROCm)
-        device = os.getenv("DEVICE", None)
-        if device is not None:
-            device = getattr(mx, device)
+        device_name = os.getenv("DEVICE", None)
+        if device_name is not None:
+            device = getattr(mx, device_name)
         else:
             device = mx.default_device()
 
-        if not (device == mx.gpu and not mx.metal.is_available()):
-            return
-
-        # Determine which skip list to use based on available backend
-        skip_tests = set()
-
-        if mx.cuda.is_available():
-            from cuda_skip import cuda_skip
-
-            skip_tests = cuda_skip
-        elif mx.rocm.is_available():
-            from rocm_skip import rocm_skip
-
-            skip_tests = rocm_skip
+        skip_tests, _ = _get_backend_skip_tests(device)
 
         if not skip_tests:
             return
@@ -72,9 +76,19 @@ class MLXTestCase(unittest.TestCase):
 
     def setUp(self):
         self.default = mx.default_device()
-        device = os.getenv("DEVICE", None)
-        if device is not None:
-            device = getattr(mx, device)
+
+        device_name = os.getenv("DEVICE", None)
+        if device_name is not None:
+            device = getattr(mx, device_name)
+        else:
+            device = self.default
+
+        skip_tests, backend = _get_backend_skip_tests(device)
+        test_id = f"{self.__class__.__name__}.{self._testMethodName}"
+        if test_id in skip_tests:
+            self.skipTest(f"Skipped on {backend} backend")
+
+        if device_name is not None:
             mx.set_default_device(device)
 
     def tearDown(self):

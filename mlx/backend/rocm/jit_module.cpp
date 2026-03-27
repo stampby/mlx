@@ -150,6 +150,29 @@ const std::filesystem::path& hsaco_cache_dir() {
   return cache;
 }
 
+// Get the path for HSACO file, splitting long names into nested directories.
+// This mirrors the CUDA backend approach to handle long kernel names that
+// would otherwise exceed filesystem filename limits (typically 255 chars).
+std::filesystem::path get_hsaco_path(
+    const std::filesystem::path& cache_dir,
+    const std::string& module_name,
+    const std::string& extension) {
+  constexpr int max_file_name_length = 245;
+  if (module_name.size() <= max_file_name_length) {
+    return cache_dir / (module_name + extension);
+  }
+
+  auto hsaco_path = cache_dir;
+  int offset = 0;
+  while (module_name.size() - offset > max_file_name_length) {
+    hsaco_path /= module_name.substr(offset, max_file_name_length);
+    offset += max_file_name_length;
+  }
+  hsaco_path /= module_name.substr(offset) + extension;
+
+  return hsaco_path;
+}
+
 // Try to read the cached |hsaco| and |hsaco_kernels| from |cache_dir|.
 bool read_cached_hsaco(
     const std::filesystem::path& cache_dir,
@@ -160,7 +183,7 @@ bool read_cached_hsaco(
     return false;
   }
 
-  auto hsaco_path = cache_dir / (module_name + ".hsaco");
+  auto hsaco_path = get_hsaco_path(cache_dir, module_name, ".hsaco");
   std::error_code error;
   auto hsaco_size = std::filesystem::file_size(hsaco_path, error);
   if (error) {
@@ -173,7 +196,8 @@ bool read_cached_hsaco(
   hsaco.resize(hsaco_size);
   hsaco_file.read(hsaco.data(), hsaco_size);
 
-  std::ifstream txt_file(cache_dir / (module_name + ".txt"), std::ios::binary);
+  auto txt_path = get_hsaco_path(cache_dir, module_name, ".txt");
+  std::ifstream txt_file(txt_path, std::ios::binary);
   std::string line;
   while (std::getline(txt_file, line)) {
     auto tab = line.find('\t');
@@ -195,17 +219,28 @@ void write_cached_hsaco(
     return;
   }
 
-  std::ofstream hsaco_file(
-      cache_dir / (module_name + ".hsaco"), std::ios::binary);
+  auto hsaco_path = get_hsaco_path(cache_dir, module_name, ".hsaco");
+
+  // Create parent directories if they don't exist (for long module names)
+  std::error_code error;
+  std::filesystem::create_directories(hsaco_path.parent_path(), error);
+  if (error) {
+    return;
+  }
+
+  std::ofstream hsaco_file(hsaco_path, std::ios::binary);
   if (!hsaco.empty()) {
     hsaco_file.write(&hsaco.front(), hsaco.size());
   }
-  std::ofstream txt_file(cache_dir / (module_name + ".txt"), std::ios::binary);
+
+  auto txt_path = get_hsaco_path(cache_dir, module_name, ".txt");
+  std::ofstream txt_file(txt_path, std::ios::binary);
   for (const auto& [name, mangled] : hsaco_kernels) {
     txt_file << name << "\t" << mangled << std::endl;
   }
 
-  std::ofstream source_file(cache_dir / (module_name + ".hip"));
+  auto source_path = get_hsaco_path(cache_dir, module_name, ".hip");
+  std::ofstream source_file(source_path);
   source_file << source_code;
 }
 
@@ -227,14 +262,13 @@ void compile(
     std::string& hsaco,
     std::vector<std::pair<std::string, std::string>>& hsaco_kernels) {
   // Create the program
+  // Use a hash of the module name to avoid "File name too long" errors
+  // from hiprtc creating temporary files with the program name.
+  auto program_name = "kernel_" +
+      std::to_string(std::hash<std::string>{}(module_name)) + ".hip";
   hiprtcProgram prog;
   CHECK_HIPRTC_ERROR(hiprtcCreateProgram(
-      &prog,
-      source.c_str(),
-      (module_name + ".hip").c_str(),
-      0,
-      nullptr,
-      nullptr));
+      &prog, source.c_str(), program_name.c_str(), 0, nullptr, nullptr));
 
   std::unique_ptr<hiprtcProgram, void (*)(hiprtcProgram*)> prog_freer(
       &prog,

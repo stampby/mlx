@@ -18,64 +18,44 @@ using namespace nb::literals;
 
 class PyKeySequence {
  public:
-  explicit PyKeySequence(uint64_t seed) : seed_(seed), initialized_(false) {
-    // Create empty state list - will be populated on first use
+  PyKeySequence() {
+    // Destroy state before the python interpreter exits.
+    auto atexit = nb::module_::import_("atexit");
+    atexit.attr("register")(nb::cpp_function([this]() { state_.reset(); }));
   }
 
   void seed(uint64_t seed) {
-    ensure_initialized();
-    state_[0] = mx::random::key(seed);
+    state()[0] = mx::random::key(seed);
   }
 
   mx::array next() {
-    ensure_initialized();
-    auto out = mx::random::split(nb::cast<mx::array>(state_[0]));
-    state_[0] = out.first;
+    auto out = mx::random::split(nb::cast<mx::array>(state()[0]));
+    state()[0] = out.first;
     return out.second;
   }
 
   nb::list& state() {
-    // Return the list reference - it may be empty if not initialized
-    // This allows mx.random.state to exist as an attribute
-    return state_;
-  }
-
-  void ensure_initialized() {
-    if (!initialized_) {
-      // Clear and repopulate the list
-      while (nb::len(state_) > 0) {
-        state_.attr("pop")();
-      }
-      state_.append(mx::random::key(seed_));
-      initialized_ = true;
+    if (!state_) {
+      static auto time_seed = []() {
+        auto now = std::chrono::system_clock::now();
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   now.time_since_epoch())
+            .count();
+      }();
+      state_ = nb::list();
+      state_->append(mx::random::key(time_seed));
     }
-  }
-
-  void release() {
-    if (initialized_) {
-      nb::gil_scoped_acquire gil;
-      state_.release().dec_ref();
-    }
+    return *state_;
   }
 
  private:
-  uint64_t seed_;
-  bool initialized_;
-  nb::list state_;
+  std::optional<nb::list> state_;
 };
 
 PyKeySequence& default_key() {
-  auto get_current_time_seed = []() {
-    auto now = std::chrono::system_clock::now();
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-               now.time_since_epoch())
-        .count();
-  };
-  static PyKeySequence* ks = nullptr;
-  if (!ks) {
-    ks = new PyKeySequence(get_current_time_seed());
-  }
-  return *ks;
+  // Each thread has its own random key to avoid race condition.
+  static thread_local PyKeySequence ks;
+  return ks;
 }
 
 void init_random(nb::module_& parent_module) {
@@ -83,12 +63,16 @@ void init_random(nb::module_& parent_module) {
       "random",
       "mlx.core.random: functionality related to random number generation");
 
-  // Set the 'state' attribute to the default key's state list
-  // This is accessed by mx.compile for random state tracking
-  // We set it here but the actual GPU allocation happens lazily in
-  // PyKeySequence
-  m.attr("state") = default_key().state();
-
+  m.def("__getattr__", [&](nb::handle key) -> nb::object {
+    // Create random.state lazily to avoid initializing device during import.
+    if (nb::isinstance<nb::str>(key) && nb::cast<std::string>(key) == "state") {
+      return default_key().state();
+    }
+    return nb::steal(PyErr_Format(
+        PyExc_AttributeError,
+        "Module 'random' has no attribute %R",
+        key.ptr()));
+  });
   m.def(
       "seed",
       [](uint64_t seed) { default_key().seed(seed); },
@@ -537,8 +521,4 @@ void init_random(nb::module_& parent_module) {
             array:
               The generated random permutation or randomly permuted input array.
       )pbdoc");
-
-  // Register static Python object cleanup before the interpreter exits
-  auto atexit = nb::module_::import_("atexit");
-  atexit.attr("register")(nb::cpp_function([]() { default_key().release(); }));
 }

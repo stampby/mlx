@@ -37,23 +37,63 @@ static bool rocm_available() {
 
 // Check if managed memory is supported on this device
 static bool managed_memory_supported() {
-  static int supported = -1;
-  if (supported < 0) {
+  // Always return false to force the use of hipHostMalloc (GTT RAM).
+  // hipMallocManaged uses HMM, which causes implicit page migrations and
+  // significant memory copying between host and device on access.
+  // Using hipHostMalloc maps pinned host memory directly to the GPU's address space.
+  return false;
+}
+
+static bool is_integrated() {
+  static int integrated = -1;
+  if (integrated < 0) {
     if (!rocm_available()) {
-      supported = 0;
+      integrated = 0;
     } else {
-      // Try a small test allocation to see if managed memory works
-      void* test_ptr = nullptr;
-      hipError_t err = hipMallocManaged(&test_ptr, 64);
-      if (err == hipSuccess && test_ptr != nullptr) {
-        (void)hipFree(test_ptr);
-        supported = 1;
-      } else {
-        supported = 0;
-      }
+      int device = 0;
+      (void)hipGetDevice(&device);
+      hipDeviceProp_t props;
+      hipError_t err = hipGetDeviceProperties(&props, device);
+      integrated = (err == hipSuccess && props.integrated == 1) ? 1 : 0;
     }
   }
-  return supported == 1;
+  return integrated == 1;
+}
+
+inline void* rocm_unified_malloc(size_t size, bool& is_managed) {
+  void* data = nullptr;
+  hipError_t err;
+  if (is_integrated()) {
+    err = hipExtMallocWithFlags(&data, size, hipDeviceMallocFinegrained);
+    is_managed = true; // Use is_managed=true to signify hipFree should be used
+  } else if (managed_memory_supported()) {
+    err = hipMallocManaged(&data, size);
+    is_managed = true;
+    if (err == hipSuccess) {
+      int device_count = 0;
+      (void)hipGetDeviceCount(&device_count);
+      for (int i = 0; i < device_count; ++i) {
+        (void)hipMemAdvise(data, size, hipMemAdviseSetAccessedBy, i);
+      }
+    }
+  } else {
+    err = hipHostMalloc(&data, size, hipHostMallocDefault);
+    is_managed = false;
+  }
+  if (err != hipSuccess) {
+    std::ostringstream oss;
+    oss << "hipMalloc (unified) failed: " << hipGetErrorString(err) << ".";
+    throw std::runtime_error(oss.str());
+  }
+  return data;
+}
+
+inline void rocm_unified_free(void* data, bool is_managed) {
+  if (is_managed) {
+    (void)hipFree(data);
+  } else {
+    (void)hipHostFree(data);
+  }
 }
 
 SmallSizePool::SmallSizePool()
@@ -67,27 +107,9 @@ SmallSizePool::SmallSizePool()
 
   next_free_ = buffer_;
 
-  // Try managed memory first, fall back to host-pinned memory
-  // Host-pinned memory is accessible from both CPU and GPU
-  hipError_t err;
-  if (managed_memory_supported()) {
-    err = hipMallocManaged(&data_, small_pool_size);
-    if (err == hipSuccess) {
-      // Hint that this memory will be accessed by all devices
-      int device_count = 0;
-      (void)hipGetDeviceCount(&device_count);
-      for (int i = 0; i < device_count; ++i) {
-        (void)hipMemAdvise(
-            data_, small_pool_size, hipMemAdviseSetAccessedBy, i);
-      }
-    }
-  } else {
-    // Use host-pinned memory that's accessible from GPU
-    // hipHostMallocDefault makes memory accessible from device
-    err = hipHostMalloc(&data_, small_pool_size, hipHostMallocDefault);
-  }
-
-  if (err != hipSuccess) {
+  try {
+    data_ = rocm_unified_malloc(small_pool_size, is_managed_);
+  } catch (...) {
     delete[] buffer_;
     buffer_ = nullptr;
     next_free_ = nullptr;
@@ -105,11 +127,7 @@ SmallSizePool::SmallSizePool()
 
 SmallSizePool::~SmallSizePool() {
   if (data_) {
-    if (managed_memory_supported()) {
-      (void)hipFree(data_);
-    } else {
-      (void)hipHostFree(data_);
-    }
+    rocm_unified_free(data_, is_managed_);
   }
   if (buffer_) {
     delete[] buffer_;
@@ -125,7 +143,8 @@ RocmBuffer* SmallSizePool::malloc() {
   next_free_ = next_free_->next;
   b->buf.data = static_cast<char*>(data_) + i * small_block_size;
   b->buf.size = small_block_size;
-  b->buf.is_managed = managed_memory_supported();
+  b->buf.is_managed = is_managed_;
+  b->buf.device = -1;
   return &b->buf;
 }
 
@@ -199,32 +218,27 @@ Buffer RocmAllocator::malloc(size_t size) {
     }
     lock.unlock();
     if (!buf) {
-      buf = new RocmBuffer{nullptr, size, false};
-      hipError_t err;
-
-      // Try managed memory first, fall back to host-pinned memory
-      if (managed_memory_supported()) {
-        err = hipMallocManaged(&buf->data, size);
-        buf->is_managed = true;
-        if (err == hipSuccess) {
-          // Hint that this memory will be accessed by all devices
-          int device_count = 0;
-          (void)hipGetDeviceCount(&device_count);
-          for (int i = 0; i < device_count; ++i) {
-            (void)hipMemAdvise(buf->data, size, hipMemAdviseSetAccessedBy, i);
-          }
+      if (is_integrated()) {
+        buf = new RocmBuffer{nullptr, size, false, -1};
+        hipError_t err = hipExtMallocWithFlags(&buf->data, size, hipDeviceMallocFinegrained);
+        if (err != hipSuccess) {
+          delete buf;
+          std::ostringstream oss;
+          oss << "hipExtMallocWithFlags failed: " << hipGetErrorString(err) << ".";
+          throw std::runtime_error(oss.str());
         }
       } else {
-        // Use host-pinned memory that's accessible from GPU
-        err = hipHostMalloc(&buf->data, size, hipHostMallocDefault);
-        buf->is_managed = false;
-      }
+        int device = 0;
+        hipGetDevice(&device);
+        buf = new RocmBuffer{nullptr, size, false, device};
+        hipError_t err = hipMalloc(&buf->data, size);
 
-      if (err != hipSuccess) {
-        delete buf;
-        std::ostringstream oss;
-        oss << "hipMalloc failed: " << hipGetErrorString(err) << ".";
-        throw std::runtime_error(oss.str());
+        if (err != hipSuccess) {
+          delete buf;
+          std::ostringstream oss;
+          oss << "hipMalloc failed: " << hipGetErrorString(err) << ".";
+          throw std::runtime_error(oss.str());
+        }
       }
     }
     lock.lock();
@@ -267,13 +281,38 @@ void RocmAllocator::rocm_free(RocmBuffer* buf) {
   if (scalar_pool_.in_pool(buf)) {
     scalar_pool_.free(buf);
   } else {
-    if (buf->is_managed) {
-      (void)hipFree(buf->data);
+    if (buf->device == -1) {
+      rocm_unified_free(buf->data, buf->is_managed);
     } else {
-      (void)hipHostFree(buf->data);
+      (void)hipFree(buf->data);
     }
     delete buf;
   }
+}
+
+void RocmAllocator::move_to_unified_memory(RocmBuffer& buf) {
+  if (buf.device == -1) {
+    return;
+  }
+  bool is_managed = false;
+  void* data = rocm_unified_malloc(buf.size, is_managed);
+  
+  // Use default memcpy to sync from VRAM to Host/Managed
+  hipError_t err = hipMemcpy(data, buf.data, buf.size, hipMemcpyDefault);
+  if (err != hipSuccess) {
+    rocm_unified_free(data, is_managed);
+    std::ostringstream oss;
+    oss << "hipMemcpy failed: " << hipGetErrorString(err) << ".";
+    throw std::runtime_error(oss.str());
+  }
+  
+  // Free the VRAM buffer
+  (void)hipFree(buf.data);
+  
+  // Update the buffer to point to the new unified memory
+  buf.data = data;
+  buf.is_managed = is_managed;
+  buf.device = -1;
 }
 
 size_t RocmAllocator::get_active_memory() const {
@@ -334,11 +373,13 @@ void* Buffer::raw_ptr() {
   if (!ptr_) {
     return nullptr;
   }
-  // Synchronize all streams before accessing managed memory from CPU
+  // Synchronize all streams before accessing memory from CPU
   // This ensures all GPU operations have completed
-  // Note: For kernel access, use gpu_ptr() from kernel_utils.hpp instead
   (void)hipDeviceSynchronize();
-  return static_cast<rocm::RocmBuffer*>(ptr_)->data;
+  
+  auto& cbuf = *static_cast<rocm::RocmBuffer*>(ptr_);
+  rocm::allocator().move_to_unified_memory(cbuf);
+  return cbuf.data;
 }
 
 } // namespace allocator
