@@ -305,37 +305,24 @@ void sdpa_vector(
     };
 
     // Dispatch based on dtype, causal, and head dimension
-    if (o.dtype() == float32) {
-      if (do_causal) {
-        if (D == 64) launch_kernel(float(), std::true_type(), std::integral_constant<int, 64>());
-        else if (D == 96) launch_kernel(float(), std::true_type(), std::integral_constant<int, 96>());
-        else if (D == 128) launch_kernel(float(), std::true_type(), std::integral_constant<int, 128>());
-      } else {
-        if (D == 64) launch_kernel(float(), std::false_type(), std::integral_constant<int, 64>());
-        else if (D == 96) launch_kernel(float(), std::false_type(), std::integral_constant<int, 96>());
-        else if (D == 128) launch_kernel(float(), std::false_type(), std::integral_constant<int, 128>());
+    #define SDPA_LAUNCH_CASES(TYPE) \
+      if (do_causal) { \
+        if (D == 64) launch_kernel(TYPE(), std::true_type(), std::integral_constant<int, 64>()); \
+        else if (D == 96) launch_kernel(TYPE(), std::true_type(), std::integral_constant<int, 96>()); \
+        else if (D == 128) launch_kernel(TYPE(), std::true_type(), std::integral_constant<int, 128>()); \
+        else if (D == 256) launch_kernel(TYPE(), std::true_type(), std::integral_constant<int, 256>()); \
+      } else { \
+        if (D == 64) launch_kernel(TYPE(), std::false_type(), std::integral_constant<int, 64>()); \
+        else if (D == 96) launch_kernel(TYPE(), std::false_type(), std::integral_constant<int, 96>()); \
+        else if (D == 128) launch_kernel(TYPE(), std::false_type(), std::integral_constant<int, 128>()); \
+        else if (D == 256) launch_kernel(TYPE(), std::false_type(), std::integral_constant<int, 256>()); \
       }
-    } else if (o.dtype() == float16) {
-      if (do_causal) {
-        if (D == 64) launch_kernel(__half(), std::true_type(), std::integral_constant<int, 64>());
-        else if (D == 96) launch_kernel(__half(), std::true_type(), std::integral_constant<int, 96>());
-        else if (D == 128) launch_kernel(__half(), std::true_type(), std::integral_constant<int, 128>());
-      } else {
-        if (D == 64) launch_kernel(__half(), std::false_type(), std::integral_constant<int, 64>());
-        else if (D == 96) launch_kernel(__half(), std::false_type(), std::integral_constant<int, 96>());
-        else if (D == 128) launch_kernel(__half(), std::false_type(), std::integral_constant<int, 128>());
-      }
-    } else if (o.dtype() == bfloat16) {
-      if (do_causal) {
-        if (D == 64) launch_kernel(hip_bfloat16(), std::true_type(), std::integral_constant<int, 64>());
-        else if (D == 96) launch_kernel(hip_bfloat16(), std::true_type(), std::integral_constant<int, 96>());
-        else if (D == 128) launch_kernel(hip_bfloat16(), std::true_type(), std::integral_constant<int, 128>());
-      } else {
-        if (D == 64) launch_kernel(hip_bfloat16(), std::false_type(), std::integral_constant<int, 64>());
-        else if (D == 96) launch_kernel(hip_bfloat16(), std::false_type(), std::integral_constant<int, 96>());
-        else if (D == 128) launch_kernel(hip_bfloat16(), std::false_type(), std::integral_constant<int, 128>());
-      }
-    }
+
+    if (o.dtype() == float32) { SDPA_LAUNCH_CASES(float) }
+    else if (o.dtype() == float16) { SDPA_LAUNCH_CASES(__half) }
+    else if (o.dtype() == bfloat16) { SDPA_LAUNCH_CASES(hip_bfloat16) }
+
+    #undef SDPA_LAUNCH_CASES
   });
 }
 
