@@ -3047,6 +3047,189 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 }
 
 namespace rocm {
+
+// ======================================================================
+// Prefill-optimized gather QMV: groups batch elements by expert.
+//
+// For sorted rhs_indices, consecutive batch elements hit the same expert.
+// This kernel assigns blockIdx.z to contiguous runs of same-expert batches,
+// so all rows for one expert share weight reads from global memory.
+// Each block handles one column (via warp cooperation) and iterates over
+// all M rows for each batch element in the run.
+//
+// Grid: (num_runs, ceil(N/cols_per_block), max_rows_per_run)
+// Where num_runs = number of contiguous expert runs.
+// ======================================================================
+template <
+    typename T,
+    typename ScaleT,
+    int BITS,
+    int GROUP_SIZE,
+    bool AFFINE,
+    int THREADS_PER_COL>
+__global__ void __launch_bounds__(1024) gather_qmv_prefill_kernel(
+    const T* __restrict__ x,
+    const uint8_t* __restrict__ w,
+    const ScaleT* __restrict__ scales,
+    const ScaleT* __restrict__ biases,
+    const uint32_t* __restrict__ lhs_indices,
+    const uint32_t* __restrict__ rhs_indices,
+    const int* __restrict__ run_starts,   // [num_runs]: start batch idx of each run
+    const int* __restrict__ run_lengths,  // [num_runs]: length of each run
+    T* __restrict__ out,
+    int B,
+    int M,
+    int N,
+    int K,
+    int E,
+    bool has_bias,
+    int64_t x_batch_stride) {
+  const int lane = threadIdx.x;
+  const int warp_idx = threadIdx.y;
+  const int col = blockIdx.y * blockDim.y + warp_idx;
+  const int run_id = blockIdx.z;
+  const int row = blockIdx.x;
+
+  if (row >= M || col >= N) return;
+
+  int run_start = run_starts[run_id];
+  int run_len = run_lengths[run_id];
+
+  // All batches in this run have the same expert
+  uint32_t rhs_idx = rhs_indices[run_start];
+  if (rhs_idx >= static_cast<uint32_t>(E)) return;
+
+  // Weight pointers (same for all batches in run)
+  const int num_groups = (K + GROUP_SIZE - 1) / GROUP_SIZE;
+  const int row_bytes = (K * BITS + 7) / 8;
+  int64_t w_expert_stride = static_cast<int64_t>(N) * row_bytes;
+  int64_t sb_expert_stride = static_cast<int64_t>(N) * num_groups;
+  int64_t col_w_offset = static_cast<int64_t>(col) * row_bytes;
+  int64_t col_sb_offset = static_cast<int64_t>(col) * num_groups;
+
+  const uint8_t* w_row = w + static_cast<int64_t>(rhs_idx) * w_expert_stride + col_w_offset;
+  const ScaleT* scales_row = scales + static_cast<int64_t>(rhs_idx) * sb_expert_stride + col_sb_offset;
+  const ScaleT* biases_row = has_bias
+      ? (biases + static_cast<int64_t>(rhs_idx) * sb_expert_stride + col_sb_offset)
+      : nullptr;
+
+  // Process each batch element in the run
+  for (int r = 0; r < run_len; ++r) {
+    int batch = run_start + r;
+    uint32_t lhs_idx = lhs_indices[batch];
+    const T* x_row = x + static_cast<int64_t>(lhs_idx) * x_batch_stride + static_cast<int64_t>(row) * K;
+
+    float acc = 0.0f;
+
+    for (int g = 0; g < num_groups; ++g) {
+      int k_start = g * GROUP_SIZE;
+      int k_end = min(k_start + GROUP_SIZE, K);
+
+      float scale = load_scale_value<ScaleT, GROUP_SIZE, AFFINE>(scales_row[g]);
+      float bias_val = has_bias ? static_cast<float>(biases_row[g]) : 0.0f;
+
+      if constexpr (AFFINE) {
+        float qx_acc = 0.0f;
+        float x_group_sum = 0.0f;
+
+        if constexpr (BITS == 4) {
+          int k_local = lane * 8;
+          int step = THREADS_PER_COL * 8;
+          for (; k_start + k_local + 7 < k_end; k_local += step) {
+            int k = k_start + k_local;
+            uint32_t w_packed = *reinterpret_cast<const uint32_t*>(&w_row[k / 2]);
+            float w0 = static_cast<float>(w_packed & 0xF);
+            float w1 = static_cast<float>((w_packed >> 4) & 0xF);
+            float w2 = static_cast<float>((w_packed >> 8) & 0xF);
+            float w3 = static_cast<float>((w_packed >> 12) & 0xF);
+            float w4 = static_cast<float>((w_packed >> 16) & 0xF);
+            float w5 = static_cast<float>((w_packed >> 20) & 0xF);
+            float w6 = static_cast<float>((w_packed >> 24) & 0xF);
+            float w7 = static_cast<float>((w_packed >> 28) & 0xF);
+            float x0 = static_cast<float>(x_row[k]);
+            float x1 = static_cast<float>(x_row[k + 1]);
+            float x2 = static_cast<float>(x_row[k + 2]);
+            float x3 = static_cast<float>(x_row[k + 3]);
+            float x4 = static_cast<float>(x_row[k + 4]);
+            float x5 = static_cast<float>(x_row[k + 5]);
+            float x6 = static_cast<float>(x_row[k + 6]);
+            float x7 = static_cast<float>(x_row[k + 7]);
+            qx_acc = fmaf(x0, w0, qx_acc);
+            qx_acc = fmaf(x1, w1, qx_acc);
+            qx_acc = fmaf(x2, w2, qx_acc);
+            qx_acc = fmaf(x3, w3, qx_acc);
+            qx_acc = fmaf(x4, w4, qx_acc);
+            qx_acc = fmaf(x5, w5, qx_acc);
+            qx_acc = fmaf(x6, w6, qx_acc);
+            qx_acc = fmaf(x7, w7, qx_acc);
+            if (has_bias)
+              x_group_sum += x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7;
+          }
+          for (; k_start + k_local < k_end; k_local++) {
+            int k = k_start + k_local;
+            float x_val = static_cast<float>(x_row[k]);
+            uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+            qx_acc = fmaf(x_val, static_cast<float>(quant_val), qx_acc);
+            if (has_bias) x_group_sum += x_val;
+          }
+        } else if constexpr (BITS == 8) {
+          int k_local = lane * 4;
+          int step = THREADS_PER_COL * 4;
+          for (; k_start + k_local + 3 < k_end; k_local += step) {
+            int k = k_start + k_local;
+            uint32_t w_packed = *reinterpret_cast<const uint32_t*>(&w_row[k]);
+            float w0 = static_cast<float>(w_packed & 0xFF);
+            float w1 = static_cast<float>((w_packed >> 8) & 0xFF);
+            float w2 = static_cast<float>((w_packed >> 16) & 0xFF);
+            float w3 = static_cast<float>((w_packed >> 24) & 0xFF);
+            float x0 = static_cast<float>(x_row[k]);
+            float x1 = static_cast<float>(x_row[k + 1]);
+            float x2 = static_cast<float>(x_row[k + 2]);
+            float x3 = static_cast<float>(x_row[k + 3]);
+            qx_acc = fmaf(x0, w0, qx_acc);
+            qx_acc = fmaf(x1, w1, qx_acc);
+            qx_acc = fmaf(x2, w2, qx_acc);
+            qx_acc = fmaf(x3, w3, qx_acc);
+            if (has_bias) x_group_sum += x0 + x1 + x2 + x3;
+          }
+          for (; k_start + k_local < k_end; k_local++) {
+            int k = k_start + k_local;
+            float x_val = static_cast<float>(x_row[k]);
+            float w_val = static_cast<float>(w_row[k]);
+            qx_acc = fmaf(x_val, w_val, qx_acc);
+            if (has_bias) x_group_sum += x_val;
+          }
+        } else {
+          for (int k_local = lane; k_start + k_local < k_end; k_local += THREADS_PER_COL) {
+            int k = k_start + k_local;
+            float x_val = static_cast<float>(x_row[k]);
+            uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+            qx_acc = fmaf(x_val, static_cast<float>(quant_val), qx_acc);
+            if (has_bias) x_group_sum += x_val;
+          }
+        }
+
+        qx_acc = subgroup_reduce_sum_qmm<THREADS_PER_COL>(qx_acc);
+        x_group_sum = subgroup_reduce_sum_qmm<THREADS_PER_COL>(x_group_sum);
+        acc += scale * qx_acc + bias_val * x_group_sum;
+      } else {
+        float qx_acc = 0.0f;
+        for (int k_local = lane; k_start + k_local < k_end; k_local += THREADS_PER_COL) {
+          int k = k_start + k_local;
+          float x_val = static_cast<float>(x_row[k]);
+          uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+          qx_acc = fmaf(x_val, dequantize_value<BITS, false>(quant_val, 1.0f, 0.0f), qx_acc);
+        }
+        acc += scale * subgroup_reduce_sum_qmm<THREADS_PER_COL>(qx_acc);
+      }
+    }
+
+    if (lane == 0) {
+      out[static_cast<int64_t>(batch) * M * N + static_cast<int64_t>(row) * N + col] = static_cast<T>(acc);
+    }
+  }
+}
+
 template <
     typename T,
     typename ScaleT,
@@ -3669,6 +3852,70 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   bool use_fast_gather_qmv = transpose_ && bits_supported_by_fast;
   use_fast_gather_qmv = parse_warp_kernel_env(
       "MLX_ROCM_GATHER_QMV_USE_WARP", use_fast_gather_qmv);
+  // ---- Prefill optimization: group by expert for M>1 with sorted indices ----
+  if (M > 1 && transpose_ && right_sorted_ && E > 0 && batch_ndim == 1 &&
+      mode_ == QuantizationMode::Affine && x.dtype() == bfloat16 &&
+      group_size_ == 64 && (bits_ == 4 || bits_ == 8)) {
+    // Compute contiguous runs of same-expert batches on CPU.
+    const auto* ri_cpu = rhs_indices.data<uint32_t>();
+    std::vector<int> run_starts_vec, run_lengths_vec;
+    run_starts_vec.reserve(E);
+    run_lengths_vec.reserve(E);
+    int run_begin = 0;
+    for (int b = 1; b <= B; ++b) {
+      if (b == B || ri_cpu[b] != ri_cpu[run_begin]) {
+        run_starts_vec.push_back(run_begin);
+        run_lengths_vec.push_back(b - run_begin);
+        run_begin = b;
+      }
+    }
+    int num_runs = static_cast<int>(run_starts_vec.size());
+
+    // Upload run info to GPU
+    array run_starts_arr({num_runs}, int32, nullptr, {});
+    array run_lengths_arr({num_runs}, int32, nullptr, {});
+    run_starts_arr.set_data(allocator::malloc(run_starts_arr.nbytes()));
+    run_lengths_arr.set_data(allocator::malloc(run_lengths_arr.nbytes()));
+    std::memcpy(run_starts_arr.data<int>(), run_starts_vec.data(), num_runs * sizeof(int));
+    std::memcpy(run_lengths_arr.data<int>(), run_lengths_vec.data(), num_runs * sizeof(int));
+    enc.set_input_array(run_starts_arr);
+    enc.set_input_array(run_lengths_arr);
+
+    int fast_threads_per_col_pf = select_qmv_threads_per_col(K, N, bits_, num_runs);
+    int fast_cols_per_block_pf = select_qmv_cols_per_block(K, N, bits_);
+    int max_cpb = rocm::kMaxThreadsPerBlock / fast_threads_per_col_pf;
+    while (fast_cols_per_block_pf > max_cpb) fast_cols_per_block_pf /= 2;
+    while (fast_cols_per_block_pf > 1 && (N % fast_cols_per_block_pf) != 0 && fast_cols_per_block_pf > 8)
+      fast_cols_per_block_pf /= 2;
+
+    dim3 pf_block(fast_threads_per_col_pf, fast_cols_per_block_pf);
+    dim3 pf_grid(M, (N + fast_cols_per_block_pf - 1) / fast_cols_per_block_pf, num_runs);
+
+    int64_t x_bs = (x_batch_count == 1) ? 0 : static_cast<int64_t>(M) * K;
+
+    enc.launch_kernel([&](hipStream_t stream) {
+      auto launch_pf = [&](auto bits_tag) {
+        constexpr int BITS = decltype(bits_tag)::value;
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_prefill_kernel<hip_bfloat16, hip_bfloat16, BITS, 64, true, 16>),
+            pf_grid, pf_block, 0, stream,
+            gpu_ptr<const hip_bfloat16>(x),
+            gpu_ptr<const uint8_t>(w),
+            gpu_ptr<const hip_bfloat16>(scales),
+            has_bias ? gpu_ptr<const hip_bfloat16>(*biases) : nullptr,
+            gpu_ptr<const uint32_t>(lhs_indices),
+            gpu_ptr<const uint32_t>(rhs_indices),
+            gpu_ptr<const int>(run_starts_arr),
+            gpu_ptr<const int>(run_lengths_arr),
+            gpu_ptr<hip_bfloat16>(out),
+            B, M, N, K, E, has_bias, x_bs);
+      };
+      if (bits_ == 4) launch_pf(std::integral_constant<int, 4>{});
+      else launch_pf(std::integral_constant<int, 8>{});
+    });
+    return;
+  }
+
   const void *x_ptr = gpu_ptr<void>(x), *w_ptr = gpu_ptr<void>(w),
              *scales_ptr = gpu_ptr<void>(scales),
              *biases_ptr = has_bias ? gpu_ptr<void>(*biases) : nullptr;
