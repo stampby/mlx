@@ -78,10 +78,12 @@ inline void* rocm_unified_malloc(size_t size, bool& is_managed) {
   hipError_t err;
   if (is_integrated()) {
     // Integrated GPU (APU): CPU and GPU share physical memory.
-    // hipExtMallocWithFlags gives fine-grained coherent access with best GPU
-    // bandwidth. Falls back to hipMallocManaged if unavailable.
+    // hipExtMallocWithFlags gives fine-grained coherent access — no page
+    // faults or HMM migration overhead, and the GPU can access it directly
+    // without TLB shootdowns. Falls back to hipMallocManaged if unavailable.
     err = hipExtMallocWithFlags(&data, size, hipDeviceMallocFinegrained);
     if (err != hipSuccess) {
+      // Fallback: hipMallocManaged with HMM
       err = hipMallocManaged(&data, size);
     }
     is_managed = true;
@@ -195,7 +197,6 @@ RocmAllocator::RocmAllocator()
     memory_limit_ = total * 0.8;
     max_pool_size_ = memory_limit_;
   }
-
 }
 
 Buffer RocmAllocator::malloc(size_t size) {

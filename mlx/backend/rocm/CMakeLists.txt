@@ -10,6 +10,7 @@ find_package(rocblas REQUIRED CONFIG)
 find_package(rocthrust REQUIRED CONFIG)
 find_package(rocprim REQUIRED CONFIG)
 find_package(hiprand REQUIRED CONFIG)
+find_package(rocwmma REQUIRED CONFIG)
 
 # Ensure HIP architectures are set - respect user-provided value from command
 # line The user can set this via -DCMAKE_HIP_ARCHITECTURES=gfx1011
@@ -41,6 +42,8 @@ get_target_property(ROCTHRUST_INCLUDES roc::rocthrust
                     INTERFACE_INCLUDE_DIRECTORIES)
 get_target_property(ROCPRIM_INCLUDES roc::rocprim INTERFACE_INCLUDE_DIRECTORIES)
 get_target_property(HIPRAND_INCLUDES hip::hiprand INTERFACE_INCLUDE_DIRECTORIES)
+get_target_property(ROCWMMA_INCLUDES roc::rocwmma
+                    INTERFACE_INCLUDE_DIRECTORIES)
 
 # Find GCC installation for C++ standard library headers ROCm's clang needs to
 # know where to find libstdc++ headers
@@ -99,6 +102,11 @@ foreach(inc ${ROCPRIM_INCLUDES})
   endif()
 endforeach()
 foreach(inc ${HIPRAND_INCLUDES})
+  if(inc)
+    list(APPEND HIP_INCLUDE_FLAGS "-I${inc}")
+  endif()
+endforeach()
+foreach(inc ${ROCWMMA_INCLUDES})
   if(inc)
     list(APPEND HIP_INCLUDE_FLAGS "-I${inc}")
   endif()

@@ -12,6 +12,21 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <rocblas/rocblas.h>
+// rocWMMA is only supported on CDNA (gfx9xx) and RDNA 3+ (gfx11xx, gfx12xx).
+// Guard the include so it doesn't trigger static_assert on RDNA 1/2 (gfx10xx).
+// During host compilation __HIP_DEVICE_COMPILE__ is 0 so rocwmma defines
+// ROCWMMA_ARCH_HOST and compiles fine.  During device compilation for
+// unsupported architectures like gfx1030 the header would static_assert.
+#if !defined(__HIP_DEVICE_COMPILE__) || !__HIP_DEVICE_COMPILE__ || \
+    defined(__gfx908__) || defined(__gfx90a__) || defined(__gfx942__) || defined(__gfx950__) || \
+    defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || \
+    defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__) || defined(__gfx1153__) || \
+    defined(__gfx1200__) || defined(__gfx1201__)
+#define ROCM_HAS_WMMA 1
+#include <rocwmma/rocwmma.hpp>
+#else
+#define ROCM_HAS_WMMA 0
+#endif
 #include <algorithm>
 #include <atomic>
 #include <cstring>
@@ -3777,6 +3792,197 @@ __global__ void gather_qmv_kernel(
   }
   out[batch * M * N + row * N + col] = (T)acc;
 }
+
+// ======================================================================
+// WMMA-accelerated gather QMV prefill kernel using rocwmma 16x16x16 tiles.
+//
+// Each wavefront (32 lanes on RDNA 3.5 / gfx1151) computes one 16x16
+// output tile.  Weights are dequantized from 4-bit packed format into
+// bf16 in shared memory, then loaded into rocwmma fragments for the
+// matrix multiply-accumulate.  Accumulation is in float32; the final
+// result is converted back to bf16 on store.
+//
+// Grid:  (ceil(M/16), ceil(N/16), num_runs)
+// Block: (32, 1, 1)   -- one wave32 per 16x16 output tile
+//
+// On architectures without WMMA support (RDNA 1/2) the kernel body is
+// an empty stub; dispatch checks prevent it from being launched there.
+// ======================================================================
+template <typename T, typename ScaleT, int BITS, int GROUP_SIZE, bool AFFINE>
+__global__ void __launch_bounds__(32) gather_qmv_wmma_prefill_kernel(
+    const T* __restrict__ x,
+    const uint8_t* __restrict__ w,
+    const ScaleT* __restrict__ scales,
+    const ScaleT* __restrict__ biases,
+    const uint32_t* __restrict__ lhs_indices,
+    const uint32_t* __restrict__ rhs_indices,
+    const int* __restrict__ run_starts,
+    const int* __restrict__ run_lengths,
+    T* __restrict__ out,
+    int B, int M, int N, int K, int E,
+    bool has_bias, int64_t x_batch_stride) {
+
+#if ROCM_HAS_WMMA
+
+  static_assert(BITS == 4, "WMMA prefill kernel only supports 4-bit quantized weights");
+  static_assert(AFFINE, "WMMA prefill kernel only supports affine quantization");
+
+  constexpr int WMMA_M = 16;
+  constexpr int WMMA_N = 16;
+  constexpr int WMMA_K = 16;
+
+  // Tile coordinates in the output matrix
+  const int tile_row = blockIdx.x * WMMA_M;  // starting row of this 16x16 tile
+  const int tile_col = blockIdx.y * WMMA_N;  // starting col of this 16x16 tile
+  const int run_id   = blockIdx.z;
+
+  // Bounds check -- the dispatch guarantees M and N are multiples of 16,
+  // but guard anyway for safety.
+  if (tile_row >= M || tile_col >= N) return;
+
+  const int lane = threadIdx.x;  // 0..31
+
+  // Run info
+  const int run_start = run_starts[run_id];
+  const int run_len   = run_lengths[run_id];
+
+  const uint32_t rhs_idx = rhs_indices[run_start];
+  if (rhs_idx >= static_cast<uint32_t>(E)) return;
+
+  // Weight layout constants
+  const int num_groups = (K + GROUP_SIZE - 1) / GROUP_SIZE;
+  const int row_bytes  = (K * BITS + 7) / 8;  // bytes per weight row (one output col)
+  const int64_t w_expert_stride  = static_cast<int64_t>(N) * row_bytes;
+  const int64_t sb_expert_stride = static_cast<int64_t>(N) * num_groups;
+
+  // Base pointers for this expert
+  const uint8_t* w_expert  = w      + static_cast<int64_t>(rhs_idx) * w_expert_stride;
+  const ScaleT*  s_expert  = scales + static_cast<int64_t>(rhs_idx) * sb_expert_stride;
+  const ScaleT*  b_expert  = has_bias
+      ? (biases + static_cast<int64_t>(rhs_idx) * sb_expert_stride)
+      : nullptr;
+
+  // Shared memory for dequantized weight tile [WMMA_K x WMMA_N] in row-major
+  // and for x tile [WMMA_M x WMMA_K] in row-major.
+  // Total: (16*16 + 16*16) * sizeof(hip_bfloat16) = 1024 bytes
+  __shared__ hip_bfloat16 smem_w[WMMA_K * WMMA_N];  // [16][16] row-major
+  __shared__ hip_bfloat16 smem_x[WMMA_M * WMMA_K];  // [16][16] row-major
+
+  // Fragment types for bf16 input, f32 accumulation
+  using frag_a   = rocwmma::fragment<rocwmma::matrix_a,   WMMA_M, WMMA_N, WMMA_K, hip_bfloat16, rocwmma::row_major>;
+  using frag_b   = rocwmma::fragment<rocwmma::matrix_b,   WMMA_M, WMMA_N, WMMA_K, hip_bfloat16, rocwmma::row_major>;
+  using frag_acc = rocwmma::fragment<rocwmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float>;
+
+  // Process each batch element in the run
+  for (int r = 0; r < run_len; ++r) {
+    const int batch = run_start + r;
+    const uint32_t lhs_idx = lhs_indices[batch];
+    const T* x_base = x + static_cast<int64_t>(lhs_idx) * x_batch_stride
+                        + static_cast<int64_t>(tile_row) * K;
+
+    // Zero the accumulator for this batch element
+    frag_acc acc;
+    rocwmma::fill_fragment(acc, 0.0f);
+
+    // Loop over K dimension in chunks of WMMA_K (16)
+    for (int k_base = 0; k_base < K; k_base += WMMA_K) {
+      // --- Load x tile [WMMA_M x WMMA_K] into shared memory ---
+      // 32 lanes load 256 elements (16x16) -> 8 elements per lane
+      #pragma unroll
+      for (int i = 0; i < (WMMA_M * WMMA_K + 31) / 32; ++i) {
+        int idx = lane + i * 32;
+        if (idx < WMMA_M * WMMA_K) {
+          int m_local = idx / WMMA_K;
+          int k_local = idx % WMMA_K;
+          int k_global = k_base + k_local;
+          if (k_global < K) {
+            smem_x[idx] = x_base[m_local * K + k_global];
+          } else {
+            smem_x[idx] = static_cast<hip_bfloat16>(0.0f);
+          }
+        }
+      }
+
+      // --- Dequantize weight tile [WMMA_K x WMMA_N] into shared memory ---
+      // Layout: smem_w[k][n] = dequant(w[expert, tile_col + n, k_base + k])
+      // w is stored as [N, row_bytes], each row for one output column.
+      // We need 16 columns x 16 K values = 256 values, 8 per lane.
+      #pragma unroll
+      for (int i = 0; i < (WMMA_K * WMMA_N + 31) / 32; ++i) {
+        int idx = lane + i * 32;
+        if (idx < WMMA_K * WMMA_N) {
+          int k_local = idx / WMMA_N;  // row in [K, N]
+          int n_local = idx % WMMA_N;  // col in [K, N]
+          int k_global = k_base + k_local;
+          int n_global = tile_col + n_local;
+
+          if (k_global < K) {
+            // Pointer to weight row for output column n_global
+            const uint8_t* w_row = w_expert + static_cast<int64_t>(n_global) * row_bytes;
+
+            // Extract 4-bit quantized value
+            uint8_t packed = w_row[k_global >> 1];
+            uint8_t quant_val = (k_global & 1) ? (packed >> 4) : (packed & 0xF);
+
+            // Dequantize: val = scale * quant_val + bias
+            int group_idx = k_global / GROUP_SIZE;
+            float scale = static_cast<float>(
+                s_expert[static_cast<int64_t>(n_global) * num_groups + group_idx]);
+            float bias_val = has_bias
+                ? static_cast<float>(
+                    b_expert[static_cast<int64_t>(n_global) * num_groups + group_idx])
+                : 0.0f;
+            float dequant = scale * static_cast<float>(quant_val) + bias_val;
+            smem_w[idx] = static_cast<hip_bfloat16>(dequant);
+          } else {
+            smem_w[idx] = static_cast<hip_bfloat16>(0.0f);
+          }
+        }
+      }
+
+      __syncthreads();
+
+      // --- Load fragments from shared memory and perform MMA ---
+      frag_a a_frag;
+      frag_b b_frag;
+
+      // Load A from smem_x [WMMA_M x WMMA_K], row-major, ldm = WMMA_K
+      rocwmma::load_matrix_sync(a_frag, smem_x, WMMA_K);
+      // Load B from smem_w [WMMA_K x WMMA_N], row-major, ldm = WMMA_N
+      rocwmma::load_matrix_sync(b_frag, smem_w, WMMA_N);
+
+      // D = A * B + C
+      rocwmma::mma_sync(acc, a_frag, b_frag, acc);
+
+      __syncthreads();
+    }
+
+    // --- Store the 16x16 result tile ---
+    // Store f32 accumulator to shared memory, then convert to bf16 for output.
+    __shared__ float smem_out_f32[WMMA_M * WMMA_N];
+
+    rocwmma::store_matrix_sync(smem_out_f32, acc, WMMA_N, rocwmma::mem_row_major);
+    __syncthreads();
+
+    // Convert f32 -> bf16 and write to global output
+    T* out_base = out + static_cast<int64_t>(batch) * M * N
+                      + static_cast<int64_t>(tile_row) * N
+                      + tile_col;
+    #pragma unroll
+    for (int i = 0; i < (WMMA_M * WMMA_N + 31) / 32; ++i) {
+      int idx = lane + i * 32;
+      if (idx < WMMA_M * WMMA_N) {
+        int m_local = idx / WMMA_N;
+        int n_local = idx % WMMA_N;
+        out_base[m_local * N + n_local] = static_cast<T>(smem_out_f32[idx]);
+      }
+    }
+    __syncthreads();
+  }
+
+#endif // ROCM_HAS_WMMA
+}
+
 } // namespace rocm
 
 void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
@@ -3881,6 +4087,39 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     enc.set_input_array(run_starts_arr);
     enc.set_input_array(run_lengths_arr);
 
+    int64_t x_bs = (x_batch_count == 1) ? 0 : static_cast<int64_t>(M) * K;
+
+    // ---- WMMA path: use 16x16x16 wave matrix multiply when tiles align ----
+    bool use_wmma = (M >= 16) && (M % 16 == 0) && (N % 16 == 0) && (bits_ == 4);
+    use_wmma = parse_warp_kernel_env("MLX_ROCM_GATHER_QMV_USE_WMMA", use_wmma);
+
+    if (use_wmma) {
+      // One wave32 per 16x16 output tile
+      dim3 wmma_block(32, 1, 1);
+      dim3 wmma_grid((M + 15) / 16, (N + 15) / 16, num_runs);
+      // Shared memory: smem_w[16*16] + smem_x[16*16] bf16 + smem_out_f32[16*16] f32
+      // = 512 + 512 + 1024 = 2048 bytes
+      size_t wmma_smem = 0;  // static shared memory, declared in-kernel
+
+      enc.launch_kernel([&](hipStream_t stream) {
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_wmma_prefill_kernel<hip_bfloat16, hip_bfloat16, 4, 64, true>),
+            wmma_grid, wmma_block, wmma_smem, stream,
+            gpu_ptr<const hip_bfloat16>(x),
+            gpu_ptr<const uint8_t>(w),
+            gpu_ptr<const hip_bfloat16>(scales),
+            has_bias ? gpu_ptr<const hip_bfloat16>(*biases) : nullptr,
+            gpu_ptr<const uint32_t>(lhs_indices),
+            gpu_ptr<const uint32_t>(rhs_indices),
+            gpu_ptr<const int>(run_starts_arr),
+            gpu_ptr<const int>(run_lengths_arr),
+            gpu_ptr<hip_bfloat16>(out),
+            B, M, N, K, E, has_bias, x_bs);
+      });
+      return;
+    }
+
+    // ---- Scalar prefill fallback ----
     int fast_threads_per_col_pf = select_qmv_threads_per_col(K, N, bits_, num_runs);
     int fast_cols_per_block_pf = select_qmv_cols_per_block(K, N, bits_);
     int max_cpb = rocm::kMaxThreadsPerBlock / fast_threads_per_col_pf;
@@ -3890,8 +4129,6 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
 
     dim3 pf_block(fast_threads_per_col_pf, fast_cols_per_block_pf);
     dim3 pf_grid(M, (N + fast_cols_per_block_pf - 1) / fast_cols_per_block_pf, num_runs);
-
-    int64_t x_bs = (x_batch_count == 1) ? 0 : static_cast<int64_t>(M) * K;
 
     enc.launch_kernel([&](hipStream_t stream) {
       auto launch_pf = [&](auto bits_tag) {
