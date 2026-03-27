@@ -397,6 +397,86 @@ __global__ void scatter_general_kernel(
   }
 }
 
+template <int BLOCK_SIZE>
+__global__ void masked_scatter_offsets_kernel(
+    const bool* mask,
+    uint32_t* scatter_offsets,
+    int64_t mask_batch_size) {
+  const int64_t batch_idx = static_cast<int64_t>(blockIdx.x);
+  const int tid = threadIdx.x;
+  const int64_t batch_base = batch_idx * mask_batch_size;
+
+  __shared__ uint32_t scan_vals[BLOCK_SIZE];
+  uint32_t batch_prefix = 0;
+
+  for (int64_t i = 0; i < mask_batch_size; i += BLOCK_SIZE) {
+    const int64_t mask_idx = i + tid;
+    const bool in_range = mask_idx < mask_batch_size;
+    const uint32_t mask_value =
+        (in_range && mask[batch_base + mask_idx]) ? 1u : 0u;
+
+    scan_vals[tid] = mask_value;
+    __syncthreads();
+
+    // In-place inclusive scan for a fixed-size block.
+    for (int offset = 1; offset < BLOCK_SIZE; offset <<= 1) {
+      uint32_t add = 0;
+      if (tid >= offset) {
+        add = scan_vals[tid - offset];
+      }
+      __syncthreads();
+      scan_vals[tid] += add;
+      __syncthreads();
+    }
+
+    if (in_range) {
+      // Convert the in-block inclusive scan to an exclusive offset.
+      scatter_offsets[batch_base + mask_idx] =
+          batch_prefix + (scan_vals[tid] - mask_value);
+    }
+
+    __syncthreads();
+    batch_prefix += scan_vals[BLOCK_SIZE - 1];
+    __syncthreads();
+  }
+}
+
+template <typename T, bool SrcContiguous>
+__global__ void masked_scatter_assign_kernel(
+    const bool* mask,
+    const uint32_t* scatter_offsets,
+    const T* src,
+    T* out,
+    int64_t total,
+    const rocm::hip_array<int32_t, MAX_NDIM> src_shape,
+    const rocm::hip_array<int64_t, MAX_NDIM> src_strides,
+    int32_t src_ndim,
+    int64_t src_batch_size,
+    int64_t mask_batch_size) {
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x +
+      threadIdx.x;
+  if (idx >= total || !mask[idx]) {
+    return;
+  }
+
+  const uint32_t src_index = scatter_offsets[idx];
+  if (static_cast<int64_t>(src_index) >= src_batch_size) {
+    return;
+  }
+
+  const int64_t batch_idx = idx / mask_batch_size;
+  const int64_t src_elem =
+      batch_idx * src_batch_size + static_cast<int64_t>(src_index);
+
+  if constexpr (SrcContiguous) {
+    out[idx] = src[src_elem];
+  } else {
+    const int64_t src_loc = rocm::elem_to_loc<int64_t>(
+        src_elem, src_shape.data_, src_strides.data_, src_ndim);
+    out[idx] = src[src_loc];
+  }
+}
+
 } // namespace rocm
 
 void Gather::eval_gpu(const std::vector<array>& inputs, array& out) {
@@ -1034,6 +1114,147 @@ void ScatterAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
   #undef DISPATCH_CONTIGUOUS
   #undef DISPATCH_NDIM
   #undef DISPATCH_IDX_TYPE
+}
+
+void MaskedScatter::eval_gpu(const std::vector<array>& inputs, array& out) {
+  assert(inputs.size() == 3);
+
+  const auto& dst = inputs[0];
+  const auto& mask = inputs[1];
+  const auto& src = inputs[2];
+
+  auto& s = stream();
+  auto& encoder = rocm::get_command_encoder(s);
+
+  const int64_t total = mask.size();
+  const CopyType copy_type = (total == 1)
+      ? CopyType::Scalar
+      : (dst.flags().row_contiguous ? CopyType::Vector : CopyType::General);
+  copy_gpu(dst, out, copy_type, s);
+  if (total == 0) {
+    return;
+  }
+
+  array mask_flat = flatten_in_eval(mask, 1, -1, s);
+  if (mask_flat.data<void>() != mask.data<void>()) {
+    encoder.add_temporary(mask_flat);
+  }
+  if (!mask_flat.flags().row_contiguous) {
+    mask_flat = contiguous_copy_gpu(mask_flat, s);
+    encoder.add_temporary(mask_flat);
+  }
+
+  array scatter_offsets(mask_flat.shape(), uint32, nullptr, {});
+  scatter_offsets.set_data(allocator::malloc(scatter_offsets.nbytes()));
+  encoder.add_temporary(scatter_offsets);
+
+  const int64_t batch_count = mask_flat.shape(0);
+  const int64_t mask_batch_size = total / batch_count;
+  const int64_t src_batch_size = src.size() / batch_count;
+
+  std::vector<int32_t> src_shape(src.shape().begin(), src.shape().end());
+  std::vector<int64_t> src_strides(src.strides().begin(), src.strides().end());
+  auto src_shape_param = const_param(src_shape);
+  auto src_strides_param = const_param(src_strides);
+  const bool src_contiguous = src.flags().row_contiguous;
+
+  encoder.set_input_array(mask_flat);
+  encoder.set_input_array(src);
+  encoder.set_output_array(out);
+
+  constexpr int block_size = 256;
+  const auto offset_grid = dim3(static_cast<uint32_t>(batch_count));
+  const auto offset_block = dim3(block_size);
+  const int64_t num_blocks = (total + block_size - 1) / block_size;
+
+  encoder.launch_kernel(
+      [&, src_shape_param, src_strides_param, src_contiguous](
+          hipStream_t stream) {
+        hipLaunchKernelGGL(
+            (rocm::masked_scatter_offsets_kernel<block_size>),
+            offset_grid,
+            offset_block,
+            0,
+            stream,
+            mask_flat.data<bool>(),
+            scatter_offsets.data<uint32_t>(),
+            mask_batch_size);
+
+#define LAUNCH_MASKED_SCATTER(T, SrcC) \
+  hipLaunchKernelGGL( \
+      (rocm::masked_scatter_assign_kernel<T, SrcC>), \
+      dim3(static_cast<uint32_t>(num_blocks)), \
+      dim3(block_size), \
+      0, \
+      stream, \
+      mask_flat.data<bool>(), \
+      scatter_offsets.data<uint32_t>(), \
+      src.data<T>(), \
+      out.data<T>(), \
+      total, \
+      src_shape_param, \
+      src_strides_param, \
+      src.ndim(), \
+      src_batch_size, \
+      mask_batch_size)
+
+#define DISPATCH_MASKED_SCATTER(T)         \
+  if (src_contiguous) {                    \
+    LAUNCH_MASKED_SCATTER(T, true);        \
+  } else {                                 \
+    LAUNCH_MASKED_SCATTER(T, false);       \
+  }
+
+        switch (out.dtype()) {
+          case bool_:
+            DISPATCH_MASKED_SCATTER(bool);
+            break;
+          case uint8:
+            DISPATCH_MASKED_SCATTER(uint8_t);
+            break;
+          case uint16:
+            DISPATCH_MASKED_SCATTER(uint16_t);
+            break;
+          case uint32:
+            DISPATCH_MASKED_SCATTER(uint32_t);
+            break;
+          case uint64:
+            DISPATCH_MASKED_SCATTER(uint64_t);
+            break;
+          case int8:
+            DISPATCH_MASKED_SCATTER(int8_t);
+            break;
+          case int16:
+            DISPATCH_MASKED_SCATTER(int16_t);
+            break;
+          case int32:
+            DISPATCH_MASKED_SCATTER(int32_t);
+            break;
+          case int64:
+            DISPATCH_MASKED_SCATTER(int64_t);
+            break;
+          case float16:
+            DISPATCH_MASKED_SCATTER(__half);
+            break;
+          case float32:
+            DISPATCH_MASKED_SCATTER(float);
+            break;
+          case float64:
+            DISPATCH_MASKED_SCATTER(double);
+            break;
+          case bfloat16:
+            DISPATCH_MASKED_SCATTER(hip_bfloat16);
+            break;
+          case complex64:
+            DISPATCH_MASKED_SCATTER(hipFloatComplex);
+            break;
+          default:
+            throw std::runtime_error("Unsupported dtype for MaskedScatter");
+        }
+
+#undef DISPATCH_MASKED_SCATTER
+#undef LAUNCH_MASKED_SCATTER
+      });
 }
 
 } // namespace mlx::core

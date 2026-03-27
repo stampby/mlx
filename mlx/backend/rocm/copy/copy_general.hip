@@ -100,27 +100,39 @@ void copy_general(
   encoder.add_temporary(strides_in_arr);
   encoder.add_temporary(strides_out_arr);
 
+  void* shape_ptr = gpu_ptr<void>(shape_arr);
+  void* strides_in_ptr = gpu_ptr<void>(strides_in_arr);
+  void* strides_out_ptr = gpu_ptr<void>(strides_out_arr);
+  const void* in_ptr = gpu_ptr<void>(in);
+  void* out_ptr = gpu_ptr<void>(out);
+
   dispatch_all_types(in.dtype(), [&](auto in_type_tag) {
     dispatch_all_types(out.dtype(), [&](auto out_type_tag) {
       using InType = hip_type_t<MLX_GET_TYPE(in_type_tag)>;
       using OutType = hip_type_t<MLX_GET_TYPE(out_type_tag)>;
       
-      encoder.launch_kernel([&](hipStream_t stream) {
+      encoder.launch_kernel([
+                               &,
+                               shape_ptr,
+                               strides_in_ptr,
+                               strides_out_ptr,
+                               in_ptr,
+                               out_ptr](hipStream_t stream) {
         // Copy shape and strides to device
         (void)hipMemcpyAsync(
-            shape_arr.data<int32_t>(),
+            shape_ptr,
             shape.data(),
             ndim * sizeof(int32_t),
             hipMemcpyHostToDevice,
             stream);
         (void)hipMemcpyAsync(
-            strides_in_arr.data<int64_t>(),
+            strides_in_ptr,
             strides_in.data(),
             ndim * sizeof(int64_t),
             hipMemcpyHostToDevice,
             stream);
         (void)hipMemcpyAsync(
-            strides_out_arr.data<int64_t>(),
+            strides_out_ptr,
             strides_out.data(),
             ndim * sizeof(int64_t),
             hipMemcpyHostToDevice,
@@ -132,12 +144,12 @@ void copy_general(
         hipLaunchKernelGGL(
             (rocm::copy_gg_dynamic<InType, OutType, int64_t>),
             dim3(num_blocks), dim3(block_size), 0, stream,
-            reinterpret_cast<const InType*>(in.data<void>()) + offset_in,
-            reinterpret_cast<OutType*>(out.data<void>()) + offset_out,
+            static_cast<const InType*>(in_ptr) + offset_in,
+            static_cast<OutType*>(out_ptr) + offset_out,
             static_cast<int64_t>(data_size),
-            shape_arr.data<int32_t>(),
-            strides_in_arr.data<int64_t>(),
-            strides_out_arr.data<int64_t>(),
+            static_cast<const int*>(shape_ptr),
+            static_cast<const int64_t*>(strides_in_ptr),
+            static_cast<const int64_t*>(strides_out_ptr),
             ndim);
       });
     });

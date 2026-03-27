@@ -47,7 +47,7 @@ const char* dtype_to_hip_type(const Dtype& dtype) {
     case float16:
       return "__half";
     case bfloat16:
-      return "__hip_bfloat16";
+      return "hip_bfloat16";
     case float32:
       return "float";
     case float64:

@@ -132,28 +132,45 @@ class CopyableHipEvent {
 // AtomicEvent implementations
 ///////////////////////////////////////////////////////////////////////////////
 
+namespace {
+
+void signal_atomic_callback(void* data) {
+  auto* pair = static_cast<std::pair<std::atomic<uint64_t>*, uint64_t>*>(data);
+  pair->first->store(pair->second);
+  delete pair;
+}
+
+} // namespace
+
 AtomicEvent::AtomicEvent() {
   buf_ = std::shared_ptr<allocator::Buffer>(
-      new allocator::Buffer{allocator().malloc(sizeof(std::atomic<uint64_t>))}, 
+      new allocator::Buffer{allocator().malloc(sizeof(std::atomic<uint64_t>))},
       [](allocator::Buffer* ptr) {
         allocator().free(*ptr);
         delete ptr;
       });
+  // Initialize to 0, this will migrate to unified memory if needed
   *static_cast<uint64_t*>(buf_->raw_ptr()) = 0;
 }
 
 void AtomicEvent::wait(uint64_t value) {
   auto* ac = atomic();
-  uint64_t current;
-  while ((current = ac->load()) < value) {
-    // Spin wait
+  while (ac->load(std::memory_order_acquire) < value) {
+    std::this_thread::yield();
   }
 }
 
 void AtomicEvent::wait(hipStream_t stream, uint64_t value) {
-  // For HIP, we use host function callback for synchronization
-  (void)hipStreamSynchronize(stream);
-  wait(value);
+  // Use hipStreamWaitValue64 if possible to make the GPU wait for the atomic directly.
+  // This avoids blocking the host thread and is much more efficient.
+  // flags = hipStreamWaitValueGte (Greater than or equal)
+  hipError_t err = hipStreamWaitValue64(stream, atomic(), value, hipStreamWaitValueGte, 0xFFFFFFFFFFFFFFFFULL);
+  if (err != hipSuccess) {
+    // Fallback to synchronous wait if hipStreamWaitValue64 is not supported or fails.
+    // hipStreamSynchronize should be blocking if flags are set correctly.
+    CHECK_HIP_ERROR(hipStreamSynchronize(stream));
+    wait(value);
+  }
 }
 
 void AtomicEvent::wait(Stream s, uint64_t value) {
@@ -163,27 +180,35 @@ void AtomicEvent::wait(Stream s, uint64_t value) {
     auto& encoder = get_command_encoder(s);
     encoder.commit();
     wait(encoder.stream(), value);
+    // Keep the buffer alive until the wait is finished
     encoder.add_completed_handler([buf = buf_]() {});
   }
 }
 
 void AtomicEvent::signal(uint64_t value) {
-  atomic()->store(value);
+  atomic()->store(value, std::memory_order_release);
 }
 
 void AtomicEvent::signal(hipStream_t stream, uint64_t value) {
-  (void)hipStreamSynchronize(stream);
-  signal(value);
+  // Use hipStreamWriteValue64 if possible to signal the atomic directly from the GPU stream.
+  // This is much more efficient than using a host callback.
+  // We don't use flags or mask for now.
+  hipError_t err = hipStreamWriteValue64(stream, atomic(), value, 0);
+  if (err != hipSuccess) {
+    // Fallback to host callback if hipStreamWriteValue64 is not supported or fails.
+    auto* data = new std::pair<std::atomic<uint64_t>*, uint64_t>(atomic(), value);
+    CHECK_HIP_ERROR(hipLaunchHostFunc(stream, signal_atomic_callback, data));
+  }
 }
 
 void AtomicEvent::signal(Stream s, uint64_t value) {
   if (s.device == mlx::core::Device::cpu) {
-    static HipStream stream(device(mlx::core::Device::gpu));
-    scheduler::enqueue(s, [*this, value]() mutable { signal(stream, value); });
+    scheduler::enqueue(s, [*this, value]() mutable { signal(value); });
   } else {
     auto& encoder = get_command_encoder(s);
     encoder.commit();
     signal(encoder.stream(), value);
+    // Keep the buffer alive until it's signaled
     encoder.add_completed_handler([buf = buf_]() {});
   }
 }

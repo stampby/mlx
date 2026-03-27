@@ -44,12 +44,12 @@ void Worker::commit(hipStream_t stream) {
 }
 
 void Worker::thread_fn() {
+  uint64_t current_batch = 0;
   while (!stop_) {
-    uint64_t current_batch = 0;
     Tasks tasks;
     {
       std::unique_lock<std::mutex> lk(mtx_);
-      cond_.wait(lk, [this, &current_batch] {
+      cond_.wait(lk, [this, current_batch] {
         return this->signaled_batch_ > current_batch || this->stop_;
       });
       current_batch = signaled_batch_;

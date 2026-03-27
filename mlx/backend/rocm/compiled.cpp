@@ -225,6 +225,220 @@ struct numeric_limits<float> {
 } // namespace std
 } // namespace hip
 
+// Math function overloads for bfloat16 and half types
+// HIP doesn't provide native math functions for these types,
+// so we convert to float, compute, and convert back.
+
+__device__ inline hip_bfloat16 abs(hip_bfloat16 x) {
+  return hip_bfloat16(fabsf(static_cast<float>(x)));
+}
+__device__ inline __half abs(__half x) {
+  return __float2half(fabsf(__half2float(x)));
+}
+
+__device__ inline hip_bfloat16 exp(hip_bfloat16 x) {
+  return hip_bfloat16(expf(static_cast<float>(x)));
+}
+__device__ inline __half exp(__half x) {
+  return __float2half(expf(__half2float(x)));
+}
+
+__device__ inline hip_bfloat16 log(hip_bfloat16 x) {
+  return hip_bfloat16(logf(static_cast<float>(x)));
+}
+__device__ inline __half log(__half x) {
+  return __float2half(logf(__half2float(x)));
+}
+
+__device__ inline hip_bfloat16 sqrt(hip_bfloat16 x) {
+  return hip_bfloat16(sqrtf(static_cast<float>(x)));
+}
+__device__ inline __half sqrt(__half x) {
+  return __float2half(sqrtf(__half2float(x)));
+}
+
+__device__ inline hip_bfloat16 rsqrt(hip_bfloat16 x) {
+  return hip_bfloat16(rsqrtf(static_cast<float>(x)));
+}
+__device__ inline __half rsqrt(__half x) {
+  return __float2half(rsqrtf(__half2float(x)));
+}
+
+__device__ inline hip_bfloat16 sin(hip_bfloat16 x) {
+  return hip_bfloat16(sinf(static_cast<float>(x)));
+}
+__device__ inline __half sin(__half x) {
+  return __float2half(sinf(__half2float(x)));
+}
+
+__device__ inline hip_bfloat16 cos(hip_bfloat16 x) {
+  return hip_bfloat16(cosf(static_cast<float>(x)));
+}
+__device__ inline __half cos(__half x) {
+  return __float2half(cosf(__half2float(x)));
+}
+
+__device__ inline hip_bfloat16 tan(hip_bfloat16 x) {
+  return hip_bfloat16(tanf(static_cast<float>(x)));
+}
+__device__ inline __half tan(__half x) {
+  return __float2half(tanf(__half2float(x)));
+}
+
+__device__ inline hip_bfloat16 sinh(hip_bfloat16 x) {
+  return hip_bfloat16(sinhf(static_cast<float>(x)));
+}
+__device__ inline __half sinh(__half x) {
+  return __float2half(sinhf(__half2float(x)));
+}
+
+__device__ inline hip_bfloat16 cosh(hip_bfloat16 x) {
+  return hip_bfloat16(coshf(static_cast<float>(x)));
+}
+__device__ inline __half cosh(__half x) {
+  return __float2half(coshf(__half2float(x)));
+}
+
+__device__ inline hip_bfloat16 tanh(hip_bfloat16 x) {
+  return hip_bfloat16(tanhf(static_cast<float>(x)));
+}
+__device__ inline __half tanh(__half x) {
+  return __float2half(tanhf(__half2float(x)));
+}
+
+__device__ inline hip_bfloat16 asin(hip_bfloat16 x) {
+  return hip_bfloat16(asinf(static_cast<float>(x)));
+}
+__device__ inline __half asin(__half x) {
+  return __float2half(asinf(__half2float(x)));
+}
+
+__device__ inline hip_bfloat16 acos(hip_bfloat16 x) {
+  return hip_bfloat16(acosf(static_cast<float>(x)));
+}
+__device__ inline __half acos(__half x) {
+  return __float2half(acosf(__half2float(x)));
+}
+
+__device__ inline hip_bfloat16 atan(hip_bfloat16 x) {
+  return hip_bfloat16(atanf(static_cast<float>(x)));
+}
+__device__ inline __half atan(__half x) {
+  return __float2half(atanf(__half2float(x)));
+}
+
+__device__ inline hip_bfloat16 asinh(hip_bfloat16 x) {
+  return hip_bfloat16(asinhf(static_cast<float>(x)));
+}
+__device__ inline __half asinh(__half x) {
+  return __float2half(asinhf(__half2float(x)));
+}
+
+__device__ inline hip_bfloat16 acosh(hip_bfloat16 x) {
+  return hip_bfloat16(acoshf(static_cast<float>(x)));
+}
+__device__ inline __half acosh(__half x) {
+  return __float2half(acoshf(__half2float(x)));
+}
+
+__device__ inline hip_bfloat16 atanh(hip_bfloat16 x) {
+  return hip_bfloat16(atanhf(static_cast<float>(x)));
+}
+__device__ inline __half atanh(__half x) {
+  return __float2half(atanhf(__half2float(x)));
+}
+
+__device__ inline hip_bfloat16 ceil(hip_bfloat16 x) {
+  return hip_bfloat16(ceilf(static_cast<float>(x)));
+}
+__device__ inline __half ceil(__half x) {
+  return __float2half(ceilf(__half2float(x)));
+}
+
+__device__ inline hip_bfloat16 floor(hip_bfloat16 x) {
+  return hip_bfloat16(floorf(static_cast<float>(x)));
+}
+__device__ inline __half floor(__half x) {
+  return __float2half(floorf(__half2float(x)));
+}
+
+__device__ inline hip_bfloat16 rint(hip_bfloat16 x) {
+  return hip_bfloat16(rintf(static_cast<float>(x)));
+}
+__device__ inline __half rint(__half x) {
+  return __float2half(rintf(__half2float(x)));
+}
+
+__device__ inline hip_bfloat16 log2(hip_bfloat16 x) {
+  return hip_bfloat16(log2f(static_cast<float>(x)));
+}
+__device__ inline __half log2(__half x) {
+  return __float2half(log2f(__half2float(x)));
+}
+
+__device__ inline hip_bfloat16 log10(hip_bfloat16 x) {
+  return hip_bfloat16(log10f(static_cast<float>(x)));
+}
+__device__ inline __half log10(__half x) {
+  return __float2half(log10f(__half2float(x)));
+}
+
+__device__ inline hip_bfloat16 log1pf(hip_bfloat16 x) {
+  return hip_bfloat16(::log1pf(static_cast<float>(x)));
+}
+__device__ inline __half log1pf(__half x) {
+  return __float2half(::log1pf(__half2float(x)));
+}
+
+__device__ inline hip_bfloat16 expm1f(hip_bfloat16 x) {
+  return hip_bfloat16(::expm1f(static_cast<float>(x)));
+}
+__device__ inline __half expm1f(__half x) {
+  return __float2half(::expm1f(__half2float(x)));
+}
+
+__device__ inline hip_bfloat16 erff(hip_bfloat16 x) {
+  return hip_bfloat16(::erff(static_cast<float>(x)));
+}
+__device__ inline __half erff(__half x) {
+  return __float2half(::erff(__half2float(x)));
+}
+
+__device__ inline hip_bfloat16 erfinvf(hip_bfloat16 x) {
+  return hip_bfloat16(::erfinvf(static_cast<float>(x)));
+}
+__device__ inline __half erfinvf(__half x) {
+  return __float2half(::erfinvf(__half2float(x)));
+}
+
+__device__ inline hip_bfloat16 powf(hip_bfloat16 base, hip_bfloat16 exp) {
+  return hip_bfloat16(::powf(static_cast<float>(base), static_cast<float>(exp)));
+}
+__device__ inline __half powf(__half base, __half exp) {
+  return __float2half(::powf(__half2float(base), __half2float(exp)));
+}
+
+__device__ inline hip_bfloat16 fmodf(hip_bfloat16 x, hip_bfloat16 y) {
+  return hip_bfloat16(::fmodf(static_cast<float>(x), static_cast<float>(y)));
+}
+__device__ inline __half fmodf(__half x, __half y) {
+  return __float2half(::fmodf(__half2float(x), __half2float(y)));
+}
+
+__device__ inline hip_bfloat16 truncf(hip_bfloat16 x) {
+  return hip_bfloat16(::truncf(static_cast<float>(x)));
+}
+__device__ inline __half truncf(__half x) {
+  return __float2half(::truncf(__half2float(x)));
+}
+
+__device__ inline hip_bfloat16 atan2f(hip_bfloat16 y, hip_bfloat16 x) {
+  return hip_bfloat16(::atan2f(static_cast<float>(y), static_cast<float>(x)));
+}
+__device__ inline __half atan2f(__half y, __half x) {
+  return __float2half(::atan2f(__half2float(y), __half2float(x)));
+}
+
 // Include device operations
 namespace mlx::core::rocm {
 
@@ -320,11 +534,27 @@ struct FloorDivide {
 };
 
 struct LogAddExp {
+  __device__ hip_bfloat16 operator()(hip_bfloat16 x, hip_bfloat16 y) {
+    float fx = static_cast<float>(x);
+    float fy = static_cast<float>(y);
+    float maxval = fx > fy ? fx : fy;
+    float minval = fx > fy ? fy : fx;
+    return hip_bfloat16(maxval + log1pf(expf(minval - maxval)));
+  }
+
+  __device__ __half operator()(__half x, __half y) {
+    float fx = __half2float(x);
+    float fy = __half2float(y);
+    float maxval = fx > fy ? fx : fy;
+    float minval = fx > fy ? fy : fx;
+    return __float2half(maxval + log1pf(expf(minval - maxval)));
+  }
+
   template <typename T>
   __device__ T operator()(T x, T y) {
     T maxval = x > y ? x : y;
     T minval = x > y ? y : x;
-    return maxval + log1pf(expf(minval - maxval));
+    return static_cast<T>(maxval + log1pf(expf(minval - maxval)));
   }
 };
 
@@ -385,10 +615,22 @@ struct Square {
 };
 
 struct Sigmoid {
+  __device__ hip_bfloat16 operator()(hip_bfloat16 x) {
+    float fx = static_cast<float>(x);
+    float y = 1.0f / (1.0f + expf(-fabsf(fx)));
+    return hip_bfloat16((fx < 0.0f) ? 1.0f - y : y);
+  }
+
+  __device__ __half operator()(__half x) {
+    float fx = __half2float(x);
+    float y = 1.0f / (1.0f + expf(-fabsf(fx)));
+    return __float2half((fx < 0.0f) ? 1.0f - y : y);
+  }
+
   template <typename T>
   __device__ T operator()(T x) {
-    T y = 1 / (1 + exp(-abs(x)));
-    return (x < 0) ? 1 - y : y;
+    T y = T(1) / (T(1) + exp(-abs(x)));
+    return (x < T(0)) ? (T(1) - y) : y;
   }
 };
 
@@ -474,7 +716,7 @@ struct Rsqrt {
 
 struct Sign {
   template <typename T>
-  __device__ T operator()(T x) { return (x > T(0)) - (x < T(0)); }
+  __device__ T operator()(T x) { return T((x > T(0)) - (x < T(0))); }
 };
 
 struct Asin {

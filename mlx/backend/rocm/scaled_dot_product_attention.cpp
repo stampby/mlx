@@ -28,6 +28,27 @@ void sdpa_vector(
     const std::optional<array>& sinks,
     Stream s);
 
+// Defined in flash_attention.hip
+bool supports_sdpa_flash(
+    const array& q,
+    const array& k,
+    const array& v,
+    bool has_mask,
+    bool has_arr_mask,
+    bool do_causal,
+    bool output_logsumexp);
+
+void sdpa_flash(
+    const array& q,
+    const array& k,
+    const array& v,
+    float scale,
+    array& o,
+    bool do_causal,
+    const std::optional<array>& mask,
+    const std::optional<array>& sinks,
+    Stream s);
+
 namespace {
 
 array prepare_sdpa_input(const array& x, Stream s) {
@@ -42,6 +63,23 @@ array prepare_sdpa_input(const array& x, Stream s) {
   return x;
 }
 
+bool prefer_flash_for_decode(
+    const array& q,
+    const array& k,
+    bool has_arr_mask,
+    bool has_sinks) {
+  if (has_arr_mask || has_sinks) {
+    return false;
+  }
+  if (q.shape(2) != 1) {
+    return false;
+  }
+  if (k.shape(2) < 512) {
+    return false;
+  }
+  return q.dtype() == float16 || q.dtype() == bfloat16;
+}
+
 } // namespace
 
 namespace fast {
@@ -53,16 +91,13 @@ bool ScaledDotProductAttention::use_fallback(
     bool has_mask,
     bool has_arr_mask,
     bool do_causal,
-    bool is_training,
+    bool /*is_training*/,
     bool output_logsumexp,
-    Stream s) {
-  if (s.device == Device::cpu) {
-    return true;
-  }
-
-  // Use fallback if we don't support the vector kernel
+    Stream /*s*/) {
   return !supports_sdpa_vector(
-      q, k, v, has_mask, has_arr_mask, do_causal, output_logsumexp);
+             q, k, v, has_mask, has_arr_mask, do_causal, output_logsumexp) &&
+      !supports_sdpa_flash(
+          q, k, v, has_mask, has_arr_mask, do_causal, output_logsumexp);
 }
 
 bool ScaledDotProductAttention::supports_bool_mask() {
@@ -87,12 +122,30 @@ void ScaledDotProductAttention::eval_gpu(
     mask_arr = prepare_sdpa_input(inputs[3], s);
   }
 
-  if (supports_sdpa_vector(
-          q, k, v, has_mask, has_arr_mask, do_causal_, output_logsumexp_)) {
+  bool vector_supported = supports_sdpa_vector(
+      q, k, v, has_mask, has_arr_mask, do_causal_, output_logsumexp_);
+  bool flash_supported = supports_sdpa_flash(
+      q, k, v, has_mask, has_arr_mask, do_causal_, output_logsumexp_);
+  bool flash_first = flash_supported &&
+      prefer_flash_for_decode(q, k, has_arr_mask, has_sinks_);
+
+  if (flash_first) {
+    if (has_sinks_) {
+      sdpa_flash(q, k, v, scale_, out, do_causal_, mask_arr, inputs.back(), s);
+    } else {
+      sdpa_flash(q, k, v, scale_, out, do_causal_, mask_arr, std::nullopt, s);
+    }
+  } else if (vector_supported) {
     if (has_sinks_) {
       sdpa_vector(q, k, v, scale_, out, do_causal_, inputs.back(), s);
     } else {
       sdpa_vector(q, k, v, scale_, out, do_causal_, std::nullopt, s);
+    }
+  } else if (flash_supported) {
+    if (has_sinks_) {
+      sdpa_flash(q, k, v, scale_, out, do_causal_, mask_arr, inputs.back(), s);
+    } else {
+      sdpa_flash(q, k, v, scale_, out, do_causal_, mask_arr, std::nullopt, s);
     }
   } else {
     // Fallback: compute attention manually

@@ -2,14 +2,14 @@
 
 #define _USE_MATH_DEFINES
 
+#include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/rocm/device.h"
 #include "mlx/backend/rocm/device/config.h"
 #include "mlx/backend/rocm/kernel_utils.hpp"
-#include "mlx/backend/gpu/copy.h"
 #include "mlx/dtype_utils.h"
 
-#include <hip/hip_runtime.h>
 #include <hip/hip_bfloat16.h>
+#include <hip/hip_runtime.h>
 #include <cmath>
 
 namespace mlx::core {
@@ -50,11 +50,16 @@ template <typename T>
 __device__ __forceinline__ T tile_reduce_max_32(T val) {
   // Reduce within a 32-thread tile using shuffle operations
   T other;
-  other = __shfl_xor(val, 16); val = val > other ? val : other;
-  other = __shfl_xor(val, 8);  val = val > other ? val : other;
-  other = __shfl_xor(val, 4);  val = val > other ? val : other;
-  other = __shfl_xor(val, 2);  val = val > other ? val : other;
-  other = __shfl_xor(val, 1);  val = val > other ? val : other;
+  other = __shfl_xor(val, 16);
+  val = val > other ? val : other;
+  other = __shfl_xor(val, 8);
+  val = val > other ? val : other;
+  other = __shfl_xor(val, 4);
+  val = val > other ? val : other;
+  other = __shfl_xor(val, 2);
+  val = val > other ? val : other;
+  other = __shfl_xor(val, 1);
+  val = val > other ? val : other;
   return val;
 }
 
@@ -68,10 +73,9 @@ __global__ void kernel_sdpav_1pass(
     T* O,
     const T* sinks,
     const AttnParams params) {
-  
   // BN = number of 32-thread tiles, BD = tile size (32)
-  constexpr int BN = 32;  // Number of tiles processing keys in parallel
-  constexpr int BD = 32;  // Tile size (always 32 for consistency)
+  constexpr int BN = 32; // Number of tiles processing keys in parallel
+  constexpr int BD = 32; // Tile size (always 32 for consistency)
   constexpr int v_per_thread = D / BD;
 
   const int inner_k_stride = BN * params.K_strides[2];
@@ -90,8 +94,8 @@ __global__ void kernel_sdpav_1pass(
   const U scale_log2 = params.scale * 1.44269504089f; // M_LOG2E
 
   // Use virtual 32-thread tiles instead of hardware warps
-  const int lane_idx = threadIdx.x % SDPA_TILE_SIZE;  // 0-31 within tile
-  const int tile_idx = threadIdx.x / SDPA_TILE_SIZE;  // Which tile (0-31)
+  const int lane_idx = threadIdx.x % SDPA_TILE_SIZE; // 0-31 within tile
+  const int tile_idx = threadIdx.x / SDPA_TILE_SIZE; // Which tile (0-31)
 
   const int batch_idx = blockIdx.z;
   const int head_idx = blockIdx.x;
@@ -99,20 +103,29 @@ __global__ void kernel_sdpav_1pass(
   const int q_seq_idx = blockIdx.y;
   const int kv_seq_idx = tile_idx;
 
-  const T* Q_ptr = Q + batch_idx * params.Q_strides[0] + head_idx * params.Q_strides[1] + q_seq_idx * params.Q_strides[2];
-  const T* K_ptr = K + batch_idx * params.K_strides[0] + kv_head_idx * params.K_strides[1] + kv_seq_idx * params.K_strides[2];
-  const T* V_ptr = V + batch_idx * params.V_strides[0] + kv_head_idx * params.V_strides[1] + kv_seq_idx * params.V_strides[2];
-  T* O_ptr = O + batch_idx * params.O_strides[0] + head_idx * params.O_strides[1] + q_seq_idx * params.O_strides[2];
+  const T* Q_ptr = Q + batch_idx * params.Q_strides[0] +
+      head_idx * params.Q_strides[1] + q_seq_idx * params.Q_strides[2];
+  const T* K_ptr = K + batch_idx * params.K_strides[0] +
+      kv_head_idx * params.K_strides[1] + kv_seq_idx * params.K_strides[2];
+  const T* V_ptr = V + batch_idx * params.V_strides[0] +
+      kv_head_idx * params.V_strides[1] + kv_seq_idx * params.V_strides[2];
+  T* O_ptr = O + batch_idx * params.O_strides[0] +
+      head_idx * params.O_strides[1] + q_seq_idx * params.O_strides[2];
 
-  // Read query and initialize output
-  #pragma unroll
+// Read query and initialize output
+#pragma unroll
   for (int i = 0; i < v_per_thread; i++) {
     q[i] = scale_log2 * static_cast<U>(Q_ptr[v_per_thread * lane_idx + i]);
     o[i] = 0.f;
   }
 
-  U max_score = -1e9f;
+  U max_score = -__int_as_float(0x7f7fffff); // -FLT_MAX
   U sum_exp_score = 0.f;
+
+  if (sinks && tile_idx == 0) {
+    max_score = 1.44269504089f * static_cast<U>(sinks[head_idx]); // M_LOG2E
+    sum_exp_score = 1.f;
+  }
 
   // Process keys
   for (int i = kv_seq_idx; i < params.kL; i += BN) {
@@ -122,13 +135,13 @@ __global__ void kernel_sdpav_1pass(
     }
 
     if (use_key) {
-      #pragma unroll
+#pragma unroll
       for (int j = 0; j < v_per_thread; j++) {
         k[j] = K_ptr[v_per_thread * lane_idx + j];
       }
 
       U score = 0.f;
-      #pragma unroll
+#pragma unroll
       for (int j = 0; j < v_per_thread; j++) {
         score += q[j] * static_cast<U>(k[j]);
       }
@@ -143,9 +156,10 @@ __global__ void kernel_sdpav_1pass(
       max_score = new_max;
       sum_exp_score = sum_exp_score * factor + exp_score;
 
-      #pragma unroll
+#pragma unroll
       for (int j = 0; j < v_per_thread; j++) {
-        o[j] = o[j] * factor + exp_score * static_cast<U>(V_ptr[v_per_thread * lane_idx + j]);
+        o[j] = o[j] * factor +
+            exp_score * static_cast<U>(V_ptr[v_per_thread * lane_idx + j]);
       }
     }
 
@@ -167,8 +181,8 @@ __global__ void kernel_sdpav_1pass(
   sum_exp_score = tile_reduce_sum_32(sum_exp_scores[lane_idx % BN] * factor);
   sum_exp_score = sum_exp_score == 0 ? 0 : 1.0f / sum_exp_score;
 
-  // Aggregate outputs across tiles
-  #pragma unroll
+// Aggregate outputs across tiles
+#pragma unroll
   for (int i = 0; i < v_per_thread; i++) {
     outputs[lane_idx][tile_idx] = o[i];
     __syncthreads();
@@ -179,7 +193,7 @@ __global__ void kernel_sdpav_1pass(
 
   // Write final output
   if (lane_idx == 0) {
-    #pragma unroll
+#pragma unroll
     for (int i = 0; i < v_per_thread; i++) {
       O_ptr[v_per_thread * tile_idx + i] = static_cast<T>(o[i]);
     }
@@ -230,7 +244,8 @@ bool supports_sdpa_vector(
   const int query_sequence_length = q.shape(2);
 
   const bool sdpa_supported_head_dim = query_head_dim == value_head_dim &&
-      (query_head_dim == 64 || query_head_dim == 96 || query_head_dim == 128);
+      (query_head_dim == 64 || query_head_dim == 96 || query_head_dim == 128 ||
+       query_head_dim == 256);
 
   const bool supported_vector_config =
       sdpa_supported_head_dim && query_sequence_length < 4;
@@ -282,56 +297,137 @@ void sdpa_vector(
   params.O_strides[1] = o.strides(1);
   params.O_strides[2] = o.strides(2);
 
-  encoder.launch_kernel([&](hipStream_t stream) {
+  const void* q_ptr = gpu_ptr<void>(q);
+  const void* k_ptr = gpu_ptr<void>(k);
+  const void* v_ptr = gpu_ptr<void>(v);
+  void* o_ptr = gpu_ptr<void>(o);
+  const void* sinks_ptr = sinks ? gpu_ptr<void>(*sinks) : nullptr;
+  bool has_sinks = sinks.has_value();
+
+  encoder.launch_kernel([&, q_ptr, k_ptr, v_ptr, o_ptr, sinks_ptr, has_sinks](
+                            hipStream_t stream) {
     dim3 grid_dim(H, qL, B);
-    dim3 block_dim(1024, 1, 1);  // 32 tiles * 32 threads = 1024
+    dim3 block_dim(1024, 1, 1); // 32 tiles * 32 threads = 1024
 
     auto launch_kernel = [&](auto type_tag, auto causal_tag, auto headdim_tag) {
       using DataType = decltype(type_tag);
       constexpr bool causal = decltype(causal_tag)::value;
       constexpr int headdim = decltype(headdim_tag)::value;
-      
+
       hipLaunchKernelGGL(
           (rocm::kernel_sdpav_1pass<DataType, causal, headdim>),
-          grid_dim, block_dim, 0, stream,
-          q.data<DataType>(),
-          k.data<DataType>(),
-          v.data<DataType>(),
-          o.data<DataType>(),
-          sinks ? sinks->data<DataType>() : nullptr,
+          grid_dim,
+          block_dim,
+          0,
+          stream,
+          static_cast<const DataType*>(q_ptr),
+          static_cast<const DataType*>(k_ptr),
+          static_cast<const DataType*>(v_ptr),
+          static_cast<DataType*>(o_ptr),
+          has_sinks ? static_cast<const DataType*>(sinks_ptr) : nullptr,
           params);
     };
 
     // Dispatch based on dtype, causal, and head dimension
     if (o.dtype() == float32) {
       if (do_causal) {
-        if (D == 64) launch_kernel(float(), std::true_type(), std::integral_constant<int, 64>());
-        else if (D == 96) launch_kernel(float(), std::true_type(), std::integral_constant<int, 96>());
-        else if (D == 128) launch_kernel(float(), std::true_type(), std::integral_constant<int, 128>());
+        if (D == 64)
+          launch_kernel(
+              float(), std::true_type(), std::integral_constant<int, 64>());
+        else if (D == 96)
+          launch_kernel(
+              float(), std::true_type(), std::integral_constant<int, 96>());
+        else if (D == 128)
+          launch_kernel(
+              float(), std::true_type(), std::integral_constant<int, 128>());
+        else if (D == 256)
+          launch_kernel(
+              float(), std::true_type(), std::integral_constant<int, 256>());
       } else {
-        if (D == 64) launch_kernel(float(), std::false_type(), std::integral_constant<int, 64>());
-        else if (D == 96) launch_kernel(float(), std::false_type(), std::integral_constant<int, 96>());
-        else if (D == 128) launch_kernel(float(), std::false_type(), std::integral_constant<int, 128>());
+        if (D == 64)
+          launch_kernel(
+              float(), std::false_type(), std::integral_constant<int, 64>());
+        else if (D == 96)
+          launch_kernel(
+              float(), std::false_type(), std::integral_constant<int, 96>());
+        else if (D == 128)
+          launch_kernel(
+              float(), std::false_type(), std::integral_constant<int, 128>());
+        else if (D == 256)
+          launch_kernel(
+              float(), std::false_type(), std::integral_constant<int, 256>());
       }
     } else if (o.dtype() == float16) {
       if (do_causal) {
-        if (D == 64) launch_kernel(__half(), std::true_type(), std::integral_constant<int, 64>());
-        else if (D == 96) launch_kernel(__half(), std::true_type(), std::integral_constant<int, 96>());
-        else if (D == 128) launch_kernel(__half(), std::true_type(), std::integral_constant<int, 128>());
+        if (D == 64)
+          launch_kernel(
+              __half(), std::true_type(), std::integral_constant<int, 64>());
+        else if (D == 96)
+          launch_kernel(
+              __half(), std::true_type(), std::integral_constant<int, 96>());
+        else if (D == 128)
+          launch_kernel(
+              __half(), std::true_type(), std::integral_constant<int, 128>());
+        else if (D == 256)
+          launch_kernel(
+              __half(), std::true_type(), std::integral_constant<int, 256>());
       } else {
-        if (D == 64) launch_kernel(__half(), std::false_type(), std::integral_constant<int, 64>());
-        else if (D == 96) launch_kernel(__half(), std::false_type(), std::integral_constant<int, 96>());
-        else if (D == 128) launch_kernel(__half(), std::false_type(), std::integral_constant<int, 128>());
+        if (D == 64)
+          launch_kernel(
+              __half(), std::false_type(), std::integral_constant<int, 64>());
+        else if (D == 96)
+          launch_kernel(
+              __half(), std::false_type(), std::integral_constant<int, 96>());
+        else if (D == 128)
+          launch_kernel(
+              __half(), std::false_type(), std::integral_constant<int, 128>());
+        else if (D == 256)
+          launch_kernel(
+              __half(), std::false_type(), std::integral_constant<int, 256>());
       }
     } else if (o.dtype() == bfloat16) {
       if (do_causal) {
-        if (D == 64) launch_kernel(hip_bfloat16(), std::true_type(), std::integral_constant<int, 64>());
-        else if (D == 96) launch_kernel(hip_bfloat16(), std::true_type(), std::integral_constant<int, 96>());
-        else if (D == 128) launch_kernel(hip_bfloat16(), std::true_type(), std::integral_constant<int, 128>());
+        if (D == 64)
+          launch_kernel(
+              hip_bfloat16(),
+              std::true_type(),
+              std::integral_constant<int, 64>());
+        else if (D == 96)
+          launch_kernel(
+              hip_bfloat16(),
+              std::true_type(),
+              std::integral_constant<int, 96>());
+        else if (D == 128)
+          launch_kernel(
+              hip_bfloat16(),
+              std::true_type(),
+              std::integral_constant<int, 128>());
+        else if (D == 256)
+          launch_kernel(
+              hip_bfloat16(),
+              std::true_type(),
+              std::integral_constant<int, 256>());
       } else {
-        if (D == 64) launch_kernel(hip_bfloat16(), std::false_type(), std::integral_constant<int, 64>());
-        else if (D == 96) launch_kernel(hip_bfloat16(), std::false_type(), std::integral_constant<int, 96>());
-        else if (D == 128) launch_kernel(hip_bfloat16(), std::false_type(), std::integral_constant<int, 128>());
+        if (D == 64)
+          launch_kernel(
+              hip_bfloat16(),
+              std::false_type(),
+              std::integral_constant<int, 64>());
+        else if (D == 96)
+          launch_kernel(
+              hip_bfloat16(),
+              std::false_type(),
+              std::integral_constant<int, 96>());
+        else if (D == 128)
+          launch_kernel(
+              hip_bfloat16(),
+              std::false_type(),
+              std::integral_constant<int, 128>());
+        else if (D == 256)
+          launch_kernel(
+              hip_bfloat16(),
+              std::false_type(),
+              std::integral_constant<int, 256>());
       }
     }
   });

@@ -82,3 +82,7 @@ uv.lock
 
 # keys
 *.pem
+
+build.sh
+github-runner/
+sync_fork.sh

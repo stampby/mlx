@@ -58,13 +58,9 @@ rocm_skip = {
     "TestQuantized.test_gather_qmm_sorted",
     "TestQuantized.test_gather_qmm_grad",
     "TestQuantized.test_non_multiples",
-    "TestQuantized.test_qmm",
-    "TestQuantized.test_qmm_jvp",
-    "TestQuantized.test_qmm_shapes",
-    "TestQuantized.test_qmm_vjp",
-    "TestQuantized.test_qmv",
-    "TestQuantized.test_fp_qmv",
     "TestQuantized.test_fp_qvm",
+    "TestQuantized.test_fp_qmv",  # ROCm fp_qmv currently aborts on GPU
+    "TestQuantized.test_qmv_small_non_multiples",  # nvfp4 qmv path unsupported
     "TestQuantized.test_qvm",
     "TestQuantized.test_qvm_splitk",
     "TestQuantized.test_small_matrix",
