@@ -3,6 +3,7 @@
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/rocm/device.h"
 #include "mlx/backend/rocm/gemms/naive_gemm.h"
+#include "mlx/backend/rocm/gemms/hipblaslt_gemm.h"
 #include "mlx/backend/rocm/gemms/rocblas_gemm.h"
 #include "mlx/backend/rocm/kernel_utils.hpp"
 #include "mlx/backend/rocm/quantized/quantized.h"
@@ -682,6 +683,25 @@ void dequant_rocblas_gemm(
       case bfloat16: {
         float alpha_f = alpha;
         float beta_f = beta;
+
+        // Try hipBLASLt first for bf16 GEMMs — often faster on RDNA 3.5/CDNA
+        if (rocm::is_hipblaslt_available()) {
+          try {
+            // data_type=0 means "use bfloat16", impl maps internally
+            rocm::hipblaslt_gemm_raw(
+                stream,
+                static_cast<int>(op_b), static_cast<int>(op_a),
+                N, M, K,
+                &alpha_f, b_ptr, ldb, a_ptr, lda,
+                &beta_f, c_ptr, ldc,
+                2,   // 2 = bfloat16 (mapped in impl)
+                0);  // unused
+            break;
+          } catch (...) {
+            // Fall through to rocBLAS
+          }
+        }
+
         int solution_index = qmm_gemm_solution_index_bf16(false);
         static std::atomic<bool> solution_valid{true};
 

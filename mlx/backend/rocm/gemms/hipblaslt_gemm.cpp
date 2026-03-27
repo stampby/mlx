@@ -407,6 +407,14 @@ void hipblaslt_gemm(
   hipblasOperation_t op_a = to_hipblas_op(transpose_b);
   hipblasOperation_t op_b = to_hipblas_op(transpose_a);
 
+  static bool dbg = []{
+    fprintf(stderr, "[hipBLASLt] first call\n");
+    return true;
+  }();
+  (void)dbg;
+  fprintf(stderr, "[hipBLASLt] M=%d N=%d K=%d ta=%d tb=%d lda=%d ldb=%d ldc=%d\n",
+      M, N, K, (int)transpose_a, (int)transpose_b, lda, ldb, ldc);
+
   const void* a_ptr = gpu_ptr<void>(a);
   const void* b_ptr = gpu_ptr<void>(b);
   void* c_ptr = gpu_ptr<void>(c);
@@ -495,6 +503,46 @@ void hipblaslt_gemm_batched(
             hip_dtype,
             stream);
       });
+}
+
+void hipblaslt_gemm_raw(
+    hipStream_t stream,
+    int op_a,
+    int op_b,
+    int M, int N, int K,
+    const float* alpha,
+    const void* a_ptr, int lda,
+    const void* b_ptr, int ldb,
+    const float* beta,
+    void* c_ptr, int ldc,
+    int data_type_hint,
+    int /*compute_type_hint*/) {
+  int device_id = 0;
+  (void)hipGetDevice(&device_id);
+  hipblasLtHandle_t handle = get_handle(device_id);
+
+  // Map data_type_hint: 1=fp16, 2=bf16, 3=fp32
+  hipDataType hip_dtype;
+  switch (data_type_hint) {
+    case 1: hip_dtype = HIP_R_16F; break;
+    case 2: hip_dtype = HIP_R_16BF; break;
+    default: hip_dtype = HIP_R_32F; break;
+  }
+
+  hipblaslt_gemm_impl(
+      handle,
+      device_id,
+      static_cast<hipblasOperation_t>(op_a),
+      static_cast<hipblasOperation_t>(op_b),
+      M, N, K,
+      alpha,
+      a_ptr, lda, 0,
+      b_ptr, ldb, 0,
+      beta,
+      c_ptr, ldc, 0,
+      1,  // batch_count
+      hip_dtype,
+      stream);
 }
 
 } // namespace mlx::core::rocm
