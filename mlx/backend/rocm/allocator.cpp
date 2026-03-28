@@ -7,7 +7,6 @@
 
 #include <hip/hip_runtime.h>
 #include <unistd.h>
-#include <unistd.h>
 
 #include <cassert>
 #include <sstream>
@@ -78,13 +77,12 @@ inline void* rocm_unified_malloc(size_t size, bool& is_managed) {
   void* data = nullptr;
   hipError_t err;
   if (is_integrated()) {
-    // Integrated GPU (APU): CPU and GPU share physical memory.
-    // hipExtMallocWithFlags gives fine-grained coherent access — no page
-    // faults or HMM migration overhead, and the GPU can access it directly
-    // without TLB shootdowns. Falls back to hipMallocManaged if unavailable.
+    // Unified memory device (iGPU/APU): CPU and GPU share system RAM.
+    // Try hipExtMallocWithFlags first (fine-grained coherent, best GPU
+    // bandwidth). Falls back to hipMallocManaged for large allocations
+    // that exceed the small device-local VRAM (~2GB).
     err = hipExtMallocWithFlags(&data, size, hipDeviceMallocFinegrained);
     if (err != hipSuccess) {
-      // Fallback: hipMallocManaged with HMM
       err = hipMallocManaged(&data, size);
     }
     is_managed = true;
@@ -195,19 +193,8 @@ RocmAllocator::RocmAllocator()
   size_t free, total;
   hipError_t err = hipMemGetInfo(&free, &total);
   if (err == hipSuccess) {
-    if (is_integrated()) {
-      // On integrated GPU (APU), GPU and CPU share system RAM.
-      // hipMemGetInfo reports only the small dedicated VRAM (2GB on Strix Halo).
-      // Use system RAM total instead — the GPU can access all of it.
-      size_t pages = sysconf(_SC_PHYS_PAGES);
-      size_t page_size = sysconf(_SC_PAGE_SIZE);
-      size_t sys_total = pages * page_size;
-      memory_limit_ = sys_total * 0.8;
-      max_pool_size_ = memory_limit_;
-    } else {
-      memory_limit_ = total * 0.8;
-      max_pool_size_ = memory_limit_;
-    }
+    memory_limit_ = total * 0.8;
+    max_pool_size_ = memory_limit_;
   }
 }
 
@@ -233,12 +220,8 @@ Buffer RocmAllocator::malloc(size_t size) {
     size = 8;
   } else if (size < page_size) {
     size = next_power_of_2(size);
-  } else if (size < 1024 * 1024) {
-    size = page_size * ((size + page_size - 1) / page_size);
   } else {
-    // Power-of-2 for >= 1MB: wastes up to 2x memory but dramatically
-    // improves cache hit rate during decode (13 allocs/token → ~0).
-    size = next_power_of_2(size);
+    size = page_size * ((size + page_size - 1) / page_size);
   }
 
   RocmBuffer* buf = buffer_cache_.reuse_from_cache(size);
