@@ -529,12 +529,19 @@ inline int select_qmv_cols_per_block(int K, int N, int bits) {
 }
 
 inline int select_qmv_threads_per_col(int K, int N, int bits, int batch_count) {
+  // On RDNA 3.5 (wave32), 16 threads per column gives better occupancy
+  // than 32 for most LLM decode shapes. 32 threads only helps for very
+  // large K where the extra parallelism in the reduction outweighs the
+  // reduced block count.
   int threads_per_col = 16;
   if (WARP_SIZE == 32) {
     bool quant_bits_supported =
         (bits == 2 || bits == 4 || bits == 5 || bits == 6 || bits == 8);
-    bool large_decode_like = (batch_count == 1) && (N >= 4096 || K >= 4096);
-    if (quant_bits_supported && large_decode_like) {
+    // On RDNA 3.5 (40 CUs / 20 WGPs), 16 threads/col allows 2 columns
+    // per warp, increasing memory-level parallelism for decode. Only use
+    // full warp (32) for extreme K where reduction parallelism dominates.
+    bool extreme = (batch_count == 1) && (K >= 16384);
+    if (quant_bits_supported && extreme) {
       threads_per_col = WARP_SIZE;
     }
   }
