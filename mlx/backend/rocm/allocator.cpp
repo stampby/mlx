@@ -207,14 +207,26 @@ Buffer RocmAllocator::malloc(size_t size) {
   }
 
   // Find available buffer from cache.
+  // Use aggressive size rounding to maximize cache hit rate:
+  // - Small (<=8B): scalar pool
+  // - Medium (<16KB): power-of-2
+  // - Large (<1MB): 16KB page aligned
+  // - Very large (>=1MB): power-of-2 (coarser buckets = more cache hits)
+  // The power-of-2 rounding for large allocations is critical for decode —
+  // without it, slightly different sizes (e.g., 1.01MB vs 1.02MB) miss the
+  // cache and trigger hipExtMallocWithFlags at ~7ms each.
   auto orig_size = size;
   std::unique_lock lock(mutex_);
   if (size <= small_block_size) {
     size = 8;
   } else if (size < page_size) {
     size = next_power_of_2(size);
-  } else {
+  } else if (size < 1024 * 1024) {
     size = page_size * ((size + page_size - 1) / page_size);
+  } else {
+    // Power-of-2 for >= 1MB: wastes up to 2x memory but dramatically
+    // improves cache hit rate during decode (13 allocs/token → ~0).
+    size = next_power_of_2(size);
   }
 
   RocmBuffer* buf = buffer_cache_.reuse_from_cache(size);
