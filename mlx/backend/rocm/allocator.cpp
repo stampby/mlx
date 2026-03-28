@@ -7,6 +7,7 @@
 
 #include <hip/hip_runtime.h>
 #include <unistd.h>
+#include <unistd.h>
 
 #include <cassert>
 #include <sstream>
@@ -194,8 +195,19 @@ RocmAllocator::RocmAllocator()
   size_t free, total;
   hipError_t err = hipMemGetInfo(&free, &total);
   if (err == hipSuccess) {
-    memory_limit_ = total * 0.8;
-    max_pool_size_ = memory_limit_;
+    if (is_integrated()) {
+      // On integrated GPU (APU), GPU and CPU share system RAM.
+      // hipMemGetInfo reports only the small dedicated VRAM (2GB on Strix Halo).
+      // Use system RAM total instead — the GPU can access all of it.
+      size_t pages = sysconf(_SC_PHYS_PAGES);
+      size_t page_size = sysconf(_SC_PAGE_SIZE);
+      size_t sys_total = pages * page_size;
+      memory_limit_ = sys_total * 0.8;
+      max_pool_size_ = memory_limit_;
+    } else {
+      memory_limit_ = total * 0.8;
+      max_pool_size_ = memory_limit_;
+    }
   }
 }
 
