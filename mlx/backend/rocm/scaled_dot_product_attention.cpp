@@ -148,11 +148,12 @@ void ScaledDotProductAttention::eval_gpu(
       sdpa_flash(q, k, v, scale_, out, do_causal_, mask_arr, std::nullopt, s);
     }
   } else {
-    // Fallback: compute attention manually
-    // This path should rarely be hit due to use_fallback check
+    // This should not be reached — use_fallback() returns true for unsupported
+    // configs, causing the framework to decompose SDPA into basic GPU ops
+    // (matmul + softmax + matmul) before this primitive is created.
     throw std::runtime_error(
-        "SDPA configuration not supported by ROCm kernel. "
-        "Please use CPU fallback or adjust parameters.");
+        "[ScaledDotProductAttention::eval_gpu] Unsupported configuration reached. "
+        "This is a bug — use_fallback() should have returned true.");
   }
 }
 

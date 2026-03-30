@@ -442,25 +442,34 @@ __device__ inline __half atan2f(__half y, __half x) {
 // Include device operations
 namespace mlx::core::rocm {
 
-// Binary ops
+// Binary ops — promote half/bfloat16 through float to avoid precision loss
+// that compounds across 28-36 transformer layers in LLM inference.
 struct Add {
   template <typename T>
-  __device__ T operator()(T x, T y) { return x + y; }
+  __device__ T operator()(T x, T y) {
+    return T(static_cast<float>(x) + static_cast<float>(y));
+  }
 };
 
 struct Subtract {
   template <typename T>
-  __device__ T operator()(T x, T y) { return x - y; }
+  __device__ T operator()(T x, T y) {
+    return T(static_cast<float>(x) - static_cast<float>(y));
+  }
 };
 
 struct Multiply {
   template <typename T>
-  __device__ T operator()(T x, T y) { return x * y; }
+  __device__ T operator()(T x, T y) {
+    return T(static_cast<float>(x) * static_cast<float>(y));
+  }
 };
 
 struct Divide {
   template <typename T>
-  __device__ T operator()(T x, T y) { return x / y; }
+  __device__ T operator()(T x, T y) {
+    return T(static_cast<float>(x) / static_cast<float>(y));
+  }
 };
 
 struct Maximum {
@@ -475,7 +484,9 @@ struct Minimum {
 
 struct Power {
   template <typename T>
-  __device__ T operator()(T base, T exp) { return powf(base, exp); }
+  __device__ T operator()(T base, T exp) {
+    return T(powf(static_cast<float>(base), static_cast<float>(exp)));
+  }
 };
 
 struct Equal {
@@ -520,17 +531,23 @@ struct LogicalOr {
 
 struct ArcTan2 {
   template <typename T>
-  __device__ T operator()(T y, T x) { return atan2f(y, x); }
+  __device__ T operator()(T y, T x) {
+    return T(atan2f(static_cast<float>(y), static_cast<float>(x)));
+  }
 };
 
 struct Remainder {
   template <typename T>
-  __device__ T operator()(T x, T y) { return fmodf(x, y); }
+  __device__ T operator()(T x, T y) {
+    return T(fmodf(static_cast<float>(x), static_cast<float>(y)));
+  }
 };
 
 struct FloorDivide {
   template <typename T>
-  __device__ T operator()(T x, T y) { return truncf(x / y); }
+  __device__ T operator()(T x, T y) {
+    return T(truncf(static_cast<float>(x) / static_cast<float>(y)));
+  }
 };
 
 struct LogAddExp {
@@ -552,9 +569,11 @@ struct LogAddExp {
 
   template <typename T>
   __device__ T operator()(T x, T y) {
-    T maxval = x > y ? x : y;
-    T minval = x > y ? y : x;
-    return static_cast<T>(maxval + log1pf(expf(minval - maxval)));
+    float fx = static_cast<float>(x);
+    float fy = static_cast<float>(y);
+    float maxval = fx > fy ? fx : fy;
+    float minval = fx > fy ? fy : fx;
+    return T(maxval + log1pf(expf(minval - maxval)));
   }
 };
 
@@ -583,26 +602,21 @@ struct RightShift {
   __device__ T operator()(T x, T y) { return x >> y; }
 };
 
+// All unary math ops promote through float to support half/bfloat16.
+// For float inputs the static_cast is a no-op.
+#define UNARY_FLOAT_OP(name, op) \
+struct name { \
+  template <typename T> \
+  __device__ T operator()(T x) { \
+    return T(op(static_cast<float>(x))); \
+  } \
+};
+
 // Unary ops
-struct Abs {
-  template <typename T>
-  __device__ T operator()(T x) { return abs(x); }
-};
-
-struct Exp {
-  template <typename T>
-  __device__ T operator()(T x) { return exp(x); }
-};
-
-struct Log {
-  template <typename T>
-  __device__ T operator()(T x) { return log(x); }
-};
-
-struct Sqrt {
-  template <typename T>
-  __device__ T operator()(T x) { return sqrt(x); }
-};
+UNARY_FLOAT_OP(Abs, fabsf)
+UNARY_FLOAT_OP(Exp, expf)
+UNARY_FLOAT_OP(Log, logf)
+UNARY_FLOAT_OP(Sqrt, sqrtf)
 
 struct Negative {
   template <typename T>
@@ -611,7 +625,10 @@ struct Negative {
 
 struct Square {
   template <typename T>
-  __device__ T operator()(T x) { return x * x; }
+  __device__ T operator()(T x) {
+    float fx = static_cast<float>(x);
+    return T(fx * fx);
+  }
 };
 
 struct Sigmoid {
@@ -629,125 +646,43 @@ struct Sigmoid {
 
   template <typename T>
   __device__ T operator()(T x) {
-    T y = T(1) / (T(1) + exp(-abs(x)));
-    return (x < T(0)) ? (T(1) - y) : y;
+    float fx = static_cast<float>(x);
+    float y = 1.0f / (1.0f + expf(-fabsf(fx)));
+    return T((fx < 0.0f) ? 1.0f - y : y);
   }
 };
 
-struct Tanh {
-  template <typename T>
-  __device__ T operator()(T x) { return tanh(x); }
-};
-
-struct Sin {
-  template <typename T>
-  __device__ T operator()(T x) { return sin(x); }
-};
-
-struct Cos {
-  template <typename T>
-  __device__ T operator()(T x) { return cos(x); }
-};
-
-struct Tan {
-  template <typename T>
-  __device__ T operator()(T x) { return tan(x); }
-};
-
-struct Sinh {
-  template <typename T>
-  __device__ T operator()(T x) { return sinh(x); }
-};
-
-struct Cosh {
-  template <typename T>
-  __device__ T operator()(T x) { return cosh(x); }
-};
-
-struct Erf {
-  template <typename T>
-  __device__ T operator()(T x) { return erff(x); }
-};
-
-struct ErfInv {
-  template <typename T>
-  __device__ T operator()(T x) { return erfinvf(x); }
-};
-
-struct Expm1 {
-  template <typename T>
-  __device__ T operator()(T x) { return expm1f(x); }
-};
-
-struct Log1p {
-  template <typename T>
-  __device__ T operator()(T x) { return log1pf(x); }
-};
-
-struct Log2 {
-  template <typename T>
-  __device__ T operator()(T x) { return log2(x); }
-};
-
-struct Log10 {
-  template <typename T>
-  __device__ T operator()(T x) { return log10(x); }
-};
-
-struct Ceil {
-  template <typename T>
-  __device__ T operator()(T x) { return ceil(x); }
-};
-
-struct Floor {
-  template <typename T>
-  __device__ T operator()(T x) { return floor(x); }
-};
-
-struct Round {
-  template <typename T>
-  __device__ T operator()(T x) { return rint(x); }
-};
-
-struct Rsqrt {
-  template <typename T>
-  __device__ T operator()(T x) { return rsqrt(x); }
-};
+UNARY_FLOAT_OP(Tanh, tanhf)
+UNARY_FLOAT_OP(Sin, sinf)
+UNARY_FLOAT_OP(Cos, cosf)
+UNARY_FLOAT_OP(Tan, tanf)
+UNARY_FLOAT_OP(Sinh, sinhf)
+UNARY_FLOAT_OP(Cosh, coshf)
+UNARY_FLOAT_OP(Erf, erff)
+UNARY_FLOAT_OP(ErfInv, erfinvf)
+UNARY_FLOAT_OP(Expm1, expm1f)
+UNARY_FLOAT_OP(Log1p, log1pf)
+UNARY_FLOAT_OP(Log2, log2f)
+UNARY_FLOAT_OP(Log10, log10f)
+UNARY_FLOAT_OP(Ceil, ceilf)
+UNARY_FLOAT_OP(Floor, floorf)
+UNARY_FLOAT_OP(Round, rintf)
+UNARY_FLOAT_OP(Rsqrt, rsqrtf)
 
 struct Sign {
   template <typename T>
-  __device__ T operator()(T x) { return T((x > T(0)) - (x < T(0))); }
+  __device__ T operator()(T x) {
+    float fx = static_cast<float>(x);
+    return T((fx > 0.0f) - (fx < 0.0f));
+  }
 };
 
-struct Asin {
-  template <typename T>
-  __device__ T operator()(T x) { return asin(x); }
-};
-
-struct Acos {
-  template <typename T>
-  __device__ T operator()(T x) { return acos(x); }
-};
-
-struct Atan {
-  template <typename T>
-  __device__ T operator()(T x) { return atan(x); }
-};
-
-struct Asinh {
-  template <typename T>
-  __device__ T operator()(T x) { return asinh(x); }
-};
-
-struct Acosh {
-  template <typename T>
-  __device__ T operator()(T x) { return acosh(x); }
-};
-
-struct Atanh {
-  template <typename T>
-  __device__ T operator()(T x) { return atanh(x); }
-};
+UNARY_FLOAT_OP(Asin, asinf)
+UNARY_FLOAT_OP(Acos, acosf)
+UNARY_FLOAT_OP(Atan, atanf)
+UNARY_FLOAT_OP(Asinh, asinhf)
+UNARY_FLOAT_OP(Acosh, acoshf)
+UNARY_FLOAT_OP(Atanh, atanhf)
 
 struct LogicalNot {
   template <typename T>
@@ -759,9 +694,11 @@ struct BitwiseNot {
   __device__ T operator()(T x) { return ~x; }
 };
 
+#undef UNARY_FLOAT_OP
+
 struct Reciprocal {
   template <typename T>
-  __device__ T operator()(T x) { return T(1) / x; }
+  __device__ T operator()(T x) { return T(1.0f / static_cast<float>(x)); }
 };
 
 // Ternary ops

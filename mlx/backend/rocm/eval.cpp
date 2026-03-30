@@ -6,7 +6,14 @@
 #include "mlx/backend/rocm/event.h"
 #include "mlx/primitives.h"
 
+#include <hip/hip_runtime.h>
+
 namespace mlx::core::gpu {
+
+void init() {
+  // Force initialization of ROCm runtime
+  hipFree(nullptr);
+}
 
 void new_stream(Stream s) {
   // Force initialization of ROCm by creating an event, so the HIP runtime and

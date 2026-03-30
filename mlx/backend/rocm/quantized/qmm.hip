@@ -3,6 +3,7 @@
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/rocm/device.h"
 #include "mlx/backend/rocm/gemms/naive_gemm.h"
+#include "mlx/backend/rocm/gemms/hipblaslt_gemm.h"
 #include "mlx/backend/rocm/gemms/rocblas_gemm.h"
 #include "mlx/backend/rocm/kernel_utils.hpp"
 #include "mlx/backend/rocm/quantized/quantized.h"
@@ -13,6 +14,23 @@
 #include <hip/hip_runtime.h>
 #include <rocblas/rocblas.h>
 #include <algorithm>
+#include <numeric>
+// rocWMMA is only supported on CDNA (gfx9xx) and RDNA 3+ (gfx11xx, gfx12xx).
+// Guard the include so it doesn't trigger static_assert on RDNA 1/2 (gfx10xx).
+// During host compilation __HIP_DEVICE_COMPILE__ is 0 so rocwmma defines
+// ROCWMMA_ARCH_HOST and compiles fine.  During device compilation for
+// unsupported architectures like gfx1030 the header would static_assert.
+#if !defined(__HIP_DEVICE_COMPILE__) || !__HIP_DEVICE_COMPILE__ || \
+    defined(__gfx908__) || defined(__gfx90a__) || defined(__gfx942__) || defined(__gfx950__) || \
+    defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || \
+    defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__) || defined(__gfx1153__) || \
+    defined(__gfx1200__) || defined(__gfx1201__)
+#define ROCM_HAS_WMMA 1
+#include <rocwmma/rocwmma.hpp>
+#else
+#define ROCM_HAS_WMMA 0
+#endif
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <list>
@@ -21,6 +39,111 @@
 
 namespace mlx::core {
 
+namespace rocm {
+
+// Strided 2D row-copy kernel: copies rows from a source with row_stride != cols
+// into a contiguous destination.
+// src layout: row i starts at src + i * src_row_stride (elements contiguous within row)
+// dst layout: row i starts at dst + i * cols (fully contiguous)
+//
+// When both row strides and cols_bytes are 4-byte aligned, uses uint32_t
+// copies (one 4-byte word per thread iteration) for good throughput without
+// alignment concerns. Falls back to byte-by-byte for the non-aligned tail.
+__global__ void strided_row_copy_kernel(
+    const char* __restrict__ src,
+    char* __restrict__ dst,
+    int64_t num_rows,
+    int64_t cols_bytes,
+    int64_t src_row_stride_bytes,
+    int64_t dst_row_stride_bytes,
+    bool use_word_copy) {
+  int64_t tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t grid_stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+
+  if (use_word_copy) {
+    // Fast path: 4-byte word copies. All row strides are 4-byte aligned.
+    constexpr int64_t WORD = 4;
+    int64_t cols_words = cols_bytes / WORD;
+    int64_t total_words = num_rows * cols_words;
+    for (int64_t i = tid; i < total_words; i += grid_stride) {
+      int64_t row = i / cols_words;
+      int64_t word_in_row = i % cols_words;
+      int64_t src_off = row * src_row_stride_bytes + word_in_row * WORD;
+      int64_t dst_off = row * dst_row_stride_bytes + word_in_row * WORD;
+      *reinterpret_cast<uint32_t*>(dst + dst_off) =
+          *reinterpret_cast<const uint32_t*>(src + src_off);
+    }
+    // Handle remainder bytes (cols_bytes % 4)
+    int64_t remainder_start = cols_words * WORD;
+    int64_t remainder_bytes = cols_bytes - remainder_start;
+    if (remainder_bytes > 0) {
+      for (int64_t i = tid; i < num_rows * remainder_bytes; i += grid_stride) {
+        int64_t row = i / remainder_bytes;
+        int64_t byte_in_tail = i % remainder_bytes;
+        int64_t src_off = row * src_row_stride_bytes + remainder_start + byte_in_tail;
+        int64_t dst_off = row * dst_row_stride_bytes + remainder_start + byte_in_tail;
+        dst[dst_off] = src[src_off];
+      }
+    }
+  } else {
+    // Slow path: byte-by-byte copy for non-aligned strides.
+    int64_t total_bytes = num_rows * cols_bytes;
+    for (int64_t i = tid; i < total_bytes; i += grid_stride) {
+      int64_t row = i / cols_bytes;
+      int64_t byte_in_row = i % cols_bytes;
+      int64_t src_off = row * src_row_stride_bytes + byte_in_row;
+      int64_t dst_off = row * dst_row_stride_bytes + byte_in_row;
+      dst[dst_off] = src[src_off];
+    }
+  }
+}
+
+// General strided copy kernel with strides passed as kernel arguments
+// (by-value hip_array structs). Avoids device memory allocation +
+// hipMemcpyAsync overhead that contiguous_copy_gpu -> copy_general_input
+// would incur. Falls back to contiguous_copy_gpu only for ndim > MAX_NDIM.
+__global__ void strided_general_copy_kernel(
+    const char* __restrict__ src,
+    char* __restrict__ dst,
+    int64_t total_elems,
+    int elem_bytes,
+    int ndim,
+    hip_array<int64_t, MAX_NDIM> shapes,
+    hip_array<int64_t, MAX_NDIM> strides_bytes) {
+  int64_t tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t grid_stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (int64_t idx = tid; idx < total_elems; idx += grid_stride) {
+    // Convert linear index to strided source offset
+    int64_t src_offset = 0;
+    int64_t remaining = idx;
+    for (int d = ndim - 1; d >= 0; --d) {
+      int64_t coord = remaining % shapes[d];
+      remaining /= shapes[d];
+      src_offset += coord * strides_bytes[d];
+    }
+    // Copy element bytes -- specialize for common QMM element sizes
+    int64_t dst_offset = idx * elem_bytes;
+    if (elem_bytes == 2) {
+      *reinterpret_cast<uint16_t*>(dst + dst_offset) =
+          *reinterpret_cast<const uint16_t*>(src + src_offset);
+    } else if (elem_bytes == 4) {
+      *reinterpret_cast<uint32_t*>(dst + dst_offset) =
+          *reinterpret_cast<const uint32_t*>(src + src_offset);
+    } else if (elem_bytes == 1) {
+      dst[dst_offset] = src[src_offset];
+    } else if (elem_bytes == 8) {
+      *reinterpret_cast<uint64_t*>(dst + dst_offset) =
+          *reinterpret_cast<const uint64_t*>(src + src_offset);
+    } else {
+      for (int b = 0; b < elem_bytes; ++b) {
+        dst[dst_offset + b] = src[src_offset + b];
+      }
+    }
+  }
+}
+
+} // namespace rocm
+
 namespace {
 
 template <typename T>
@@ -28,6 +151,32 @@ struct local_type_identity {
   using type = T;
 };
 
+// Fast contiguous-copy helper for QMM inputs.
+//
+// Design goals vs the previous implementation (which called contiguous_copy_gpu
+// unconditionally when strides didn't match row-major):
+//
+//   1. **Already contiguous** -- return immediately (unchanged).
+//
+//   2. **Inner-contiguous with outer stride gap** -- the most common
+//      non-contiguous pattern from `take` / `gather_sort`.  The inner N-1
+//      dimensions are packed (stride-1 on the last dim, products match for
+//      the rest), but the outermost dimension has a stride larger than the
+//      product of inner shapes.  We handle this with a single
+//      `strided_row_copy_kernel` launch -- no device memory allocation for
+//      shapes/strides, no hipMemcpyAsync.  One kernel dispatch total.
+//
+//   3. **General non-contiguous** (rare for QMM inputs) -- uses
+//      `strided_general_copy_kernel` which takes shapes and strides as
+//      kernel arguments (up to QMM_COPY_MAX_DIMS dimensions).  This avoids
+//      the 2x allocator::malloc + 2x hipMemcpyAsync that
+//      `contiguous_copy_gpu -> copy_general_input` would issue.  One kernel
+//      dispatch total.  Falls back to `contiguous_copy_gpu` only for arrays
+//      with more than MAX_NDIM (10) dimensions (extremely unlikely for
+//      QMM operands).
+//
+// Net effect: non-contiguous copies go from 5 GPU operations (2 allocs +
+// 2 memcpy + 1 kernel) down to 1 kernel launch.
 inline array ensure_row_contiguous_matrix(
     const array& x,
     rocm::CommandEncoder& enc,
@@ -36,12 +185,19 @@ inline array ensure_row_contiguous_matrix(
     return x;
   }
 
+  // --- Fast path 1: already row-major contiguous ---
+  int ndim = x.ndim();
+  const auto& strides = x.strides();
   bool row_major_contiguous = true;
   int64_t expected_stride = 1;
-  for (int i = x.ndim() - 1; i >= 0; --i) {
+  // Track the innermost contiguous dimensions while checking.
+  // If we break at dimension i, dimensions [i+1 .. ndim-1] are packed.
+  int first_noncontig_dim = -1;
+  for (int i = ndim - 1; i >= 0; --i) {
     if (x.shape(i) > 1) {
-      if (x.strides()[i] != expected_stride) {
+      if (strides[i] != expected_stride) {
         row_major_contiguous = false;
+        first_noncontig_dim = i;
         break;
       }
       expected_stride *= x.shape(i);
@@ -52,6 +208,174 @@ inline array ensure_row_contiguous_matrix(
     return x;
   }
 
+  // Empty arrays don't need copying.
+  if (x.size() == 0) {
+    return x;
+  }
+
+  size_t elem_bytes = x.itemsize();
+
+  // Helper: allocate a contiguous output array and return src/dst pointers.
+  // Deferred until we know a copy is actually needed and which path to use.
+  auto make_output = [&]() -> array {
+    array out(x.shape(), x.dtype(), nullptr, {});
+    out.set_data(allocator::malloc(out.nbytes()));
+    enc.add_temporary(out);
+    return out;
+  };
+
+  // --- Fast path 2: inner-contiguous, only outermost dim has a stride gap ---
+  // This covers the common case where x comes from take/gather of a [E, K]
+  // or [B, M, K] array -- inner dims are packed, outer dim stride > product.
+  // We also handle the case where the gap is at any single dimension (not
+  // just dim 0) as long as all dimensions below it are packed.
+  if (first_noncontig_dim >= 0) {
+    // Verify that all dimensions below first_noncontig_dim are packed,
+    // and only first_noncontig_dim itself has a non-standard stride.
+    // Dimensions above first_noncontig_dim (if any) must also be consistent
+    // with first_noncontig_dim's layout.
+    bool is_simple_outer_gap = true;
+    // Check: first_noncontig_dim's stride must be >= expected_stride
+    // (i.e. the inner block is correct, just spaced further apart).
+    if (strides[first_noncontig_dim] < expected_stride) {
+      is_simple_outer_gap = false;
+    }
+    // Check dimensions above first_noncontig_dim: their strides must be
+    // consistent with first_noncontig_dim's stride * shape products.
+    if (is_simple_outer_gap) {
+      int64_t outer_expected = strides[first_noncontig_dim] * x.shape(first_noncontig_dim);
+      for (int i = first_noncontig_dim - 1; i >= 0; --i) {
+        if (x.shape(i) <= 1) continue;
+        if (strides[i] != outer_expected) {
+          is_simple_outer_gap = false;
+          break;
+        }
+        outer_expected *= x.shape(i);
+      }
+    }
+
+    if (is_simple_outer_gap && first_noncontig_dim == 0) {
+      // Simplest case: only the outermost dim has extra stride.
+      // inner_size = product of shapes[1..ndim-1]
+      array x_copy = make_output();
+      const char* src = reinterpret_cast<const char*>(gpu_ptr<const void>(x));
+      char* dst = reinterpret_cast<char*>(gpu_ptr<void>(x_copy));
+
+      int64_t inner_size = 1;
+      for (int i = 1; i < ndim; ++i) {
+        inner_size *= x.shape(i);
+      }
+      int64_t num_rows = x.shape(0);
+      int64_t cols_bytes = inner_size * static_cast<int64_t>(elem_bytes);
+      int64_t src_row_stride_bytes = strides[0] * static_cast<int64_t>(elem_bytes);
+      int64_t dst_row_stride_bytes = cols_bytes;
+      bool word_copy = (cols_bytes % 4 == 0) &&
+                       (src_row_stride_bytes % 4 == 0) &&
+                       (dst_row_stride_bytes % 4 == 0);
+
+      int block_size = 256;
+      int64_t work_items = word_copy
+          ? num_rows * (cols_bytes / 4)
+          : num_rows * cols_bytes;
+      int num_blocks = static_cast<int>(
+          std::min<int64_t>((work_items + block_size - 1) / block_size, 65535));
+
+      enc.launch_kernel([=](hipStream_t stream) {
+        hipLaunchKernelGGL(
+            rocm::strided_row_copy_kernel,
+            dim3(num_blocks), dim3(block_size), 0, stream,
+            src, dst,
+            num_rows, cols_bytes,
+            src_row_stride_bytes, dst_row_stride_bytes,
+            word_copy);
+      });
+      return x_copy;
+    }
+
+    if (is_simple_outer_gap) {
+      // Gap at an interior dimension. batch_count == 1 is common here.
+      int64_t batch_count = 1;
+      for (int i = 0; i < first_noncontig_dim; ++i) {
+        batch_count *= x.shape(i);
+      }
+      if (batch_count == 1) {
+        array x_copy = make_output();
+        const char* src = reinterpret_cast<const char*>(gpu_ptr<const void>(x));
+        char* dst = reinterpret_cast<char*>(gpu_ptr<void>(x_copy));
+
+        int64_t inner_size = 1;
+        for (int i = first_noncontig_dim + 1; i < ndim; ++i) {
+          inner_size *= x.shape(i);
+        }
+        int64_t slab_rows = x.shape(first_noncontig_dim);
+        int64_t cols_bytes = inner_size * static_cast<int64_t>(elem_bytes);
+        int64_t src_row_stride_bytes = strides[first_noncontig_dim] * static_cast<int64_t>(elem_bytes);
+        int64_t dst_row_stride_bytes = cols_bytes;
+        bool word_copy = (cols_bytes % 4 == 0) &&
+                         (src_row_stride_bytes % 4 == 0) &&
+                         (dst_row_stride_bytes % 4 == 0);
+
+        int block_size = 256;
+        int64_t work_items = word_copy
+            ? slab_rows * (cols_bytes / 4)
+            : slab_rows * cols_bytes;
+        int num_blocks = static_cast<int>(
+            std::min<int64_t>((work_items + block_size - 1) / block_size, 65535));
+
+        enc.launch_kernel([=](hipStream_t stream) {
+          hipLaunchKernelGGL(
+              rocm::strided_row_copy_kernel,
+              dim3(num_blocks), dim3(block_size), 0, stream,
+              src, dst,
+              slab_rows, cols_bytes,
+              src_row_stride_bytes, dst_row_stride_bytes,
+              word_copy);
+        });
+        return x_copy;
+      }
+      // batch_count > 1 with interior gap: fall through to general path
+    }
+  }
+
+  // --- Fast path 3: general non-contiguous, strides as kernel args ---
+  // Handles arbitrary stride patterns with up to MAX_NDIM dimensions.
+  // Shapes and byte-strides are passed as hip_array structs (by value),
+  // so no device memory allocation or hipMemcpyAsync is needed.
+  // One kernel launch total.
+  if (ndim <= MAX_NDIM) {
+    array x_copy = make_output();
+    const char* src = reinterpret_cast<const char*>(gpu_ptr<const void>(x));
+    char* dst = reinterpret_cast<char*>(gpu_ptr<void>(x_copy));
+
+    int64_t total_elems = x.size();
+    int eb = static_cast<int>(elem_bytes);
+
+    int block_size = 256;
+    int num_blocks = static_cast<int>(
+        std::min<int64_t>((total_elems + block_size - 1) / block_size, 65535));
+
+    // Pack into hip_array structs that can be passed by value to the kernel.
+    rocm::hip_array<int64_t, MAX_NDIM> shapes_arg = {};
+    rocm::hip_array<int64_t, MAX_NDIM> strides_bytes_arg = {};
+    for (int i = 0; i < ndim; ++i) {
+      shapes_arg.data_[i] = x.shape(i);
+      strides_bytes_arg.data_[i] = strides[i] * static_cast<int64_t>(elem_bytes);
+    }
+
+    enc.launch_kernel([=](hipStream_t stream) {
+      hipLaunchKernelGGL(
+          rocm::strided_general_copy_kernel,
+          dim3(num_blocks), dim3(block_size), 0, stream,
+          src, dst,
+          total_elems, eb, ndim,
+          shapes_arg, strides_bytes_arg);
+    });
+    return x_copy;
+  }
+
+  // --- Fallback: ndim > MAX_NDIM (extremely rare for QMM) ---
+  // Use the generic copy infrastructure which allocates device buffers
+  // for shape/strides arrays (2 allocs + 2 hipMemcpyAsync + 1 kernel).
   array x_copy = contiguous_copy_gpu(x, s);
   enc.add_temporary(x_copy);
   return x_copy;
@@ -205,12 +529,19 @@ inline int select_qmv_cols_per_block(int K, int N, int bits) {
 }
 
 inline int select_qmv_threads_per_col(int K, int N, int bits, int batch_count) {
+  // On RDNA 3.5 (wave32), 16 threads per column gives better occupancy
+  // than 32 for most LLM decode shapes. 32 threads only helps for very
+  // large K where the extra parallelism in the reduction outweighs the
+  // reduced block count.
   int threads_per_col = 16;
   if (WARP_SIZE == 32) {
     bool quant_bits_supported =
         (bits == 2 || bits == 4 || bits == 5 || bits == 6 || bits == 8);
-    bool large_decode_like = (batch_count == 1) && (N >= 4096 || K >= 4096);
-    if (quant_bits_supported && large_decode_like) {
+    // On RDNA 3.5 (40 CUs / 20 WGPs), 16 threads/col allows 2 columns
+    // per warp, increasing memory-level parallelism for decode. Only use
+    // full warp (32) for extreme K where reduction parallelism dominates.
+    bool extreme = (batch_count == 1) && (K >= 16384);
+    if (quant_bits_supported && extreme) {
       threads_per_col = WARP_SIZE;
     }
   }
@@ -665,6 +996,25 @@ void dequant_rocblas_gemm(
       case bfloat16: {
         float alpha_f = alpha;
         float beta_f = beta;
+
+        // Try hipBLASLt first for bf16 GEMMs — often faster on RDNA 3.5/CDNA
+        if (rocm::is_hipblaslt_available()) {
+          try {
+            // data_type=0 means "use bfloat16", impl maps internally
+            rocm::hipblaslt_gemm_raw(
+                stream,
+                static_cast<int>(op_b), static_cast<int>(op_a),
+                N, M, K,
+                &alpha_f, b_ptr, ldb, a_ptr, lda,
+                &beta_f, c_ptr, ldc,
+                2,   // 2 = bfloat16 (mapped in impl)
+                0);  // unused
+            break;
+          } catch (...) {
+            // Fall through to rocBLAS
+          }
+        }
+
         int solution_index = qmm_gemm_solution_index_bf16(false);
         static std::atomic<bool> solution_valid{true};
 
@@ -2562,34 +2912,13 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   const void* biases_ptr = has_bias ? gpu_ptr<void>(*biases) : nullptr;
   void* out_ptr = gpu_ptr<void>(out);
 
-  bool use_alignment_qmv = should_use_alignment_qmv_noshared_path(
-      M,
-      N,
-      K,
-      batch_count,
-      transpose_,
-      can_use_batched_qmv,
-      bits_,
-      mode_,
-      x_ptr,
-      w_ptr,
-      scales_ptr,
-      biases_ptr,
-      has_bias);
-  bool use_noshared_qmv_variant = use_tiny_k_qmv || use_alignment_qmv;
+  // The noshared variant reads x from global memory redundantly per warp.
+  // The shared variant caches x in LDS and is ~15x faster for decode shapes.
+  // Always prefer shared unless K is tiny (where LDS overhead isn't worth it).
+  bool use_noshared_qmv_variant = use_tiny_k_qmv;
 
-  if (use_alignment_qmv) {
-    fast_cols_per_block = std::max(fast_cols_per_block, 64);
-    while (fast_cols_per_block > max_cols_per_block) {
-      fast_cols_per_block /= 2;
-    }
-    while (fast_cols_per_block > 1 && (N % fast_cols_per_block) != 0 &&
-           fast_cols_per_block > 8) {
-      fast_cols_per_block /= 2;
-    }
-    fast_block = dim3(fast_threads_per_col, fast_cols_per_block);
-    fast_grid = dim3((N + fast_cols_per_block - 1) / fast_cols_per_block, M);
-  }
+  // The noshared path used to increase cols_per_block for aligned data.
+  // Since we always use the shared variant now, no special grid adjustment needed.
 
   enc.launch_kernel([&,
                      x_ptr,
@@ -3068,6 +3397,421 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 }
 
 namespace rocm {
+
+// ======================================================================
+// GPU-only expert-batched gather QMV for sorted indices.
+//
+// Grid: (M, ceil(N/cols_per_block), max_unique_experts)
+// Each block in z-dimension finds its expert by binary-searching the sorted
+// rhs_indices array. No CPU-side run computation needed.
+//
+// The kernel reads the weight column ONCE per expert and iterates over all
+// batch elements assigned to that expert, amortizing weight memory traffic.
+// ======================================================================
+template <
+    typename T,
+    typename ScaleT,
+    int BITS,
+    int GROUP_SIZE,
+    bool AFFINE,
+    int THREADS_PER_COL>
+__global__ void __launch_bounds__(1024) gather_qmv_expert_batched_kernel(
+    const T* __restrict__ x,
+    const uint8_t* __restrict__ w,
+    const ScaleT* __restrict__ scales,
+    const ScaleT* __restrict__ biases,
+    const uint32_t* __restrict__ lhs_indices,
+    const uint32_t* __restrict__ rhs_indices,  // SORTED
+    T* __restrict__ out,
+    int B,
+    int M,
+    int N,
+    int K,
+    int E,
+    bool has_bias,
+    bool implicit_lhs,
+    int64_t implicit_x_batch_stride) {
+  const int lane = threadIdx.x;
+  const int warp_idx = threadIdx.y;
+  const int col = blockIdx.y * blockDim.y + warp_idx;
+  const int row = blockIdx.x;
+  const int expert_slot = blockIdx.z;  // which unique expert this block handles
+
+  if (row >= M || col >= N) return;
+
+  // Find this expert's token range using the expert_slot as a run index.
+  // Since rhs_indices is sorted, run boundaries are where values change.
+  // We use a parallel scan: all threads cooperate to count unique experts
+  // up to expert_slot, then binary-search for the run boundaries.
+  //
+  // Fast path: lane 0 does a boundary skip using binary search.
+  int run_start = 0, run_end = 0;
+  uint32_t expert_id = 0;
+
+  if (lane == 0 && warp_idx == 0) {
+    // Skip to the expert_slot-th unique expert by jumping over run boundaries.
+    // Each boundary is where rhs_indices[i] != rhs_indices[i-1].
+    int pos = 0;
+    for (int skip = 0; skip < expert_slot && pos < B; ++skip) {
+      // Binary search for end of current run (first index where value differs)
+      uint32_t cur_val = rhs_indices[pos];
+      int lo = pos + 1, hi = B;
+      while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        if (rhs_indices[mid] == cur_val) lo = mid + 1;
+        else hi = mid;
+      }
+      pos = lo;
+    }
+    if (pos < B) {
+      run_start = pos;
+      expert_id = rhs_indices[pos];
+      // Binary search for end of this expert's run
+      int lo = pos + 1, hi = B;
+      while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        if (rhs_indices[mid] == expert_id) lo = mid + 1;
+        else hi = mid;
+      }
+      run_end = lo;
+    }
+  }
+
+  // Broadcast via shared memory
+  __shared__ int s_run_start, s_run_end;
+  __shared__ uint32_t s_expert_id;
+  if (lane == 0 && warp_idx == 0) {
+    s_run_start = run_start;
+    s_run_end = run_end;
+    s_expert_id = expert_id;
+  }
+  __syncthreads();
+  run_start = s_run_start;
+  run_end = s_run_end;
+  expert_id = s_expert_id;
+
+  if (run_end <= run_start) return;  // this block has no work
+  if (expert_id >= static_cast<uint32_t>(E)) return;
+
+  // Weight pointers for this expert (loaded ONCE, reused for all tokens in run)
+  const int num_groups = (K + GROUP_SIZE - 1) / GROUP_SIZE;
+  const int row_bytes = (K * BITS + 7) / 8;
+  int64_t w_expert_stride = static_cast<int64_t>(N) * row_bytes;
+  int64_t sb_expert_stride = static_cast<int64_t>(N) * num_groups;
+
+  const uint8_t* w_row = w + static_cast<int64_t>(expert_id) * w_expert_stride
+                        + static_cast<int64_t>(col) * row_bytes;
+  const ScaleT* scales_row = scales + static_cast<int64_t>(expert_id) * sb_expert_stride
+                            + static_cast<int64_t>(col) * num_groups;
+  const ScaleT* biases_row = has_bias
+      ? (biases + static_cast<int64_t>(expert_id) * sb_expert_stride
+                + static_cast<int64_t>(col) * num_groups)
+      : nullptr;
+
+  // Process each batch element in the run
+  int64_t x_batch_stride = static_cast<int64_t>(M) * K;
+  for (int b = run_start; b < run_end; ++b) {
+    uint32_t lhs_idx = implicit_lhs ? 0u : lhs_indices[b];
+    int64_t x_offset = implicit_lhs
+        ? (static_cast<int64_t>(b) * implicit_x_batch_stride)
+        : (static_cast<int64_t>(lhs_idx) * x_batch_stride);
+    const T* x_row = x + x_offset + static_cast<int64_t>(row) * K;
+
+    float acc = 0.0f;
+
+    for (int g = 0; g < num_groups; ++g) {
+      int k_start = g * GROUP_SIZE;
+      int k_end = min(k_start + GROUP_SIZE, K);
+
+      float scale = load_scale_value<ScaleT, GROUP_SIZE, AFFINE>(scales_row[g]);
+      float bias_val = has_bias ? static_cast<float>(biases_row[g]) : 0.0f;
+
+      if constexpr (AFFINE) {
+        float qx_acc = 0.0f;
+        float x_group_sum = 0.0f;
+
+        if constexpr (BITS == 4) {
+          int k_local = lane * 8;
+          int step = THREADS_PER_COL * 8;
+          for (; k_start + k_local + 7 < k_end; k_local += step) {
+            int k = k_start + k_local;
+            uint32_t w_packed = *reinterpret_cast<const uint32_t*>(&w_row[k / 2]);
+            float w0 = static_cast<float>(w_packed & 0xF);
+            float w1 = static_cast<float>((w_packed >> 4) & 0xF);
+            float w2 = static_cast<float>((w_packed >> 8) & 0xF);
+            float w3 = static_cast<float>((w_packed >> 12) & 0xF);
+            float w4 = static_cast<float>((w_packed >> 16) & 0xF);
+            float w5 = static_cast<float>((w_packed >> 20) & 0xF);
+            float w6 = static_cast<float>((w_packed >> 24) & 0xF);
+            float w7 = static_cast<float>((w_packed >> 28) & 0xF);
+            float x0 = static_cast<float>(x_row[k]);
+            float x1 = static_cast<float>(x_row[k + 1]);
+            float x2 = static_cast<float>(x_row[k + 2]);
+            float x3 = static_cast<float>(x_row[k + 3]);
+            float x4 = static_cast<float>(x_row[k + 4]);
+            float x5 = static_cast<float>(x_row[k + 5]);
+            float x6 = static_cast<float>(x_row[k + 6]);
+            float x7 = static_cast<float>(x_row[k + 7]);
+            qx_acc = fmaf(x0, w0, qx_acc);
+            qx_acc = fmaf(x1, w1, qx_acc);
+            qx_acc = fmaf(x2, w2, qx_acc);
+            qx_acc = fmaf(x3, w3, qx_acc);
+            qx_acc = fmaf(x4, w4, qx_acc);
+            qx_acc = fmaf(x5, w5, qx_acc);
+            qx_acc = fmaf(x6, w6, qx_acc);
+            qx_acc = fmaf(x7, w7, qx_acc);
+            if (has_bias)
+              x_group_sum += x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7;
+          }
+          for (; k_start + k_local < k_end; k_local++) {
+            int k = k_start + k_local;
+            float x_val = static_cast<float>(x_row[k]);
+            uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+            qx_acc = fmaf(x_val, static_cast<float>(quant_val), qx_acc);
+            if (has_bias) x_group_sum += x_val;
+          }
+        } else if constexpr (BITS == 8) {
+          int k_local = lane * 4;
+          int step = THREADS_PER_COL * 4;
+          for (; k_start + k_local + 3 < k_end; k_local += step) {
+            int k = k_start + k_local;
+            uint32_t w_packed = *reinterpret_cast<const uint32_t*>(&w_row[k]);
+            float w0 = static_cast<float>(w_packed & 0xFF);
+            float w1 = static_cast<float>((w_packed >> 8) & 0xFF);
+            float w2 = static_cast<float>((w_packed >> 16) & 0xFF);
+            float w3 = static_cast<float>((w_packed >> 24) & 0xFF);
+            float x0 = static_cast<float>(x_row[k]);
+            float x1 = static_cast<float>(x_row[k + 1]);
+            float x2 = static_cast<float>(x_row[k + 2]);
+            float x3 = static_cast<float>(x_row[k + 3]);
+            qx_acc = fmaf(x0, w0, qx_acc);
+            qx_acc = fmaf(x1, w1, qx_acc);
+            qx_acc = fmaf(x2, w2, qx_acc);
+            qx_acc = fmaf(x3, w3, qx_acc);
+            if (has_bias) x_group_sum += x0 + x1 + x2 + x3;
+          }
+          for (; k_start + k_local < k_end; k_local++) {
+            int k = k_start + k_local;
+            float x_val = static_cast<float>(x_row[k]);
+            float w_val = static_cast<float>(w_row[k]);
+            qx_acc = fmaf(x_val, w_val, qx_acc);
+            if (has_bias) x_group_sum += x_val;
+          }
+        } else {
+          for (int k_local = lane; k_start + k_local < k_end; k_local += THREADS_PER_COL) {
+            int k = k_start + k_local;
+            float x_val = static_cast<float>(x_row[k]);
+            uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+            qx_acc = fmaf(x_val, static_cast<float>(quant_val), qx_acc);
+            if (has_bias) x_group_sum += x_val;
+          }
+        }
+
+        qx_acc = subgroup_reduce_sum_qmm<THREADS_PER_COL>(qx_acc);
+        x_group_sum = subgroup_reduce_sum_qmm<THREADS_PER_COL>(x_group_sum);
+        acc += scale * qx_acc + bias_val * x_group_sum;
+      } else {
+        float qx_acc = 0.0f;
+        for (int k_local = lane; k_start + k_local < k_end; k_local += THREADS_PER_COL) {
+          int k = k_start + k_local;
+          float x_val = static_cast<float>(x_row[k]);
+          uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+          qx_acc = fmaf(x_val, dequantize_value<BITS, false>(quant_val, 1.0f, 0.0f), qx_acc);
+        }
+        acc += scale * subgroup_reduce_sum_qmm<THREADS_PER_COL>(qx_acc);
+      }
+    }
+
+    if (lane == 0) {
+      out[static_cast<int64_t>(b) * M * N + static_cast<int64_t>(row) * N + col] = static_cast<T>(acc);
+    }
+  }
+}
+
+// ======================================================================
+// Prefill-optimized gather QMV: groups batch elements by expert.
+//
+// For sorted rhs_indices, consecutive batch elements hit the same expert.
+// This kernel assigns blockIdx.z to contiguous runs of same-expert batches,
+// so all rows for one expert share weight reads from global memory.
+// Each block handles one column (via warp cooperation) and iterates over
+// all M rows for each batch element in the run.
+//
+// Grid: (num_runs, ceil(N/cols_per_block), max_rows_per_run)
+// Where num_runs = number of contiguous expert runs.
+// ======================================================================
+template <
+    typename T,
+    typename ScaleT,
+    int BITS,
+    int GROUP_SIZE,
+    bool AFFINE,
+    int THREADS_PER_COL>
+__global__ void __launch_bounds__(1024) gather_qmv_prefill_kernel(
+    const T* __restrict__ x,
+    const uint8_t* __restrict__ w,
+    const ScaleT* __restrict__ scales,
+    const ScaleT* __restrict__ biases,
+    const uint32_t* __restrict__ lhs_indices,
+    const uint32_t* __restrict__ rhs_indices,
+    const int* __restrict__ run_starts,   // [num_runs]: start batch idx of each run
+    const int* __restrict__ run_lengths,  // [num_runs]: length of each run
+    const int* __restrict__ out_perm,     // [B]: sorted batch idx → original batch idx
+    T* __restrict__ out,
+    int B,
+    int M,
+    int N,
+    int K,
+    int E,
+    bool has_bias,
+    int64_t x_batch_stride) {
+  const int lane = threadIdx.x;
+  const int warp_idx = threadIdx.y;
+  const int col = blockIdx.y * blockDim.y + warp_idx;
+  const int run_id = blockIdx.z;
+  const int row = blockIdx.x;
+
+  if (row >= M || col >= N) return;
+
+  int run_start = run_starts[run_id];
+  int run_len = run_lengths[run_id];
+
+  // All batches in this run have the same expert
+  uint32_t rhs_idx = rhs_indices[run_start];
+  if (rhs_idx >= static_cast<uint32_t>(E)) return;
+
+  // Weight pointers (same for all batches in run)
+  const int num_groups = (K + GROUP_SIZE - 1) / GROUP_SIZE;
+  const int row_bytes = (K * BITS + 7) / 8;
+  int64_t w_expert_stride = static_cast<int64_t>(N) * row_bytes;
+  int64_t sb_expert_stride = static_cast<int64_t>(N) * num_groups;
+  int64_t col_w_offset = static_cast<int64_t>(col) * row_bytes;
+  int64_t col_sb_offset = static_cast<int64_t>(col) * num_groups;
+
+  const uint8_t* w_row = w + static_cast<int64_t>(rhs_idx) * w_expert_stride + col_w_offset;
+  const ScaleT* scales_row = scales + static_cast<int64_t>(rhs_idx) * sb_expert_stride + col_sb_offset;
+  const ScaleT* biases_row = has_bias
+      ? (biases + static_cast<int64_t>(rhs_idx) * sb_expert_stride + col_sb_offset)
+      : nullptr;
+
+  // Process each batch element in the run
+  for (int r = 0; r < run_len; ++r) {
+    int batch = run_start + r;
+    uint32_t lhs_idx = lhs_indices[batch];
+    const T* x_row = x + static_cast<int64_t>(lhs_idx) * x_batch_stride + static_cast<int64_t>(row) * K;
+
+    float acc = 0.0f;
+
+    for (int g = 0; g < num_groups; ++g) {
+      int k_start = g * GROUP_SIZE;
+      int k_end = min(k_start + GROUP_SIZE, K);
+
+      float scale = load_scale_value<ScaleT, GROUP_SIZE, AFFINE>(scales_row[g]);
+      float bias_val = has_bias ? static_cast<float>(biases_row[g]) : 0.0f;
+
+      if constexpr (AFFINE) {
+        float qx_acc = 0.0f;
+        float x_group_sum = 0.0f;
+
+        if constexpr (BITS == 4) {
+          int k_local = lane * 8;
+          int step = THREADS_PER_COL * 8;
+          for (; k_start + k_local + 7 < k_end; k_local += step) {
+            int k = k_start + k_local;
+            uint32_t w_packed = *reinterpret_cast<const uint32_t*>(&w_row[k / 2]);
+            float w0 = static_cast<float>(w_packed & 0xF);
+            float w1 = static_cast<float>((w_packed >> 4) & 0xF);
+            float w2 = static_cast<float>((w_packed >> 8) & 0xF);
+            float w3 = static_cast<float>((w_packed >> 12) & 0xF);
+            float w4 = static_cast<float>((w_packed >> 16) & 0xF);
+            float w5 = static_cast<float>((w_packed >> 20) & 0xF);
+            float w6 = static_cast<float>((w_packed >> 24) & 0xF);
+            float w7 = static_cast<float>((w_packed >> 28) & 0xF);
+            float x0 = static_cast<float>(x_row[k]);
+            float x1 = static_cast<float>(x_row[k + 1]);
+            float x2 = static_cast<float>(x_row[k + 2]);
+            float x3 = static_cast<float>(x_row[k + 3]);
+            float x4 = static_cast<float>(x_row[k + 4]);
+            float x5 = static_cast<float>(x_row[k + 5]);
+            float x6 = static_cast<float>(x_row[k + 6]);
+            float x7 = static_cast<float>(x_row[k + 7]);
+            qx_acc = fmaf(x0, w0, qx_acc);
+            qx_acc = fmaf(x1, w1, qx_acc);
+            qx_acc = fmaf(x2, w2, qx_acc);
+            qx_acc = fmaf(x3, w3, qx_acc);
+            qx_acc = fmaf(x4, w4, qx_acc);
+            qx_acc = fmaf(x5, w5, qx_acc);
+            qx_acc = fmaf(x6, w6, qx_acc);
+            qx_acc = fmaf(x7, w7, qx_acc);
+            if (has_bias)
+              x_group_sum += x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7;
+          }
+          for (; k_start + k_local < k_end; k_local++) {
+            int k = k_start + k_local;
+            float x_val = static_cast<float>(x_row[k]);
+            uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+            qx_acc = fmaf(x_val, static_cast<float>(quant_val), qx_acc);
+            if (has_bias) x_group_sum += x_val;
+          }
+        } else if constexpr (BITS == 8) {
+          int k_local = lane * 4;
+          int step = THREADS_PER_COL * 4;
+          for (; k_start + k_local + 3 < k_end; k_local += step) {
+            int k = k_start + k_local;
+            uint32_t w_packed = *reinterpret_cast<const uint32_t*>(&w_row[k]);
+            float w0 = static_cast<float>(w_packed & 0xFF);
+            float w1 = static_cast<float>((w_packed >> 8) & 0xFF);
+            float w2 = static_cast<float>((w_packed >> 16) & 0xFF);
+            float w3 = static_cast<float>((w_packed >> 24) & 0xFF);
+            float x0 = static_cast<float>(x_row[k]);
+            float x1 = static_cast<float>(x_row[k + 1]);
+            float x2 = static_cast<float>(x_row[k + 2]);
+            float x3 = static_cast<float>(x_row[k + 3]);
+            qx_acc = fmaf(x0, w0, qx_acc);
+            qx_acc = fmaf(x1, w1, qx_acc);
+            qx_acc = fmaf(x2, w2, qx_acc);
+            qx_acc = fmaf(x3, w3, qx_acc);
+            if (has_bias) x_group_sum += x0 + x1 + x2 + x3;
+          }
+          for (; k_start + k_local < k_end; k_local++) {
+            int k = k_start + k_local;
+            float x_val = static_cast<float>(x_row[k]);
+            float w_val = static_cast<float>(w_row[k]);
+            qx_acc = fmaf(x_val, w_val, qx_acc);
+            if (has_bias) x_group_sum += x_val;
+          }
+        } else {
+          for (int k_local = lane; k_start + k_local < k_end; k_local += THREADS_PER_COL) {
+            int k = k_start + k_local;
+            float x_val = static_cast<float>(x_row[k]);
+            uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+            qx_acc = fmaf(x_val, static_cast<float>(quant_val), qx_acc);
+            if (has_bias) x_group_sum += x_val;
+          }
+        }
+
+        qx_acc = subgroup_reduce_sum_qmm<THREADS_PER_COL>(qx_acc);
+        x_group_sum = subgroup_reduce_sum_qmm<THREADS_PER_COL>(x_group_sum);
+        acc += scale * qx_acc + bias_val * x_group_sum;
+      } else {
+        float qx_acc = 0.0f;
+        for (int k_local = lane; k_start + k_local < k_end; k_local += THREADS_PER_COL) {
+          int k = k_start + k_local;
+          float x_val = static_cast<float>(x_row[k]);
+          uint8_t quant_val = unpack_packed_value_fast<BITS>(w_row, k, row_bytes);
+          qx_acc = fmaf(x_val, dequantize_value<BITS, false>(quant_val, 1.0f, 0.0f), qx_acc);
+        }
+        acc += scale * subgroup_reduce_sum_qmm<THREADS_PER_COL>(qx_acc);
+      }
+    }
+
+    if (lane == 0) {
+      const int orig_batch = out_perm[batch];
+      out[static_cast<int64_t>(orig_batch) * M * N + static_cast<int64_t>(row) * N + col] = static_cast<T>(acc);
+    }
+  }
+}
+
 template <
     typename T,
     typename ScaleT,
@@ -3615,6 +4359,204 @@ __global__ void gather_qmv_kernel(
   }
   out[batch * M * N + row * N + col] = (T)acc;
 }
+
+// ======================================================================
+// WMMA-accelerated gather QMV prefill kernel using rocwmma 16x16x16 tiles.
+//
+// Each wavefront (32 lanes on RDNA 3.5 / gfx1151) computes one 16x16
+// output tile.  Weights are dequantized from 4-bit packed format into
+// bf16 in shared memory, then loaded into rocwmma fragments for the
+// matrix multiply-accumulate.  Accumulation is in float32; the final
+// result is converted back to bf16 on store.
+//
+// Grid:  (ceil(M/16), ceil(N/16), num_runs)
+// Block: (32, 1, 1)   -- one wave32 per 16x16 output tile
+//
+// On architectures without WMMA support (RDNA 1/2) the kernel body is
+// an empty stub; dispatch checks prevent it from being launched there.
+// ======================================================================
+template <typename T, typename ScaleT, int BITS, int GROUP_SIZE, bool AFFINE>
+__global__ void __launch_bounds__(32) gather_qmv_wmma_prefill_kernel(
+    const T* __restrict__ x,
+    const uint8_t* __restrict__ w,
+    const ScaleT* __restrict__ scales,
+    const ScaleT* __restrict__ biases,
+    const uint32_t* __restrict__ lhs_indices,
+    const uint32_t* __restrict__ rhs_indices,
+    const int* __restrict__ run_starts,
+    const int* __restrict__ run_lengths,
+    const int* __restrict__ out_perm,  // maps sorted batch idx → original batch idx
+    T* __restrict__ out,
+    int B, int M, int N, int K, int E,
+    bool has_bias, int64_t x_batch_stride) {
+
+#if ROCM_HAS_WMMA
+
+  static_assert(BITS == 4, "WMMA prefill kernel only supports 4-bit quantized weights");
+  static_assert(AFFINE, "WMMA prefill kernel only supports affine quantization");
+
+  constexpr int WMMA_M = 16;
+  constexpr int WMMA_N = 16;
+  constexpr int WMMA_K = 16;
+
+  // Tile coordinates in the output matrix
+  const int tile_row = blockIdx.x * WMMA_M;  // starting row of this 16x16 tile
+  const int tile_col = blockIdx.y * WMMA_N;  // starting col of this 16x16 tile
+  const int run_id   = blockIdx.z;
+
+  // Bounds check -- the dispatch guarantees M and N are multiples of 16,
+  // but guard anyway for safety.
+  if (tile_row >= M || tile_col >= N) return;
+
+  const int lane = threadIdx.x;  // 0..31
+
+  // Run info
+  const int run_start = run_starts[run_id];
+  const int run_len   = run_lengths[run_id];
+
+  const uint32_t rhs_idx = rhs_indices[run_start];
+  if (rhs_idx >= static_cast<uint32_t>(E)) return;
+
+  // Weight layout constants
+  const int num_groups = (K + GROUP_SIZE - 1) / GROUP_SIZE;
+  const int row_bytes  = (K * BITS + 7) / 8;  // bytes per weight row (one output col)
+  const int64_t w_expert_stride  = static_cast<int64_t>(N) * row_bytes;
+  const int64_t sb_expert_stride = static_cast<int64_t>(N) * num_groups;
+
+  // Base pointers for this expert
+  const uint8_t* w_expert  = w      + static_cast<int64_t>(rhs_idx) * w_expert_stride;
+  const ScaleT*  s_expert  = scales + static_cast<int64_t>(rhs_idx) * sb_expert_stride;
+  const ScaleT*  b_expert  = has_bias
+      ? (biases + static_cast<int64_t>(rhs_idx) * sb_expert_stride)
+      : nullptr;
+
+  // Shared memory for dequantized weight tile [WMMA_K x WMMA_N] in row-major
+  // and for x tile [WMMA_M x WMMA_K] in row-major.
+  // Total: (16*16 + 16*16) * sizeof(hip_bfloat16) = 1024 bytes
+  __shared__ hip_bfloat16 smem_w[WMMA_K * WMMA_N];  // [16][16] row-major
+  __shared__ hip_bfloat16 smem_x[WMMA_M * WMMA_K];  // [16][16] row-major
+
+  // Fragment types for bf16 input, f32 accumulation
+  using frag_a   = rocwmma::fragment<rocwmma::matrix_a,   WMMA_M, WMMA_N, WMMA_K, hip_bfloat16, rocwmma::row_major>;
+  using frag_b   = rocwmma::fragment<rocwmma::matrix_b,   WMMA_M, WMMA_N, WMMA_K, hip_bfloat16, rocwmma::row_major>;
+  using frag_acc = rocwmma::fragment<rocwmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float>;
+
+  // Process each batch element in the run
+  for (int r = 0; r < run_len; ++r) {
+    const int batch = run_start + r;
+    const uint32_t lhs_idx = lhs_indices[batch];
+    const T* x_base = x + static_cast<int64_t>(lhs_idx) * x_batch_stride
+                        + static_cast<int64_t>(tile_row) * K;
+
+    // Zero the accumulator for this batch element
+    frag_acc acc;
+    rocwmma::fill_fragment(acc, 0.0f);
+
+    // Loop over K dimension in chunks of WMMA_K (16)
+    for (int k_base = 0; k_base < K; k_base += WMMA_K) {
+      // --- Load x tile [WMMA_M x WMMA_K] into shared memory ---
+      // 32 lanes load 256 elements (16x16) -> 8 elements per lane
+      // Pad with zero for rows beyond M (handles non-16-aligned M)
+      #pragma unroll
+      for (int i = 0; i < (WMMA_M * WMMA_K + 31) / 32; ++i) {
+        int idx = lane + i * 32;
+        if (idx < WMMA_M * WMMA_K) {
+          int m_local = idx / WMMA_K;
+          int k_local = idx % WMMA_K;
+          int m_global = tile_row + m_local;
+          int k_global = k_base + k_local;
+          if (m_global < M && k_global < K) {
+            smem_x[idx] = x_base[m_local * K + k_global];
+          } else {
+            smem_x[idx] = static_cast<hip_bfloat16>(0.0f);
+          }
+        }
+      }
+
+      // --- Dequantize weight tile [WMMA_K x WMMA_N] into shared memory ---
+      // Layout: smem_w[k][n] = dequant(w[expert, tile_col + n, k_base + k])
+      // w is stored as [N, row_bytes], each row for one output column.
+      // We need 16 columns x 16 K values = 256 values, 8 per lane.
+      #pragma unroll
+      for (int i = 0; i < (WMMA_K * WMMA_N + 31) / 32; ++i) {
+        int idx = lane + i * 32;
+        if (idx < WMMA_K * WMMA_N) {
+          int k_local = idx / WMMA_N;  // row in [K, N]
+          int n_local = idx % WMMA_N;  // col in [K, N]
+          int k_global = k_base + k_local;
+          int n_global = tile_col + n_local;
+
+          if (k_global < K) {
+            // Pointer to weight row for output column n_global
+            const uint8_t* w_row = w_expert + static_cast<int64_t>(n_global) * row_bytes;
+
+            // Extract 4-bit quantized value
+            uint8_t packed = w_row[k_global >> 1];
+            uint8_t quant_val = (k_global & 1) ? (packed >> 4) : (packed & 0xF);
+
+            // Dequantize: val = scale * quant_val + bias
+            int group_idx = k_global / GROUP_SIZE;
+            float scale = static_cast<float>(
+                s_expert[static_cast<int64_t>(n_global) * num_groups + group_idx]);
+            float bias_val = has_bias
+                ? static_cast<float>(
+                    b_expert[static_cast<int64_t>(n_global) * num_groups + group_idx])
+                : 0.0f;
+            float dequant = scale * static_cast<float>(quant_val) + bias_val;
+            smem_w[idx] = static_cast<hip_bfloat16>(dequant);
+          } else {
+            smem_w[idx] = static_cast<hip_bfloat16>(0.0f);
+          }
+        }
+      }
+
+      __syncthreads();
+
+      // --- Load fragments from shared memory and perform MMA ---
+      frag_a a_frag;
+      frag_b b_frag;
+
+      // Load A from smem_x [WMMA_M x WMMA_K], row-major, ldm = WMMA_K
+      rocwmma::load_matrix_sync(a_frag, smem_x, WMMA_K);
+      // Load B from smem_w [WMMA_K x WMMA_N], row-major, ldm = WMMA_N
+      rocwmma::load_matrix_sync(b_frag, smem_w, WMMA_N);
+
+      // D = A * B + C
+      rocwmma::mma_sync(acc, a_frag, b_frag, acc);
+
+      __syncthreads();
+    }
+
+    // --- Store the 16x16 result tile ---
+    // Store f32 accumulator to shared memory, then convert to bf16 for output.
+    __shared__ float smem_out_f32[WMMA_M * WMMA_N];
+
+    rocwmma::store_matrix_sync(smem_out_f32, acc, WMMA_N, rocwmma::mem_row_major);
+    __syncthreads();
+
+    // Convert f32 -> bf16 and write to global output (mask out-of-bounds rows)
+    // Use out_perm to map sorted batch position back to original output position
+    const int orig_batch = out_perm[batch];
+    T* out_base = out + static_cast<int64_t>(orig_batch) * M * N
+                      + static_cast<int64_t>(tile_row) * N
+                      + tile_col;
+    #pragma unroll
+    for (int i = 0; i < (WMMA_M * WMMA_N + 31) / 32; ++i) {
+      int idx = lane + i * 32;
+      if (idx < WMMA_M * WMMA_N) {
+        int m_local = idx / WMMA_N;
+        int n_local = idx % WMMA_N;
+        if (tile_row + m_local < M) {
+          out_base[m_local * N + n_local] = static_cast<T>(smem_out_f32[idx]);
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+#endif // ROCM_HAS_WMMA
+}
+
 } // namespace rocm
 
 void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
@@ -3690,16 +4632,202 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   bool use_fast_gather_qmv = transpose_ && bits_supported_by_fast;
   use_fast_gather_qmv = parse_warp_kernel_env(
       "MLX_ROCM_GATHER_QMV_USE_WARP", use_fast_gather_qmv);
+  // ---- Prefill optimization: group by expert for M>1 ----
+  // Works with both sorted and unsorted rhs_indices; we sort on CPU.
+  // NOTE: MLX's MoE expands tokens to B individual M=1 calls, so M>1 is rare.
+  // The WMMA prefill kernel is used when upstream batching produces M>1.
+  if (M > 1 && transpose_ && E > 0 && batch_ndim == 1 &&
+      mode_ == QuantizationMode::Affine && x.dtype() == bfloat16 &&
+      group_size_ == 64 && (bits_ == 4 || bits_ == 8)) {
+    // Sort batch elements by expert to form contiguous runs.
+    // This allows the kernel to process all tokens for one expert together,
+    // sharing weight reads. We create a sorted permutation on CPU.
+    const auto* ri_cpu = rhs_indices.data<uint32_t>();
+    const auto* li_cpu = lhs_indices.data<uint32_t>();
+
+    // Create sort permutation by expert index
+    std::vector<int> perm(B);
+    std::iota(perm.begin(), perm.end(), 0);
+    std::sort(perm.begin(), perm.end(), [&](int a, int b) {
+      return ri_cpu[a] < ri_cpu[b];
+    });
+
+    // Build sorted index arrays and compute runs
+    std::vector<uint32_t> sorted_ri(B), sorted_li(B);
+    for (int i = 0; i < B; ++i) {
+      sorted_ri[i] = ri_cpu[perm[i]];
+      sorted_li[i] = li_cpu[perm[i]];
+    }
+
+    std::vector<int> run_starts_vec, run_lengths_vec;
+    run_starts_vec.reserve(E);
+    run_lengths_vec.reserve(E);
+    int run_begin = 0;
+    for (int b = 1; b <= B; ++b) {
+      if (b == B || sorted_ri[b] != sorted_ri[run_begin]) {
+        run_starts_vec.push_back(run_begin);
+        run_lengths_vec.push_back(b - run_begin);
+        run_begin = b;
+      }
+    }
+    int num_runs = static_cast<int>(run_starts_vec.size());
+
+    // Upload sorted indices to GPU
+    array sorted_ri_arr({B}, uint32, nullptr, {});
+    array sorted_li_arr({B}, uint32, nullptr, {});
+    sorted_ri_arr.set_data(allocator::malloc(sorted_ri_arr.nbytes()));
+    sorted_li_arr.set_data(allocator::malloc(sorted_li_arr.nbytes()));
+    std::memcpy(sorted_ri_arr.data<uint32_t>(), sorted_ri.data(), B * sizeof(uint32_t));
+    std::memcpy(sorted_li_arr.data<uint32_t>(), sorted_li.data(), B * sizeof(uint32_t));
+    enc.set_input_array(sorted_ri_arr);
+    enc.set_input_array(sorted_li_arr);
+
+    // Also need a mapping from sorted position back to original batch index for output
+    array perm_arr({B}, int32, nullptr, {});
+    perm_arr.set_data(allocator::malloc(perm_arr.nbytes()));
+    std::memcpy(perm_arr.data<int>(), perm.data(), B * sizeof(int));
+    enc.set_input_array(perm_arr);
+
+    // Upload run info to GPU
+    array run_starts_arr({num_runs}, int32, nullptr, {});
+    array run_lengths_arr({num_runs}, int32, nullptr, {});
+    run_starts_arr.set_data(allocator::malloc(run_starts_arr.nbytes()));
+    run_lengths_arr.set_data(allocator::malloc(run_lengths_arr.nbytes()));
+    std::memcpy(run_starts_arr.data<int>(), run_starts_vec.data(), num_runs * sizeof(int));
+    std::memcpy(run_lengths_arr.data<int>(), run_lengths_vec.data(), num_runs * sizeof(int));
+    enc.set_input_array(run_starts_arr);
+    enc.set_input_array(run_lengths_arr);
+
+    int64_t x_bs = (x_batch_count == 1) ? 0 : static_cast<int64_t>(M) * K;
+
+    // ---- WMMA path: use 16x16x16 wave matrix multiply when tiles align ----
+    // WMMA tiles are 16x16; kernel handles non-aligned M with bounds masking.
+    // N must be 16-aligned (typical for transformer hidden dimensions).
+    bool use_wmma = (M >= 2) && (N % 16 == 0) && (bits_ == 4);
+    use_wmma = parse_warp_kernel_env("MLX_ROCM_GATHER_QMV_USE_WMMA", use_wmma);
+
+    if (use_wmma) {
+      // One wave32 per 16x16 output tile
+      dim3 wmma_block(32, 1, 1);
+      dim3 wmma_grid((M + 15) / 16, (N + 15) / 16, num_runs);
+      // Shared memory: smem_w[16*16] + smem_x[16*16] bf16 + smem_out_f32[16*16] f32
+      // = 512 + 512 + 1024 = 2048 bytes
+      size_t wmma_smem = 0;  // static shared memory, declared in-kernel
+
+      enc.launch_kernel([&](hipStream_t stream) {
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_wmma_prefill_kernel<hip_bfloat16, hip_bfloat16, 4, 64, true>),
+            wmma_grid, wmma_block, wmma_smem, stream,
+            gpu_ptr<const hip_bfloat16>(x),
+            gpu_ptr<const uint8_t>(w),
+            gpu_ptr<const hip_bfloat16>(scales),
+            has_bias ? gpu_ptr<const hip_bfloat16>(*biases) : nullptr,
+            gpu_ptr<const uint32_t>(sorted_li_arr),
+            gpu_ptr<const uint32_t>(sorted_ri_arr),
+            gpu_ptr<const int>(run_starts_arr),
+            gpu_ptr<const int>(run_lengths_arr),
+            gpu_ptr<const int>(perm_arr),
+            gpu_ptr<hip_bfloat16>(out),
+            B, M, N, K, E, has_bias, x_bs);
+      });
+      return;
+    }
+
+    // ---- Scalar prefill fallback ----
+    int fast_threads_per_col_pf = select_qmv_threads_per_col(K, N, bits_, num_runs);
+    int fast_cols_per_block_pf = select_qmv_cols_per_block(K, N, bits_);
+    int max_cpb = rocm::kMaxThreadsPerBlock / fast_threads_per_col_pf;
+    while (fast_cols_per_block_pf > max_cpb) fast_cols_per_block_pf /= 2;
+    while (fast_cols_per_block_pf > 1 && (N % fast_cols_per_block_pf) != 0 && fast_cols_per_block_pf > 8)
+      fast_cols_per_block_pf /= 2;
+
+    dim3 pf_block(fast_threads_per_col_pf, fast_cols_per_block_pf);
+    dim3 pf_grid(M, (N + fast_cols_per_block_pf - 1) / fast_cols_per_block_pf, num_runs);
+
+    enc.launch_kernel([&](hipStream_t stream) {
+      auto launch_pf = [&](auto bits_tag) {
+        constexpr int BITS = decltype(bits_tag)::value;
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_prefill_kernel<hip_bfloat16, hip_bfloat16, BITS, 64, true, 16>),
+            pf_grid, pf_block, 0, stream,
+            gpu_ptr<const hip_bfloat16>(x),
+            gpu_ptr<const uint8_t>(w),
+            gpu_ptr<const hip_bfloat16>(scales),
+            has_bias ? gpu_ptr<const hip_bfloat16>(*biases) : nullptr,
+            gpu_ptr<const uint32_t>(sorted_li_arr),
+            gpu_ptr<const uint32_t>(sorted_ri_arr),
+            gpu_ptr<const int>(run_starts_arr),
+            gpu_ptr<const int>(run_lengths_arr),
+            gpu_ptr<const int>(perm_arr),
+            gpu_ptr<hip_bfloat16>(out),
+            B, M, N, K, E, has_bias, x_bs);
+      };
+      if (bits_ == 4) launch_pf(std::integral_constant<int, 4>{});
+      else launch_pf(std::integral_constant<int, 8>{});
+    });
+    return;
+  }
+
   const void *x_ptr = gpu_ptr<void>(x), *w_ptr = gpu_ptr<void>(w),
              *scales_ptr = gpu_ptr<void>(scales),
              *biases_ptr = has_bias ? gpu_ptr<void>(*biases) : nullptr;
   const uint32_t *li_ptr = gpu_ptr<const uint32_t>(lhs_indices),
                  *ri_ptr = gpu_ptr<const uint32_t>(rhs_indices);
   void* out_ptr = gpu_ptr<void>(out);
+
+  // GPU-only expert-batched kernel: when indices are sorted, each block finds
+  // its expert's token range on-GPU and processes them together. Weight data
+  // loaded once per expert column, reused across all tokens for that expert.
+  // max_unique_experts = min(B, E) is an upper bound on unique experts.
+  // Expert-batched kernel: beneficial when few experts have many tokens each.
+  // For high-expert-count models (E=512, top_k=10), most runs have 1-4 tokens,
+  // so the per-block run-finding overhead outweighs the shared weight benefit.
+  // Enable only when B/E is high enough (e.g., low expert count with long prompt).
+  bool use_expert_batched = transpose_ && right_sorted_ && (M == 1) &&
+      (B >= 64) && (E > 0) && (E <= 64) && (B / E >= 4) &&
+      mode_ == QuantizationMode::Affine &&
+      x.dtype() == bfloat16 && group_size_ == 64 && (bits_ == 4 || bits_ == 8);
+  use_expert_batched = parse_warp_kernel_env(
+      "MLX_ROCM_GATHER_QMV_EXPERT_BATCHED", use_expert_batched);
+
+  if (use_expert_batched) {
+    int max_unique_experts = std::min(B, E);
+    int eb_threads_per_col = select_qmv_threads_per_col(K, N, bits_, max_unique_experts);
+    int eb_cols_per_block = select_qmv_cols_per_block(K, N, bits_);
+    int eb_max_cpb = rocm::kMaxThreadsPerBlock / eb_threads_per_col;
+    while (eb_cols_per_block > eb_max_cpb) eb_cols_per_block /= 2;
+    while (eb_cols_per_block > 1 && (N % eb_cols_per_block) != 0 && eb_cols_per_block > 8)
+      eb_cols_per_block /= 2;
+
+    dim3 eb_block(eb_threads_per_col, eb_cols_per_block);
+    dim3 eb_grid(M, (N + eb_cols_per_block - 1) / eb_cols_per_block, max_unique_experts);
+
+    enc.launch_kernel([&](hipStream_t stream) {
+      auto launch_eb = [&](auto bits_tag) {
+        constexpr int BITS = decltype(bits_tag)::value;
+        hipLaunchKernelGGL(
+            (rocm::gather_qmv_expert_batched_kernel<
+                hip_bfloat16, hip_bfloat16, BITS, 64, true, 16>),
+            eb_grid, eb_block, 0, stream,
+            (const hip_bfloat16*)x_ptr,
+            (const uint8_t*)w_ptr,
+            (const hip_bfloat16*)scales_ptr,
+            (const hip_bfloat16*)biases_ptr,
+            li_ptr, ri_ptr,
+            (hip_bfloat16*)out_ptr,
+            B, M, N, K, E, has_bias,
+            use_sorted_rhs_schedule, implicit_x_batch_stride);
+      };
+      if (bits_ == 4) launch_eb(std::integral_constant<int, 4>{});
+      else launch_eb(std::integral_constant<int, 8>{});
+    });
+    return;
+  }
+
   enc.launch_kernel([&](hipStream_t stream) {
     if (use_fast_gather_qmv && mode_ == QuantizationMode::Affine &&
         x.dtype() == bfloat16 && group_size_ == 64 &&
-        (bits_ == 6 || bits_ == 8)) {
+        (bits_ == 4 || bits_ == 6 || bits_ == 8)) {
       auto launch_fast_kernel = [&](auto bits_tag) {
         constexpr int BITS = decltype(bits_tag)::value;
         if (fast_threads_per_col == 16) {
@@ -3769,7 +4897,9 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         }
       };
 
-      if (bits_ == 6) {
+      if (bits_ == 4) {
+        launch_fast_kernel(std::integral_constant<int, 4>{});
+      } else if (bits_ == 6) {
         launch_fast_kernel(std::integral_constant<int, 6>{});
       } else {
         launch_fast_kernel(std::integral_constant<int, 8>{});

@@ -10,17 +10,20 @@ find_package(rocblas REQUIRED CONFIG)
 find_package(rocthrust REQUIRED CONFIG)
 find_package(rocprim REQUIRED CONFIG)
 find_package(hiprand REQUIRED CONFIG)
+find_package(rocwmma REQUIRED CONFIG)
 
 # Ensure HIP architectures are set - respect user-provided value from command
 # line The user can set this via -DCMAKE_HIP_ARCHITECTURES=gfx1011
 #
-# Supported architectures from ROCm 6.4.0 - 7.2.0 compatibility matrix: CDNA:
-# gfx908 (MI100), gfx90a (MI200), gfx942 (MI300) CDNA4: gfx950 (MI400 series)
-# RDNA2: gfx1030 (RX 6000 series) RDNA3: gfx1100 (RX 7900), gfx1101 (RX 7600)
-# RDNA4: gfx1200, gfx1201 (RX 8000 series)
+# Supported architectures from ROCm 6.4.0 - 7.2.0 compatibility matrix:
+# CDNA:   gfx908 (MI100), gfx90a (MI200), gfx942 (MI300)
+# RDNA2:  gfx1030 (RX 6000 series)
+# RDNA3:  gfx1100 (RX 7900), gfx1101 (RX 7600)
+# RDNA3.5: gfx1150, gfx1151, gfx1152 (Ryzen AI / Radeon 8060S)
+# RDNA4:  gfx1200, gfx1201 (RX 9000 series)
 if(NOT CMAKE_HIP_ARCHITECTURES)
   set(CMAKE_HIP_ARCHITECTURES
-      "gfx908;gfx90a;gfx942;gfx1010;gfx1011;gfx1012;gfx1030;gfx1031;gfx1032;gfx1100;gfx1101;gfx1102"
+      "gfx908;gfx90a;gfx942;gfx1010;gfx1011;gfx1012;gfx1030;gfx1031;gfx1032;gfx1100;gfx1101;gfx1102;gfx1150;gfx1151;gfx1152;gfx1200;gfx1201"
       CACHE STRING "HIP architectures" FORCE)
 endif()
 message(
@@ -39,6 +42,8 @@ get_target_property(ROCTHRUST_INCLUDES roc::rocthrust
                     INTERFACE_INCLUDE_DIRECTORIES)
 get_target_property(ROCPRIM_INCLUDES roc::rocprim INTERFACE_INCLUDE_DIRECTORIES)
 get_target_property(HIPRAND_INCLUDES hip::hiprand INTERFACE_INCLUDE_DIRECTORIES)
+get_target_property(ROCWMMA_INCLUDES roc::rocwmma
+                    INTERFACE_INCLUDE_DIRECTORIES)
 
 # Find GCC installation for C++ standard library headers ROCm's clang needs to
 # know where to find libstdc++ headers
@@ -101,6 +106,11 @@ foreach(inc ${HIPRAND_INCLUDES})
     list(APPEND HIP_INCLUDE_FLAGS "-I${inc}")
   endif()
 endforeach()
+foreach(inc ${ROCWMMA_INCLUDES})
+  if(inc)
+    list(APPEND HIP_INCLUDE_FLAGS "-I${inc}")
+  endif()
+endforeach()
 
 message(STATUS "HIP include flags: ${HIP_INCLUDE_FLAGS}")
 
@@ -147,6 +157,20 @@ set(HIP_SOURCES
 set(HIP_OBJ_DIR "${CMAKE_CURRENT_BINARY_DIR}/hip_objs")
 file(MAKE_DIRECTORY ${HIP_OBJ_DIR})
 
+# Detect CPU count for parallel HIP offload compilation
+# Use half of available CPUs for parallel HIP offload compilation per file
+# (Ninja already parallelizes across files, so this avoids oversubscription)
+include(ProcessorCount)
+ProcessorCount(NPROC)
+if(NPROC EQUAL 0)
+  set(NPROC 4)
+else()
+  math(EXPR NPROC "${NPROC} / 2")
+  if(NPROC LESS 2)
+    set(NPROC 2)
+  endif()
+endif()
+
 # Compile each HIP file to object file using custom commands Use -fno-gpu-rdc to
 # avoid needing device link step
 set(HIP_OBJECTS "")
@@ -168,6 +192,7 @@ foreach(hip_src ${HIP_SOURCES})
     OUTPUT ${hip_obj}
     COMMAND ${CMAKE_HIP_COMPILER} -c ${hip_src} -o ${hip_obj} -fPIC
             -DMLX_USE_ROCM ${HIP_ARCH_FLAGS} ${HIP_INCLUDE_FLAGS} -std=c++17
+            -parallel-jobs=${NPROC}
     DEPENDS ${hip_src}
     COMMENT "Compiling HIP source ${hip_src}"
     VERBATIM)
@@ -211,7 +236,8 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/utils.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/worker.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/conv/conv.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/gemms/rocblas_gemm.cpp)
+          ${CMAKE_CURRENT_SOURCE_DIR}/gemms/rocblas_gemm.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/gemms/hipblaslt_gemm.cpp)
 
 target_compile_definitions(mlx PRIVATE MLX_USE_ROCM)
 
@@ -247,16 +273,21 @@ find_library(AMDHIP64_LIB amdhip64 PATHS ${ROCM_PATH}/lib /opt/rocm/lib
 find_library(HIPRTC_LIB hiprtc PATHS ${ROCM_PATH}/lib /opt/rocm/lib
                                      /opt/rocm-6.0.0/lib)
 
+# Find hipBLASLt library (optimized GEMM for half-precision)
+find_library(HIPBLASLT_LIB hipblaslt PATHS ${ROCM_PATH}/lib /opt/rocm/lib
+                                           /opt/rocm-6.0.0/lib)
+
 message(
   STATUS
-    "ROCm libraries: rocblas=${ROCBLAS_LIB}, hiprand=${HIPRAND_LIB}, amdhip64=${AMDHIP64_LIB}, hiprtc=${HIPRTC_LIB}"
+    "ROCm libraries: rocblas=${ROCBLAS_LIB}, hiprand=${HIPRAND_LIB}, amdhip64=${AMDHIP64_LIB}, hiprtc=${HIPRTC_LIB}, hipblaslt=${HIPBLASLT_LIB}"
 )
 
 # Link the static library and ROCm libraries to mlx We link directly to the .so
 # files instead of using CMake targets to avoid propagating compile options like
 # -x hip
 target_link_libraries(mlx PRIVATE ${HIP_STATIC_LIB} ${AMDHIP64_LIB}
-                                  ${ROCBLAS_LIB} ${HIPRAND_LIB} ${HIPRTC_LIB})
+                                  ${ROCBLAS_LIB} ${HIPRAND_LIB} ${HIPRTC_LIB}
+                                  ${HIPBLASLT_LIB})
 
 # Include ROCm headers for mlx C++ files Get the HIP include directory from the
 # hip package

@@ -35,13 +35,26 @@ static bool rocm_available() {
   return available == 1;
 }
 
-// Check if managed memory is supported on this device
+// Check if managed memory (HMM) is supported on this device.
+// On integrated GPUs (Strix Halo), HMM is actually fast since there's no
+// discrete VRAM — managed memory avoids the overhead of hipExtMallocWithFlags.
 static bool managed_memory_supported() {
-  // Always return false to force the use of hipHostMalloc (GTT RAM).
-  // hipMallocManaged uses HMM, which causes implicit page migrations and
-  // significant memory copying between host and device on access.
-  // Using hipHostMalloc maps pinned host memory directly to the GPU's address space.
-  return false;
+  static int supported = -1;
+  if (supported < 0) {
+    if (!rocm_available()) {
+      supported = 0;
+    } else {
+      void* test_ptr = nullptr;
+      hipError_t err = hipMallocManaged(&test_ptr, 64);
+      if (err == hipSuccess) {
+        (void)hipFree(test_ptr);
+        supported = 1;
+      } else {
+        supported = 0;
+      }
+    }
+  }
+  return supported == 1;
 }
 
 static bool is_integrated() {
@@ -64,18 +77,18 @@ inline void* rocm_unified_malloc(size_t size, bool& is_managed) {
   void* data = nullptr;
   hipError_t err;
   if (is_integrated()) {
+    // Unified memory device (iGPU/APU): CPU and GPU share system RAM.
+    // Try hipExtMallocWithFlags first (fine-grained coherent, best GPU
+    // bandwidth). Falls back to hipMallocManaged for large allocations
+    // that exceed the small device-local VRAM (~2GB).
     err = hipExtMallocWithFlags(&data, size, hipDeviceMallocFinegrained);
-    is_managed = true; // Use is_managed=true to signify hipFree should be used
+    if (err != hipSuccess) {
+      err = hipMallocManaged(&data, size);
+    }
+    is_managed = true;
   } else if (managed_memory_supported()) {
     err = hipMallocManaged(&data, size);
     is_managed = true;
-    if (err == hipSuccess) {
-      int device_count = 0;
-      (void)hipGetDeviceCount(&device_count);
-      for (int i = 0; i < device_count; ++i) {
-        (void)hipMemAdvise(data, size, hipMemAdviseSetAccessedBy, i);
-      }
-    }
   } else {
     err = hipHostMalloc(&data, size, hipHostMallocDefault);
     is_managed = false;
@@ -193,6 +206,14 @@ Buffer RocmAllocator::malloc(size_t size) {
   }
 
   // Find available buffer from cache.
+  // Use aggressive size rounding to maximize cache hit rate:
+  // - Small (<=8B): scalar pool
+  // - Medium (<16KB): power-of-2
+  // - Large (<1MB): 16KB page aligned
+  // - Very large (>=1MB): power-of-2 (coarser buckets = more cache hits)
+  // The power-of-2 rounding for large allocations is critical for decode —
+  // without it, slightly different sizes (e.g., 1.01MB vs 1.02MB) miss the
+  // cache and trigger hipExtMallocWithFlags at ~7ms each.
   auto orig_size = size;
   std::unique_lock lock(mutex_);
   if (size <= small_block_size) {
@@ -219,14 +240,11 @@ Buffer RocmAllocator::malloc(size_t size) {
     lock.unlock();
     if (!buf) {
       if (is_integrated()) {
-        buf = new RocmBuffer{nullptr, size, false, -1};
-        hipError_t err = hipExtMallocWithFlags(&buf->data, size, hipDeviceMallocFinegrained);
-        if (err != hipSuccess) {
-          delete buf;
-          std::ostringstream oss;
-          oss << "hipExtMallocWithFlags failed: " << hipGetErrorString(err) << ".";
-          throw std::runtime_error(oss.str());
-        }
+        // Integrated GPU: allocate unified memory (CPU+GPU accessible).
+        // device=-1 signals unified memory — no move_to_unified_memory needed.
+        bool is_managed = false;
+        void* data = rocm_unified_malloc(size, is_managed);
+        buf = new RocmBuffer{data, size, is_managed, -1};
       } else {
         int device = 0;
         hipGetDevice(&device);
@@ -373,12 +391,18 @@ void* Buffer::raw_ptr() {
   if (!ptr_) {
     return nullptr;
   }
-  // Synchronize all streams before accessing memory from CPU
-  // This ensures all GPU operations have completed
-  (void)hipDeviceSynchronize();
-  
   auto& cbuf = *static_cast<rocm::RocmBuffer*>(ptr_);
-  rocm::allocator().move_to_unified_memory(cbuf);
+
+  if (cbuf.device == -1) {
+    // Unified memory (integrated GPU or hipMallocManaged): CPU-accessible.
+    // hipStreamSynchronize(nullptr) waits for the default stream — lighter
+    // than hipDeviceSynchronize which waits for ALL streams.
+    (void)hipStreamSynchronize(nullptr);
+  } else {
+    // Discrete GPU VRAM: full sync + migrate to host-accessible memory.
+    (void)hipDeviceSynchronize();
+    rocm::allocator().move_to_unified_memory(cbuf);
+  }
   return cbuf.data;
 }
 

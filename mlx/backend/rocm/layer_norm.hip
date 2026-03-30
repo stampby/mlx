@@ -111,7 +111,9 @@ __global__ void layer_norm_kernel(
     shared_sum[0] = var_sum;
   }
   __syncthreads();
-  float normalizer = rsqrtf(shared_sum[0] / axis_size + eps);
+  // Use 1/sqrt instead of rsqrtf for IEEE-compliant precision
+  // (matches Metal's metal::precise::rsqrt behavior)
+  float normalizer = 1.0f / sqrtf(shared_sum[0] / axis_size + eps);
 
   // Write output
   for (int i = threadIdx.x * N_READS; i < axis_size; i += BLOCK_DIM * N_READS) {

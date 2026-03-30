@@ -4,8 +4,11 @@
 #include "mlx/backend/rocm/kernel_utils.hpp"
 #include "mlx/backend/rocm/jit_module.h"
 #include "mlx/backend/rocm/device/indexing.hpp"
+#include "mlx/backend/rocm/device/binary_ops.hpp"
 #include "mlx/backend/rocm/device/utils.hpp"
 #include "mlx/backend/gpu/copy.h"
+#include "mlx/backend/common/slicing.h"
+#include "mlx/backend/common/utils.h"
 #include "mlx/dtype_utils.h"
 #include "mlx/primitives.h"
 
@@ -393,6 +396,69 @@ __global__ void scatter_general_kernel(
           break;
         }
       }
+    }
+  }
+}
+
+// SliceUpdate kernel: applies Op to combine existing output values with
+// update values at computed slice positions.
+template <
+    typename T,
+    typename IdxT,
+    typename Op,
+    bool OUT_ROW_CONTIG,
+    bool UPD_ROW_CONTIG,
+    bool UPD_SCALAR,
+    int NWORK>
+__global__ void slice_update_op_kernel(
+    const T* updates,
+    T* out,
+    int64_t update_size,
+    hip_array<int32_t, MAX_NDIM> update_shape,
+    hip_array<int64_t, MAX_NDIM> update_strides,
+    int32_t update_ndim,
+    hip_array<int64_t, MAX_NDIM> output_strides,
+    int64_t output_offset) {
+  Op op;
+
+  IdxT idx = (IdxT(blockIdx.x) * IdxT(blockDim.x) + IdxT(threadIdx.x)) * NWORK;
+  IdxT out_idx;
+  IdxT update_idx;
+
+  if constexpr (OUT_ROW_CONTIG) {
+    out_idx = idx;
+  } else {
+    out_idx = elem_to_loc<IdxT>(
+        idx, update_shape.data_, output_strides.data_, update_ndim);
+  }
+
+  if constexpr (!UPD_SCALAR) {
+    if constexpr (UPD_ROW_CONTIG) {
+      update_idx = idx;
+    } else {
+      update_idx = elem_to_loc<IdxT>(
+          idx, update_shape.data_, update_strides.data_, update_ndim);
+    }
+  } else {
+    update_idx = 0;
+  }
+
+  out += output_offset;
+
+  for (int j = 0; j < NWORK && idx < update_size; j++) {
+    out[out_idx] = op(out[out_idx], updates[update_idx]);
+    idx++;
+
+    if constexpr (OUT_ROW_CONTIG) {
+      out_idx = idx;
+    } else {
+      out_idx += output_strides[update_ndim - 1];
+    }
+
+    if constexpr (UPD_ROW_CONTIG) {
+      update_idx = idx;
+    } else if constexpr (!UPD_SCALAR) {
+      update_idx += update_strides[update_ndim - 1];
     }
   }
 }
@@ -1114,6 +1180,147 @@ void ScatterAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
   #undef DISPATCH_CONTIGUOUS
   #undef DISPATCH_NDIM
   #undef DISPATCH_IDX_TYPE
+}
+
+void SliceUpdate::eval_gpu(const std::vector<array>& inputs, array& out) {
+  assert(inputs.size() == 2);
+  if (out.size() == 0) {
+    return;
+  }
+
+  auto& in = inputs[0];
+  auto& upd = inputs[1];
+
+  if (upd.size() == 0) {
+    out.copy_shared_buffer(in);
+    return;
+  }
+
+  auto ctype = in.flags().contiguous && in.size() == in.data_size()
+      ? CopyType::Vector
+      : CopyType::General;
+  copy_gpu(in, out, in.data_size() == 1 ? CopyType::Scalar : ctype, stream());
+
+  // Calculate out strides, initial offset
+  auto [data_offset, out_strides] =
+      prepare_slice(out, start_indices_, strides_);
+
+  // Do copy for None reduce type
+  if (reduce_type_ == SliceUpdate::None) {
+    copy_gpu_inplace(
+        /* const array& src = */ upd,
+        /* array& dst = */ out,
+        /* const Shape& data_shape = */ upd.shape(),
+        /* const Strides& i_strides = */ upd.strides(),
+        /* const Strides& o_strides = */ out_strides,
+        /* int64_t i_offset = */ 0,
+        /* int64_t o_offset = */ data_offset,
+        /* CopyType ctype = */ CopyType::GeneralGeneral,
+        /* const Stream& s = */ stream());
+    return;
+  }
+
+  // For reduce types (Sum/Prod/Max/Min), launch a kernel
+  auto [shape, strides] =
+      collapse_contiguous_dims(upd.shape(), {upd.strides(), out_strides});
+  int nwork = 1;
+  if (shape.back() % 4 == 0) {
+    nwork = 4;
+  } else if (shape.back() % 2 == 0) {
+    nwork = 2;
+  }
+
+  auto [ds, rc, cc] = check_contiguity(shape, strides[1]);
+  bool upd_contiguous = upd.flags().row_contiguous;
+  bool upd_scalar = upd.data_size() == 1;
+  bool out_contiguous = rc;
+
+  int ndim = shape.size();
+
+  auto& s = stream();
+  auto& encoder = rocm::get_command_encoder(s);
+
+  encoder.set_input_array(upd);
+  encoder.set_output_array(out);
+
+  auto shape_param = const_param(shape);
+  auto upd_strides_param = const_param(strides[0]);
+  auto out_strides_param = const_param(strides[1]);
+
+  int64_t update_size = upd.size();
+  int block_size = 256;
+  int64_t adjusted_size = (update_size + nwork - 1) / nwork;
+  int num_blocks = static_cast<int>(
+      std::min((adjusted_size + block_size - 1) / block_size, (int64_t)65535));
+
+  #define SLICE_UPDATE_LAUNCH(T, Op, OUT_C, UPD_C, UPD_S, NWORK_VAL) \
+    hipLaunchKernelGGL( \
+        (rocm::slice_update_op_kernel<T, int64_t, Op, OUT_C, UPD_C, UPD_S, NWORK_VAL>), \
+        dim3(num_blocks), dim3(block_size), 0, stream, \
+        gpu_ptr<T>(upd), gpu_ptr<T>(out), update_size, \
+        shape_param, upd_strides_param, ndim, \
+        out_strides_param, data_offset)
+
+  // Dispatch helper for NWORK
+  #define DISPATCH_NWORK(T, Op, OUT_C, UPD_C, UPD_S) \
+    switch (nwork) { \
+      case 4: SLICE_UPDATE_LAUNCH(T, Op, OUT_C, UPD_C, UPD_S, 4); break; \
+      case 2: SLICE_UPDATE_LAUNCH(T, Op, OUT_C, UPD_C, UPD_S, 2); break; \
+      default: SLICE_UPDATE_LAUNCH(T, Op, OUT_C, UPD_C, UPD_S, 1); break; \
+    }
+
+  // Dispatch helper for contiguity flags
+  #define DISPATCH_CONTIG(T, Op) \
+    if (upd_scalar) { \
+      if (out_contiguous) { \
+        DISPATCH_NWORK(T, Op, true, false, true); \
+      } else { \
+        DISPATCH_NWORK(T, Op, false, false, true); \
+      } \
+    } else if (upd_contiguous && out_contiguous) { \
+      DISPATCH_NWORK(T, Op, true, true, false); \
+    } else if (upd_contiguous) { \
+      DISPATCH_NWORK(T, Op, false, true, false); \
+    } else if (out_contiguous) { \
+      DISPATCH_NWORK(T, Op, true, false, false); \
+    } else { \
+      DISPATCH_NWORK(T, Op, false, false, false); \
+    }
+
+  // Dispatch helper for reduce type
+  #define DISPATCH_SLICE_OP(T) \
+    switch (reduce_type_) { \
+      case SliceUpdate::Max: DISPATCH_CONTIG(T, rocm::Maximum); break; \
+      case SliceUpdate::Min: DISPATCH_CONTIG(T, rocm::Minimum); break; \
+      case SliceUpdate::Sum: DISPATCH_CONTIG(T, rocm::Add); break; \
+      case SliceUpdate::Prod: DISPATCH_CONTIG(T, rocm::Multiply); break; \
+      default: \
+        throw std::runtime_error("SliceUpdate: unsupported reduce type"); \
+    }
+
+  encoder.launch_kernel([&](hipStream_t stream) {
+    switch (out.dtype()) {
+      case float32: DISPATCH_SLICE_OP(float); break;
+      case float16: DISPATCH_SLICE_OP(__half); break;
+      case bfloat16: DISPATCH_SLICE_OP(hip_bfloat16); break;
+      case int32: DISPATCH_SLICE_OP(int32_t); break;
+      case int64: DISPATCH_SLICE_OP(int64_t); break;
+      case uint32: DISPATCH_SLICE_OP(uint32_t); break;
+      case uint64: DISPATCH_SLICE_OP(uint64_t); break;
+      case int8: DISPATCH_SLICE_OP(int8_t); break;
+      case int16: DISPATCH_SLICE_OP(int16_t); break;
+      case uint8: DISPATCH_SLICE_OP(uint8_t); break;
+      case uint16: DISPATCH_SLICE_OP(uint16_t); break;
+      case bool_: DISPATCH_SLICE_OP(bool); break;
+      default:
+        throw std::runtime_error("Unsupported dtype for SliceUpdate");
+    }
+  });
+
+  #undef DISPATCH_SLICE_OP
+  #undef DISPATCH_CONTIG
+  #undef DISPATCH_NWORK
+  #undef SLICE_UPDATE_LAUNCH
 }
 
 void MaskedScatter::eval_gpu(const std::vector<array>& inputs, array& out) {

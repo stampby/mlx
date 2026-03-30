@@ -42,8 +42,7 @@ rocblas_handle Device::get_rocblas_handle() {
     std::string arch_name = props.gcnArchName;
 
     // List of architectures supported by rocBLAS (based on TensileLibrary
-    // files) These are the architectures that have TensileLibrary_lazy_*.dat
-    // files
+    // files). These are the architectures that have TensileLibrary_lazy_*.dat.
     static const std::vector<std::string> supported_archs = {
         "gfx908",
         "gfx90a",
@@ -55,6 +54,7 @@ rocblas_handle Device::get_rocblas_handle() {
         "gfx1102",
         "gfx1150",
         "gfx1151",
+        "gfx1152",
         "gfx1200",
         "gfx1201"};
 
@@ -105,14 +105,88 @@ rocblas_handle Device::get_rocblas_handle() {
 
 bool Device::is_rocblas_available() {
   if (!rocblas_initialized_) {
-    // Trigger initialization to check availability
     try {
       get_rocblas_handle();
     } catch (...) {
-      // Ignore exception, rocblas_available_ is already set
     }
   }
   return rocblas_available_;
+}
+
+bool Device::is_rocblas_bf16_available() {
+  if (!rocblas_bf16_probed_) {
+    rocblas_bf16_probed_ = true;
+    rocblas_bf16_available_ = false;
+
+    if (!is_rocblas_available()) {
+      return false;
+    }
+
+    // Probe: run a tiny bf16 GEMM and check if the GPU survives.
+    // rocBLAS may claim support but crash if the Tensile .co files
+    // are corrupt or missing specific kernel variants.
+    make_current();
+    void* a_ptr = nullptr;
+    void* b_ptr = nullptr;
+    void* c_ptr = nullptr;
+    hipError_t err;
+
+    err = hipMalloc(&a_ptr, 4 * 4 * 2); // 4x4 bf16
+    if (err != hipSuccess) return false;
+    err = hipMalloc(&b_ptr, 4 * 4 * 2);
+    if (err != hipSuccess) { hipFree(a_ptr); return false; }
+    err = hipMalloc(&c_ptr, 4 * 4 * 2);
+    if (err != hipSuccess) { hipFree(a_ptr); hipFree(b_ptr); return false; }
+
+    (void)hipMemset(a_ptr, 0, 4 * 4 * 2);
+    (void)hipMemset(b_ptr, 0, 4 * 4 * 2);
+    (void)hipMemset(c_ptr, 0, 4 * 4 * 2);
+
+    float alpha = 1.0f, beta = 0.0f;
+    rocblas_status status = rocblas_gemm_ex(
+        rocblas_,
+        rocblas_operation_none,
+        rocblas_operation_none,
+        4, 4, 4,
+        &alpha,
+        a_ptr, rocblas_datatype_bf16_r, 4,
+        b_ptr, rocblas_datatype_bf16_r, 4,
+        &beta,
+        c_ptr, rocblas_datatype_bf16_r, 4,
+        c_ptr, rocblas_datatype_bf16_r, 4,
+        rocblas_datatype_f32_r,
+        rocblas_gemm_algo_standard, 0, 0);
+
+    // Sync and check if the GPU is still alive
+    hipError_t sync_err = hipDeviceSynchronize();
+    // Clear any lingering error
+    (void)hipGetLastError();
+
+    hipFree(a_ptr);
+    hipFree(b_ptr);
+    hipFree(c_ptr);
+
+    if (status == rocblas_status_success && sync_err == hipSuccess) {
+      rocblas_bf16_available_ = true;
+    } else {
+      // GPU may be in a bad state — need to reset
+      (void)hipDeviceReset();
+      // Re-initialize device
+      make_current();
+      // Re-create rocBLAS handle
+      if (rocblas_) {
+        rocblas_destroy_handle(rocblas_);
+        rocblas_ = nullptr;
+      }
+      rocblas_status rs = rocblas_create_handle(&rocblas_);
+      if (rs != rocblas_status_success) {
+        rocblas_available_ = false;
+      }
+      std::cerr << "Warning: rocBLAS bfloat16 GEMM probe failed on this GPU. "
+                << "Using fallback kernels for bf16 matmul." << std::endl;
+    }
+  }
+  return rocblas_bf16_available_;
 }
 
 void Device::make_current() {
@@ -191,6 +265,59 @@ void CommandEncoder::synchronize() {
   add_completed_handler([p = std::move(p)]() { p->set_value(); });
   commit();
   f.wait();
+}
+
+void CommandEncoder::begin_capture() {
+  if (capturing_) return;
+  device_.make_current();
+  // hipStreamBeginCapture records all subsequent operations on this stream
+  // into a graph instead of executing them.
+  hipError_t err = hipStreamBeginCapture(stream_, hipStreamCaptureModeGlobal);
+  if (err == hipSuccess) {
+    capturing_ = true;
+  }
+}
+
+bool CommandEncoder::end_capture() {
+  if (!capturing_) return false;
+  capturing_ = false;
+
+  hipGraph_t new_graph = nullptr;
+  hipError_t err = hipStreamEndCapture(stream_, &new_graph);
+  if (err != hipSuccess || new_graph == nullptr) {
+    return false;
+  }
+
+  // Destroy previous graph if any
+  reset_graph();
+
+  graph_ = new_graph;
+  err = hipGraphInstantiate(&graph_exec_, graph_, nullptr, nullptr, 0);
+  if (err != hipSuccess) {
+    hipGraphDestroy(graph_);
+    graph_ = nullptr;
+    graph_exec_ = nullptr;
+    return false;
+  }
+  return true;
+}
+
+bool CommandEncoder::replay() {
+  if (!graph_exec_) return false;
+  device_.make_current();
+  hipError_t err = hipGraphLaunch(graph_exec_, stream_);
+  return err == hipSuccess;
+}
+
+void CommandEncoder::reset_graph() {
+  if (graph_exec_) {
+    hipGraphExecDestroy(graph_exec_);
+    graph_exec_ = nullptr;
+  }
+  if (graph_) {
+    hipGraphDestroy(graph_);
+    graph_ = nullptr;
+  }
 }
 
 Device& device(mlx::core::Device device) {

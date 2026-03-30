@@ -5,6 +5,7 @@
 #include "mlx/array.h"
 #include "mlx/backend/common/utils.h"
 #include "mlx/backend/rocm/device.h"
+#include "mlx/backend/rocm/kernel_utils.hpp"
 
 #include <hip/hip_runtime.h>
 #include <hip/hiprtc.h>
@@ -37,9 +38,7 @@ struct KernelArgs {
   }
 
   void append(const array& a) {
-    // Use const_cast since HIP APIs expect non-const pointers but we know
-    // the data won't be modified for input arrays
-    append(reinterpret_cast<hipDeviceptr_t>(const_cast<void*>(a.data<void>())));
+    append(reinterpret_cast<hipDeviceptr_t>(gpu_ptr<void>(a)));
   }
 
   template <typename T>

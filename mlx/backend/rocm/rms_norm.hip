@@ -79,16 +79,20 @@ __global__ void rms_norm_kernel(
     shared_sum[0] = normalizer;
   }
   __syncthreads();
-  normalizer = rsqrtf(shared_sum[0] / axis_size + eps);
+  // Use 1/sqrt instead of rsqrtf for IEEE-compliant precision
+  // (matches Metal's metal::precise::rsqrt behavior)
+  normalizer = 1.0f / sqrtf(shared_sum[0] / axis_size + eps);
 
   // Write output
+  // Match Metal's weight application order: w * T(x * normalizer)
+  // Weight multiply in output type T after truncation, not in float32
   for (int i = threadIdx.x * N_READS; i < axis_size; i += BLOCK_DIM * N_READS) {
     #pragma unroll
     for (int j = 0; j < N_READS && i + j < axis_size; ++j) {
       int idx = i + j;
-      float y = static_cast<float>(x[idx]) * normalizer;
-      float wi = (w_stride == 0) ? static_cast<float>(w[0]) : static_cast<float>(w[idx * w_stride]);
-      out[idx] = static_cast<T>(wi * y);
+      T normalized = static_cast<T>(static_cast<float>(x[idx]) * normalizer);
+      T wi = (w_stride == 0) ? w[0] : w[idx * w_stride];
+      out[idx] = wi * normalized;
     }
   }
 }
@@ -150,7 +154,9 @@ __global__ void rms_norm_vjp_kernel(
   factors = shared_f2[0];
   
   float meangwx = factors.x / axis_size;
-  float normalizer = rsqrtf(factors.y / axis_size + eps);
+  // Use 1/sqrt instead of rsqrtf for IEEE-compliant precision
+  // (matches Metal's metal::precise::rsqrt behavior)
+  float normalizer = 1.0f / sqrtf(factors.y / axis_size + eps);
   float normalizer3 = normalizer * normalizer * normalizer;
 
   // Write outputs

@@ -4,6 +4,7 @@
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/rocm/device.h"
 #include "mlx/backend/rocm/gemms/gemv.h"
+#include "mlx/backend/rocm/gemms/hipblaslt_gemm.h"
 #include "mlx/backend/rocm/gemms/naive_gemm.h"
 #include "mlx/backend/rocm/kernel_utils.hpp"
 #include "mlx/primitives.h"
@@ -132,6 +133,33 @@ void gemm_rocblas(
     const array& b,
     float alpha = 1.0f,
     float beta = 0.0f) {
+  // Try hipBLASLt for bf16/fp16 GEMMs -- it often picks faster kernels than
+  // rocBLAS for half-precision on RDNA 3/3.5/4 and CDNA GPUs.
+  if ((a.dtype() == bfloat16 || a.dtype() == float16) &&
+      rocm::is_hipblaslt_available()) {
+    try {
+      rocm::hipblaslt_gemm(
+          encoder,
+          a_transposed,
+          b_transposed,
+          M,
+          N,
+          K,
+          alpha,
+          a,
+          lda,
+          b,
+          ldb,
+          beta,
+          out,
+          N, // ldc = N for row-major output
+          a.dtype());
+      return;
+    } catch (...) {
+      // hipBLASLt failed (unsupported config, etc.) -- fall through to rocBLAS.
+    }
+  }
+
   auto& device = encoder.device();
   rocblas_handle handle = device.get_rocblas_handle();
 
@@ -365,6 +393,36 @@ void gemm_strided_batched_rocblas(
     const array& b,
     float alpha = 1.0f,
     float beta = 0.0f) {
+  // Try hipBLASLt for bf16/fp16 batched GEMMs.
+  if ((a.dtype() == bfloat16 || a.dtype() == float16) &&
+      rocm::is_hipblaslt_available()) {
+    try {
+      rocm::hipblaslt_gemm_batched(
+          encoder,
+          a_transposed,
+          b_transposed,
+          M,
+          N,
+          K,
+          alpha,
+          a,
+          lda,
+          stride_a,
+          b,
+          ldb,
+          stride_b,
+          beta,
+          out,
+          N, // ldc = N for row-major output
+          stride_c,
+          batch_count,
+          a.dtype());
+      return;
+    } catch (...) {
+      // hipBLASLt failed -- fall through to rocBLAS.
+    }
+  }
+
   auto& device = encoder.device();
   rocblas_handle handle = device.get_rocblas_handle();
 

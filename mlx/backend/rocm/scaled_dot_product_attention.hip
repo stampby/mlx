@@ -5,6 +5,7 @@
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/rocm/device.h"
 #include "mlx/backend/rocm/device/config.h"
+#include "mlx/backend/rocm/device/utils.hpp"
 #include "mlx/backend/rocm/kernel_utils.hpp"
 #include "mlx/dtype_utils.h"
 
@@ -179,7 +180,6 @@ __global__ void kernel_sdpav_1pass(
   U new_max = tile_reduce_max_32(max_score);
   U factor = exp2f(max_score - new_max);
   sum_exp_score = tile_reduce_sum_32(sum_exp_scores[lane_idx % BN] * factor);
-  sum_exp_score = sum_exp_score == 0 ? 0 : 1.0f / sum_exp_score;
 
 // Aggregate outputs across tiles
 #pragma unroll
@@ -187,7 +187,8 @@ __global__ void kernel_sdpav_1pass(
     outputs[lane_idx][tile_idx] = o[i];
     __syncthreads();
     U ot = outputs[tile_idx][lane_idx] * factor;
-    o[i] = tile_reduce_sum_32(ot) * sum_exp_score;
+    o[i] = tile_reduce_sum_32(ot);
+    o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
     __syncthreads();
   }
 
