@@ -351,9 +351,10 @@ void hipblaslt_gemm_impl(
   int best_algo_idx = 0;
 
   // Auto-tuning: benchmark all algorithms to find the fastest for each shape.
-  // Runs automatically for new shapes. Once cached, uses the winner with zero overhead.
-  // Tuning adds ~10ms per unique (M,N,K) shape, amortized over the session.
-  static constexpr bool do_tune = true;
+  // Disabled by default — for quantized models the GEMM path is rarely used
+  // and the tuning overhead causes warm prompt regression.
+  // Enable with MLX_ROCM_HIPBLASLT_TUNE=1 for non-quantized models.
+  static bool do_tune = std::getenv("MLX_ROCM_HIPBLASLT_TUNE") != nullptr;
 
   auto it = tune_cache.find(key);
   if (it != tune_cache.end()) {
