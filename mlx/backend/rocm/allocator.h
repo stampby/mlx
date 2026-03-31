@@ -8,44 +8,93 @@
 #include <mutex>
 #include <set>
 #include <utility>
+#include <vector>
 
 namespace mlx::core::rocm {
 
 using allocator::Buffer;
 
-// Stores ROCm memory buffer.
-// When managed memory is available, data is allocated with hipMallocManaged.
-// Otherwise, data is allocated with hipHostMalloc (pinned host memory).
 struct RocmBuffer {
   void* data;
   size_t size;
-  bool is_managed; // true if allocated with hipMallocManaged
-  int device; // -1 for managed/host, >= 0 for VRAM
+  bool is_managed;
+  int device;
 };
 
-class SmallSizePool {
+// ---------------------------------------------------------------------------
+// SizeClassPool — fixed-size block pool with free list
+// ---------------------------------------------------------------------------
+
+class SizeClassPool {
+ public:
+  SizeClassPool() = default;
+  ~SizeClassPool();
+
+  SizeClassPool(const SizeClassPool&) = delete;
+  SizeClassPool& operator=(const SizeClassPool&) = delete;
+
+  void init(size_t block_size, size_t slab_page_size);
+  RocmBuffer* malloc();
+  void free(RocmBuffer* buf);
+  bool in_pool(RocmBuffer* buf) const;
+  bool grow();
+
+  size_t block_size() const { return block_size_; }
+  size_t free_count() const { return free_count_; }
+  size_t total_allocated() const { return backing_pages_.size() * slab_page_size_; }
+  size_t free_memory() const { return free_count_ * block_size_; }
+  bool initialized() const { return block_size_ > 0; }
+
  private:
   union Block {
     Block* next;
     RocmBuffer buf;
   };
 
-  Block* buffer_{nullptr};
-  void* data_{nullptr};
-  Block* next_free_{nullptr};
+  size_t block_size_{0};
+  size_t slab_page_size_{0};
   bool is_managed_{false};
 
- public:
-  SmallSizePool();
-  ~SmallSizePool();
+  std::vector<void*> backing_pages_;
+  std::vector<Block*> block_arrays_;
+  std::vector<size_t> blocks_per_page_;
 
-  SmallSizePool(const SmallSizePool&) = delete;
-  SmallSizePool& operator=(const SmallSizePool&) = delete;
-
-  RocmBuffer* malloc();
-  void free(RocmBuffer* buf);
-  bool in_pool(RocmBuffer* buf);
+  Block* next_free_{nullptr};
+  size_t free_count_{0};
+  size_t total_blocks_{0};
 };
+
+// ---------------------------------------------------------------------------
+// SlabAllocator — multi-tier slab allocator for sizes <= 1MB
+// ---------------------------------------------------------------------------
+
+class SlabAllocator {
+ public:
+  static constexpr int kNumSizeClasses = 18;
+  static constexpr size_t kMaxSlabSize = 1 << 20;
+
+  SlabAllocator();
+  ~SlabAllocator() = default;
+
+  RocmBuffer* malloc(size_t size);
+  void free(RocmBuffer* buf);
+  bool in_pool(RocmBuffer* buf) const;
+  bool grow(size_t size);
+  void warmup();
+
+  size_t total_allocated() const;
+  size_t free_memory() const;
+
+  static int size_class_index(size_t size);
+  static size_t round_to_size_class(size_t size);
+
+ private:
+  SizeClassPool pools_[kNumSizeClasses];
+};
+
+// ---------------------------------------------------------------------------
+// RocmAllocator
+// ---------------------------------------------------------------------------
 
 class RocmAllocator : public allocator::Allocator {
  public:
@@ -76,7 +125,7 @@ class RocmAllocator : public allocator::Allocator {
   BufferCache<RocmBuffer> buffer_cache_;
   size_t active_memory_{0};
   size_t peak_memory_{0};
-  SmallSizePool scalar_pool_;
+  SlabAllocator slab_allocator_;
 };
 
 RocmAllocator& allocator();

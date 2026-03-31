@@ -17,13 +17,6 @@ namespace rocm {
 
 constexpr int page_size = 16384;
 
-// Any allocations smaller than this will try to use the small pool
-constexpr int small_block_size = 8;
-
-// The small pool size in bytes. This should be a multiple of the host page
-// size and small_block_size.
-constexpr int small_pool_size = 4 * page_size;
-
 // Check if ROCm device is available
 static bool rocm_available() {
   static int available = -1;
@@ -36,8 +29,6 @@ static bool rocm_available() {
 }
 
 // Check if managed memory (HMM) is supported on this device.
-// On integrated GPUs (Strix Halo), HMM is actually fast since there's no
-// discrete VRAM — managed memory avoids the overhead of hipExtMallocWithFlags.
 static bool managed_memory_supported() {
   static int supported = -1;
   if (supported < 0) {
@@ -77,10 +68,6 @@ inline void* rocm_unified_malloc(size_t size, bool& is_managed) {
   void* data = nullptr;
   hipError_t err;
   if (is_integrated()) {
-    // Unified memory device (iGPU/APU): CPU and GPU share system RAM.
-    // Try hipExtMallocWithFlags first (fine-grained coherent, best GPU
-    // bandwidth). Falls back to hipMallocManaged for large allocations
-    // that exceed the small device-local VRAM (~2GB).
     err = hipExtMallocWithFlags(&data, size, hipDeviceMallocFinegrained);
     if (err != hipSuccess) {
       err = hipMallocManaged(&data, size);
@@ -109,73 +96,235 @@ inline void rocm_unified_free(void* data, bool is_managed) {
   }
 }
 
-SmallSizePool::SmallSizePool()
-    : buffer_(nullptr), data_(nullptr), next_free_(nullptr) {
-  if (!rocm_available()) {
-    return;
+// Apply memory hints to slab pages for better GPU performance
+static void apply_slab_hints(void* data, size_t size) {
+  if (!rocm_available()) return;
+  int device = 0;
+  (void)hipGetDevice(&device);
+  // Hint: GPU is the primary accessor
+  (void)hipMemAdvise(data, size, hipMemAdviseSetAccessedBy, device);
+  // Prefetch to GPU to avoid cold-start page faults
+  (void)hipMemPrefetchAsync(data, size, device, nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// SizeClassPool
+// ---------------------------------------------------------------------------
+
+void SizeClassPool::init(size_t block_size, size_t slab_page_size) {
+  block_size_ = block_size;
+  slab_page_size_ = slab_page_size;
+}
+
+SizeClassPool::~SizeClassPool() {
+  for (size_t i = 0; i < backing_pages_.size(); i++) {
+    rocm_unified_free(backing_pages_[i], is_managed_);
+    delete[] block_arrays_[i];
   }
+}
 
-  auto num_blocks = small_pool_size / small_block_size;
-  buffer_ = new Block[num_blocks];
+bool SizeClassPool::grow() {
+  if (!rocm_available() || block_size_ == 0) return false;
 
-  next_free_ = buffer_;
-
+  void* data = nullptr;
   try {
-    data_ = rocm_unified_malloc(small_pool_size, is_managed_);
+    data = rocm_unified_malloc(slab_page_size_, is_managed_);
   } catch (...) {
-    delete[] buffer_;
-    buffer_ = nullptr;
-    next_free_ = nullptr;
-    data_ = nullptr;
-    return;
-  }
-
-  auto curr = next_free_;
-  for (size_t i = 1; i < num_blocks; ++i) {
-    curr->next = buffer_ + i;
-    curr = curr->next;
-  }
-  curr->next = nullptr;
-}
-
-SmallSizePool::~SmallSizePool() {
-  if (data_) {
-    rocm_unified_free(data_, is_managed_);
-  }
-  if (buffer_) {
-    delete[] buffer_;
-  }
-}
-
-RocmBuffer* SmallSizePool::malloc() {
-  if (next_free_ == nullptr) {
-    return nullptr;
-  }
-  Block* b = next_free_;
-  uint64_t i = next_free_ - buffer_;
-  next_free_ = next_free_->next;
-  b->buf.data = static_cast<char*>(data_) + i * small_block_size;
-  b->buf.size = small_block_size;
-  b->buf.is_managed = is_managed_;
-  b->buf.device = -1;
-  return &b->buf;
-}
-
-void SmallSizePool::free(RocmBuffer* buf) {
-  auto b = reinterpret_cast<Block*>(buf);
-  b->next = next_free_;
-  next_free_ = b;
-}
-
-bool SmallSizePool::in_pool(RocmBuffer* buf) {
-  if (!buffer_) {
     return false;
   }
-  constexpr int num_blocks = (small_pool_size / small_block_size);
-  auto b = reinterpret_cast<Block*>(buf);
-  int64_t block_num = b - buffer_;
-  return block_num >= 0 && block_num < num_blocks;
+
+  // Apply memory hints for GPU access
+  apply_slab_hints(data, slab_page_size_);
+
+  size_t num_blocks = slab_page_size_ / block_size_;
+  auto* blocks = new Block[num_blocks];
+
+  // Chain blocks into the free list
+  for (size_t i = 0; i < num_blocks; i++) {
+    blocks[i].next = (i + 1 < num_blocks) ? &blocks[i + 1] : next_free_;
+  }
+  next_free_ = &blocks[0];
+
+  backing_pages_.push_back(data);
+  block_arrays_.push_back(blocks);
+  blocks_per_page_.push_back(num_blocks);
+  free_count_ += num_blocks;
+  total_blocks_ += num_blocks;
+
+  return true;
 }
+
+RocmBuffer* SizeClassPool::malloc() {
+  if (next_free_ == nullptr) return nullptr;
+
+  Block* b = next_free_;
+  next_free_ = next_free_->next;
+  free_count_--;
+
+  // Fast path: single page (common case after warmup)
+  if (block_arrays_.size() == 1) {
+    size_t idx = static_cast<size_t>(b - block_arrays_[0]);
+    b->buf.data = static_cast<char*>(backing_pages_[0]) + idx * block_size_;
+    b->buf.size = block_size_;
+    b->buf.is_managed = is_managed_;
+    b->buf.device = -1;
+    return &b->buf;
+  }
+
+  // Multi-page: find which backing page this block belongs to
+  for (size_t page = 0; page < block_arrays_.size(); page++) {
+    Block* base = block_arrays_[page];
+    size_t count = blocks_per_page_[page];
+    if (b >= base && b < base + count) {
+      size_t idx = static_cast<size_t>(b - base);
+      b->buf.data = static_cast<char*>(backing_pages_[page]) + idx * block_size_;
+      b->buf.size = block_size_;
+      b->buf.is_managed = is_managed_;
+      b->buf.device = -1;
+      return &b->buf;
+    }
+  }
+
+  return nullptr;
+}
+
+void SizeClassPool::free(RocmBuffer* buf) {
+  auto* b = reinterpret_cast<Block*>(buf);
+  b->next = next_free_;
+  next_free_ = b;
+  free_count_++;
+}
+
+bool SizeClassPool::in_pool(RocmBuffer* buf) const {
+  if (block_arrays_.empty()) return false;
+  auto* b = reinterpret_cast<const Block*>(buf);
+
+  // Fast path: single page
+  if (block_arrays_.size() == 1) {
+    return b >= block_arrays_[0] && b < block_arrays_[0] + blocks_per_page_[0];
+  }
+
+  for (size_t page = 0; page < block_arrays_.size(); page++) {
+    if (b >= block_arrays_[page] && b < block_arrays_[page] + blocks_per_page_[page]) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// SlabAllocator
+// ---------------------------------------------------------------------------
+
+// Slab page sizes per tier (indexed by size class)
+static constexpr size_t kSlabPageSizes[SlabAllocator::kNumSizeClasses] = {
+  64 * 1024,       // 8B blocks
+  64 * 1024,       // 16B
+  64 * 1024,       // 32B
+  64 * 1024,       // 64B
+  64 * 1024,       // 128B
+  256 * 1024,      // 256B
+  256 * 1024,      // 512B
+  1024 * 1024,     // 1KB
+  1024 * 1024,     // 2KB
+  1024 * 1024,     // 4KB
+  1024 * 1024,     // 8KB
+  1024 * 1024,     // 16KB
+  2 * 1024 * 1024, // 32KB
+  4 * 1024 * 1024, // 64KB
+  8 * 1024 * 1024, // 128KB
+  16 * 1024 * 1024,// 256KB
+  32 * 1024 * 1024,// 512KB
+  64 * 1024 * 1024,// 1MB
+};
+
+// Whether to pre-allocate each tier at startup
+static constexpr bool kPreallocate[SlabAllocator::kNumSizeClasses] = {
+  true,  true,  true,  true,  true,  // 8B-128B
+  true,  true,                        // 256B-512B
+  true,  true,  true,  true,  true,  // 1KB-16KB
+  false, false, false, false, false, false, // 32KB-1MB: on demand
+};
+
+SlabAllocator::SlabAllocator() {
+  for (int i = 0; i < kNumSizeClasses; i++) {
+    size_t block_size = static_cast<size_t>(1) << (i + 3); // 2^3=8 through 2^20=1MB
+    pools_[i].init(block_size, kSlabPageSizes[i]);
+  }
+}
+
+int SlabAllocator::size_class_index(size_t size) {
+  if (size == 0 || size > kMaxSlabSize) return -1;
+  if (size <= 8) return 0;
+  // ceil(log2(size)) - 3, computed via bit manipulation
+  int bits = 64 - __builtin_clzll(size - 1); // ceil(log2(size))
+  return bits - 3;
+}
+
+size_t SlabAllocator::round_to_size_class(size_t size) {
+  if (size <= 8) return 8;
+  if (size > kMaxSlabSize) return size;
+  // Round up to next power of 2
+  return static_cast<size_t>(1) << (64 - __builtin_clzll(size - 1));
+}
+
+void SlabAllocator::warmup() {
+  if (!rocm_available()) return;
+  for (int i = 0; i < kNumSizeClasses; i++) {
+    if (kPreallocate[i]) {
+      pools_[i].grow();
+    }
+  }
+}
+
+RocmBuffer* SlabAllocator::malloc(size_t size) {
+  int idx = size_class_index(size);
+  if (idx < 0) return nullptr;
+  return pools_[idx].malloc();
+}
+
+void SlabAllocator::free(RocmBuffer* buf) {
+  // O(1) dispatch: use buf->size to find the correct pool
+  int idx = size_class_index(buf->size);
+  if (idx >= 0 && pools_[idx].initialized()) {
+    pools_[idx].free(buf);
+  }
+}
+
+bool SlabAllocator::in_pool(RocmBuffer* buf) const {
+  // O(1) dispatch: size determines the pool, then verify membership
+  int idx = size_class_index(buf->size);
+  if (idx >= 0 && pools_[idx].initialized()) {
+    return pools_[idx].in_pool(buf);
+  }
+  return false;
+}
+
+bool SlabAllocator::grow(size_t size) {
+  int idx = size_class_index(size);
+  if (idx < 0) return false;
+  return pools_[idx].grow();
+}
+
+size_t SlabAllocator::total_allocated() const {
+  size_t total = 0;
+  for (int i = 0; i < kNumSizeClasses; i++) {
+    total += pools_[i].total_allocated();
+  }
+  return total;
+}
+
+size_t SlabAllocator::free_memory() const {
+  size_t total = 0;
+  for (int i = 0; i < kNumSizeClasses; i++) {
+    total += pools_[i].free_memory();
+  }
+  return total;
+}
+
+// ---------------------------------------------------------------------------
+// RocmAllocator
+// ---------------------------------------------------------------------------
 
 RocmAllocator::RocmAllocator()
     : buffer_cache_(
@@ -196,6 +345,9 @@ RocmAllocator::RocmAllocator()
     memory_limit_ = total * 0.8;
     max_pool_size_ = memory_limit_;
   }
+
+  // Pre-allocate slab pages for common allocation sizes
+  slab_allocator_.warmup();
 }
 
 Buffer RocmAllocator::malloc(size_t size) {
@@ -205,58 +357,62 @@ Buffer RocmAllocator::malloc(size_t size) {
         "Please use CPU backend instead.");
   }
 
-  // Find available buffer from cache.
-  // Use aggressive size rounding to maximize cache hit rate:
-  // - Small (<=8B): scalar pool
-  // - Medium (<16KB): power-of-2
-  // - Large (<1MB): 16KB page aligned
-  // - Very large (>=1MB): power-of-2 (coarser buckets = more cache hits)
-  // The power-of-2 rounding for large allocations is critical for decode —
-  // without it, slightly different sizes (e.g., 1.01MB vs 1.02MB) miss the
-  // cache and trigger hipExtMallocWithFlags at ~7ms each.
   auto orig_size = size;
   std::unique_lock lock(mutex_);
-  if (size <= small_block_size) {
-    size = 8;
-  } else if (size < page_size) {
-    size = next_power_of_2(size);
+
+  // Round size to appropriate boundary
+  if (size <= SlabAllocator::kMaxSlabSize) {
+    size = SlabAllocator::round_to_size_class(size);
+
+    // Try slab allocator (O(1) free-list pop)
+    RocmBuffer* buf = slab_allocator_.malloc(size);
+    if (buf) {
+      active_memory_ += size;
+      peak_memory_ = std::max(active_memory_, peak_memory_);
+      return Buffer{buf};
+    }
+
+    // Pool exhausted — grow (holds lock during HIP alloc, acceptable for rare path)
+    if (slab_allocator_.grow(size)) {
+      buf = slab_allocator_.malloc(size);
+      if (buf) {
+        active_memory_ += size;
+        peak_memory_ = std::max(active_memory_, peak_memory_);
+        return Buffer{buf};
+      }
+    }
+
+    // Slab growth failed — fall through to BufferCache
   } else {
+    // Large allocation: page-align
     size = page_size * ((size + page_size - 1) / page_size);
   }
 
+  // Try BufferCache
   RocmBuffer* buf = buffer_cache_.reuse_from_cache(size);
   if (!buf) {
-    // If we have a lot of memory pressure try to reclaim memory from the cache.
+    // Memory pressure: try to reclaim cache
     int64_t mem_to_free =
         get_active_memory() + get_cache_memory() + size - memory_limit_;
     if (mem_to_free > 0) {
       buffer_cache_.release_cached_buffers(mem_to_free);
     }
 
-    // Try the scalar pool first
-    if (size <= small_block_size) {
-      buf = scalar_pool_.malloc();
-    }
     lock.unlock();
-    if (!buf) {
-      if (is_integrated()) {
-        // Integrated GPU: allocate unified memory (CPU+GPU accessible).
-        // device=-1 signals unified memory — no move_to_unified_memory needed.
-        bool is_managed = false;
-        void* data = rocm_unified_malloc(size, is_managed);
-        buf = new RocmBuffer{data, size, is_managed, -1};
-      } else {
-        int device = 0;
-        hipGetDevice(&device);
-        buf = new RocmBuffer{nullptr, size, false, device};
-        hipError_t err = hipMalloc(&buf->data, size);
-
-        if (err != hipSuccess) {
-          delete buf;
-          std::ostringstream oss;
-          oss << "hipMalloc failed: " << hipGetErrorString(err) << ".";
-          throw std::runtime_error(oss.str());
-        }
+    if (is_integrated()) {
+      bool is_managed = false;
+      void* data = rocm_unified_malloc(size, is_managed);
+      buf = new RocmBuffer{data, size, is_managed, -1};
+    } else {
+      int device = 0;
+      hipGetDevice(&device);
+      buf = new RocmBuffer{nullptr, size, false, device};
+      hipError_t err = hipMalloc(&buf->data, size);
+      if (err != hipSuccess) {
+        delete buf;
+        std::ostringstream oss;
+        oss << "hipMalloc failed: " << hipGetErrorString(err) << ".";
+        throw std::runtime_error(oss.str());
       }
     }
     lock.lock();
@@ -264,7 +420,7 @@ Buffer RocmAllocator::malloc(size_t size) {
   active_memory_ += size;
   peak_memory_ = std::max(active_memory_, peak_memory_);
 
-  // Maintain the cache below the requested limit.
+  // Maintain cache below limit
   if (get_cache_memory() > max_pool_size_) {
     buffer_cache_.release_cached_buffers(get_cache_memory() - max_pool_size_);
   }
@@ -279,6 +435,14 @@ void RocmAllocator::free(Buffer buffer) {
 
   std::unique_lock lock(mutex_);
   active_memory_ -= buf->size;
+
+  // Slab-allocated buffers go back to the slab free list
+  if (slab_allocator_.in_pool(buf)) {
+    slab_allocator_.free(buf);
+    return;
+  }
+
+  // Large buffers go to the BufferCache
   if (get_cache_memory() < max_pool_size_) {
     buffer_cache_.recycle_to_cache(buf);
   } else {
@@ -294,18 +458,13 @@ size_t RocmAllocator::size(Buffer buffer) const {
   return buf->size;
 }
 
-// This must be called with mutex_ acquired
 void RocmAllocator::rocm_free(RocmBuffer* buf) {
-  if (scalar_pool_.in_pool(buf)) {
-    scalar_pool_.free(buf);
+  if (buf->device == -1) {
+    rocm_unified_free(buf->data, buf->is_managed);
   } else {
-    if (buf->device == -1) {
-      rocm_unified_free(buf->data, buf->is_managed);
-    } else {
-      (void)hipFree(buf->data);
-    }
-    delete buf;
+    (void)hipFree(buf->data);
   }
+  delete buf;
 }
 
 void RocmAllocator::move_to_unified_memory(RocmBuffer& buf) {
@@ -314,8 +473,7 @@ void RocmAllocator::move_to_unified_memory(RocmBuffer& buf) {
   }
   bool is_managed = false;
   void* data = rocm_unified_malloc(buf.size, is_managed);
-  
-  // Use default memcpy to sync from VRAM to Host/Managed
+
   hipError_t err = hipMemcpy(data, buf.data, buf.size, hipMemcpyDefault);
   if (err != hipSuccess) {
     rocm_unified_free(data, is_managed);
@@ -323,11 +481,9 @@ void RocmAllocator::move_to_unified_memory(RocmBuffer& buf) {
     oss << "hipMemcpy failed: " << hipGetErrorString(err) << ".";
     throw std::runtime_error(oss.str());
   }
-  
-  // Free the VRAM buffer
+
   (void)hipFree(buf.data);
-  
-  // Update the buffer to point to the new unified memory
+
   buf.data = data;
   buf.is_managed = is_managed;
   buf.device = -1;
@@ -357,6 +513,9 @@ size_t RocmAllocator::set_memory_limit(size_t limit) {
 }
 
 size_t RocmAllocator::get_cache_memory() const {
+  // Only report BufferCache size. Slab free memory is infrastructure,
+  // not cache — including it inflates the count and causes premature
+  // eviction of large buffers from the BufferCache.
   return buffer_cache_.cache_size();
 }
 
@@ -372,9 +531,6 @@ void RocmAllocator::clear_cache() {
 }
 
 RocmAllocator& allocator() {
-  // By creating the |allocator_| on heap, the destructor of RocmAllocator
-  // will not be called on exit and buffers in the cache will be leaked. This
-  // can save some time at program exit.
   static RocmAllocator* allocator_ = new RocmAllocator;
   return *allocator_;
 }
@@ -394,12 +550,8 @@ void* Buffer::raw_ptr() {
   auto& cbuf = *static_cast<rocm::RocmBuffer*>(ptr_);
 
   if (cbuf.device == -1) {
-    // Unified memory (integrated GPU or hipMallocManaged): CPU-accessible.
-    // hipStreamSynchronize(nullptr) waits for the default stream — lighter
-    // than hipDeviceSynchronize which waits for ALL streams.
     (void)hipStreamSynchronize(nullptr);
   } else {
-    // Discrete GPU VRAM: full sync + migrate to host-accessible memory.
     (void)hipDeviceSynchronize();
     rocm::allocator().move_to_unified_memory(cbuf);
   }
