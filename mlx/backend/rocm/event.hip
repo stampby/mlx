@@ -7,7 +7,9 @@
 #include "mlx/scheduler.h"
 
 #include <map>
+#include <thread>
 #include <vector>
+#include <immintrin.h>
 
 #include <hip/hip_runtime.h>
 
@@ -58,7 +60,19 @@ HipEvent::~HipEvent() {
 }
 
 void HipEvent::wait() {
-  (void)hipEventSynchronize(event_);
+  // Spin-wait with hipEventQuery instead of hipEventSynchronize.
+  // On iGPU, the blocking wait in hipEventSynchronize causes CPU-GPU
+  // contention since they share compute resources. Polling is cheaper.
+  // Use progressive backoff to reduce hipEventQuery call overhead.
+  for (int spins = 0; hipEventQuery(event_) != hipSuccess; spins++) {
+    if (spins < 100) {
+      // Tight spin for fast completions
+    } else if (spins < 1000) {
+      _mm_pause(); // x86 pause hint (reduces power, avoids pipeline stall)
+    } else {
+      std::this_thread::yield();
+    }
+  }
 }
 
 void HipEvent::wait(hipStream_t stream) {
@@ -81,7 +95,9 @@ class CopyableHipEvent {
  public:
   CopyableHipEvent()
       : event_(std::make_shared<HipEvent>(
-            hipEventDisableTiming | hipEventBlockingSync)) {}
+            hipEventDisableTiming)) {}
+            // Note: hipEventBlockingSync removed — on iGPU the blocking wait
+            // contends with GPU for CPU resources. Polling is cheaper.
 
   void wait() {
     event_->wait();
