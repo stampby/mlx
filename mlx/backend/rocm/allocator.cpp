@@ -550,7 +550,12 @@ void* Buffer::raw_ptr() {
   auto& cbuf = *static_cast<rocm::RocmBuffer*>(ptr_);
 
   if (cbuf.device == -1) {
-    (void)hipStreamSynchronize(nullptr);
+    // Unified memory on iGPU: fine-grained coherent memory means CPU sees
+    // GPU writes without explicit sync. Only sync if the stream has pending
+    // work (hipStreamQuery returns hipErrorNotReady when busy).
+    if (hipStreamQuery(nullptr) != hipSuccess) {
+      (void)hipStreamSynchronize(nullptr);
+    }
   } else {
     (void)hipDeviceSynchronize();
     rocm::allocator().move_to_unified_memory(cbuf);
