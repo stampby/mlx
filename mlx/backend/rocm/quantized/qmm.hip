@@ -7,6 +7,7 @@
 #include "mlx/backend/rocm/gemms/rocblas_gemm.h"
 #include "mlx/backend/rocm/kernel_utils.hpp"
 #include "mlx/backend/rocm/quantized/quantized.h"
+#include "mlx/backend/rocm/quantized/qmv_tiled_kernel.hip"
 #include "mlx/primitives.h"
 
 #include <hip/hip_bfloat16.h>
@@ -2916,6 +2917,57 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   // The shared variant caches x in LDS and is ~15x faster for decode shapes.
   // Always prefer shared unless K is tiny (where LDS overhead isn't worth it).
   bool use_noshared_qmv_variant = use_tiny_k_qmv;
+
+  // L2-optimized tiled QMV: use TILE_N=16 columns per block for better
+  // weight reuse in L2 cache. All 16 warps process the same K-range,
+  // so adjacent weight rows stay hot in L2 across columns.
+  // Use for non-batched single-row decode with aligned dimensions.
+  static bool use_tiled = (std::getenv("MLX_ROCM_QMV_NO_TILED") == nullptr);
+  if (use_tiled && use_fast_qmv && !can_use_batched_qmv &&
+      N % rocm::TILE_N == 0 && mode_ == QuantizationMode::Affine) {
+    enc.launch_kernel([&, x_ptr, w_ptr, scales_ptr, biases_ptr, out_ptr](hipStream_t stream) {
+      dim3 tiled_block(WARP_SIZE, rocm::TILE_N);
+      dim3 tiled_grid(M, (N + rocm::TILE_N - 1) / rocm::TILE_N);
+
+      auto launch_tiled = [&](auto type_tag, auto scale_tag, auto bits_tag, auto gs_tag) {
+        using TT = typename decltype(type_tag)::type;
+        using ST = typename decltype(scale_tag)::type;
+        constexpr int BB = bits_tag.value;
+        constexpr int GS = gs_tag.value;
+        hipLaunchKernelGGL(
+            (rocm::qmv_tiled_kernel<TT, ST, BB, GS>),
+            tiled_grid, tiled_block, 0, stream,
+            (const TT*)x_ptr, (const uint32_t*)w_ptr,
+            (const ST*)scales_ptr, (const ST*)biases_ptr,
+            (TT*)out_ptr, M, N, K, has_bias);
+      };
+
+      // Dispatch by type/bits/group_size
+      #define LAUNCH_TILED(T, ScaleT, BITS_V, GS_V) \
+        hipLaunchKernelGGL( \
+            (rocm::qmv_tiled_kernel<T, ScaleT, BITS_V, GS_V>), \
+            tiled_grid, tiled_block, 0, stream, \
+            (const T*)x_ptr, (const uint32_t*)w_ptr, \
+            (const ScaleT*)scales_ptr, (const ScaleT*)biases_ptr, \
+            (T*)out_ptr, M, N, K, has_bias)
+
+      if (x.dtype() == bfloat16) {
+        if (bits_ == 4) {
+          if (group_size_ == 32)  { LAUNCH_TILED(hip_bfloat16, hip_bfloat16, 4, 32); }
+          else if (group_size_ == 64)  { LAUNCH_TILED(hip_bfloat16, hip_bfloat16, 4, 64); }
+          else if (group_size_ == 128) { LAUNCH_TILED(hip_bfloat16, hip_bfloat16, 4, 128); }
+        }
+      } else if (x.dtype() == float16) {
+        if (bits_ == 4) {
+          if (group_size_ == 32)  { LAUNCH_TILED(__half, __half, 4, 32); }
+          else if (group_size_ == 64)  { LAUNCH_TILED(__half, __half, 4, 64); }
+          else if (group_size_ == 128) { LAUNCH_TILED(__half, __half, 4, 128); }
+        }
+      }
+      #undef LAUNCH_TILED
+    });
+    return;
+  }
 
   // The noshared path used to increase cols_per_block for aligned data.
   // Since we always use the shared variant now, no special grid adjustment needed.
