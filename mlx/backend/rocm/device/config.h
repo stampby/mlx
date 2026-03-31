@@ -81,4 +81,83 @@ constexpr int kRMSNormBlockSize = 256;
 // Attention constants
 constexpr int kAttentionBlockSize = 256;
 
+// ---- Architecture tier detection and per-arch kernel tuning ----
+//
+// RocmArchTier provides fine-grained GPU generation identification.
+// ArchTuning holds per-arch parameters for kernel dispatch decisions.
+// Both are usable from host code and kernel dispatch logic.
+
+enum class RocmArchTier {
+  Rdna2,        // gfx10xx: RDNA 2, Wave32, no WMMA
+  Rdna3,        // gfx1100-gfx1103: RDNA 3, Wave32, WMMA, 96KB LDS
+  Rdna35,       // gfx1150-gfx1152: RDNA 3.5, Wave32, WMMA, 64KB LDS, 32MB IC
+  Rdna4,        // gfx1200-gfx1201: RDNA 4, Wave32, enhanced WMMA
+  Cdna,         // gfx9xx: MI-series, Wave64
+};
+
+// Hardware capabilities detected at runtime from hipDeviceProp_t.
+struct HWInfo {
+  RocmArchTier tier;
+  int num_cus;              // Compute units (multiProcessorCount)
+  int simds_per_cu;         // SIMDs per CU (2 for RDNA, 4 for CDNA)
+  int max_threads_per_cu;   // Max resident threads per CU
+  int shared_mem_per_cu;    // Shared/LDS memory per CU in bytes
+  int l2_cache_bytes;       // L2/Infinity Cache size
+  bool has_wmma;            // WMMA/tensor core support
+};
+
+// Per-architecture tuning parameters for quantized matvec and attention kernels.
+struct ArchTuning {
+  // QMV tiled kernel
+  int qmv_tile_n;                // Output columns per block (L2 reuse)
+  // QMV↔GEMM crossover M thresholds
+  int qmv_crossover_small;       // For K<=2048, N<=2048
+  int qmv_crossover_medium;      // For K<=4096, N<=4096
+  int qmv_crossover_large;       // For larger shapes
+  // Flash attention
+  int fa_block_m;                 // Queries per flash attention block
+  int fa_block_n;                 // Keys per iteration
+};
+
+// Auto-tune based on detected hardware. Adjusts tile sizes based on actual
+// CU count to balance occupancy vs L2 reuse.
+inline ArchTuning get_arch_tuning(RocmArchTier tier) {
+  // Defaults per tier — used when HWInfo isn't available
+  switch (tier) {
+    case RocmArchTier::Rdna2:
+      return ArchTuning{8,    28,   20,  14,    128,  64};
+    case RocmArchTier::Rdna3:
+      return ArchTuning{16,   36,   24,  16,    64,   64};
+    case RocmArchTier::Rdna35:
+      // 40 CUs: TILE_N=16 gives best occupancy/reuse balance
+      return ArchTuning{16,   36,   24,  16,    64,   64};
+    case RocmArchTier::Rdna4:
+      return ArchTuning{32,   40,   28,  18,    64,   64};
+    case RocmArchTier::Cdna:
+    default:
+      return ArchTuning{16,   20,   14,  10,    128,  64};
+  }
+}
+
+// Auto-tune using full hardware info. Adjusts TILE_N based on CU count:
+// fewer CUs → larger tiles for more L2 reuse per block.
+inline ArchTuning get_arch_tuning(const HWInfo& hw) {
+  auto t = get_arch_tuning(hw.tier);
+
+  // Auto-tune QMV tile_n based on CU count.
+  // Benchmarking shows TILE_N=16 is optimal for RDNA 3/3.5 regardless
+  // of CU count — TILE_N=32 creates 1024-thread blocks that reduce
+  // occupancy. Only go to 8 for very low CU counts.
+  if (hw.tier == RocmArchTier::Rdna3 || hw.tier == RocmArchTier::Rdna35 ||
+      hw.tier == RocmArchTier::Rdna4) {
+    if (hw.num_cus <= 16) {
+      t.qmv_tile_n = 8;   // Very small APU: maximize occupancy
+    } else {
+      t.qmv_tile_n = 16;  // All other RDNA 3+: best balance
+    }
+  }
+
+  return t;
+}
+
 } // namespace mlx::core::rocm

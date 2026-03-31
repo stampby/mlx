@@ -93,6 +93,55 @@ class SlabAllocator {
 };
 
 // ---------------------------------------------------------------------------
+// DecodeArena — deterministic bump allocator for HIP Graph capture
+// ---------------------------------------------------------------------------
+// During decode, the allocation pattern is fixed: same sizes in the same
+// order every step. The arena allocates from a pre-sized contiguous buffer,
+// guaranteeing identical pointers on each reset+replay cycle.
+//
+// Usage:
+//   arena.begin(estimated_bytes);  // allocate backing buffer
+//   // ... run decode step (allocations go through arena) ...
+//   arena.reset();                 // rewind bump pointer for next step
+//   // ... replay same step (same pointers) ...
+//   arena.end();                   // release backing buffer
+
+class DecodeArena {
+ public:
+  DecodeArena() = default;
+  ~DecodeArena();
+
+  // Allocate the backing buffer and enter arena mode.
+  bool begin(size_t capacity_bytes);
+
+  // Rewind the bump pointer. Next cycle returns same addresses.
+  void reset();
+
+  // Leave arena mode and free the backing buffer.
+  void end();
+
+  // Bump-allocate from the arena. Returns nullptr if inactive or exhausted.
+  RocmBuffer* malloc(size_t size);
+
+  // No-op free (bulk-freed on end()).
+  void free(RocmBuffer* /*buf*/) {}
+
+  bool active() const { return base_ != nullptr; }
+  size_t used() const { return offset_; }
+  size_t capacity() const { return capacity_; }
+
+ private:
+  void* base_{nullptr};
+  size_t capacity_{0};
+  size_t offset_{0};
+  bool is_managed_{false};
+
+  // Pre-allocated RocmBuffer descriptors (recycled on reset)
+  std::vector<RocmBuffer> descriptors_;
+  size_t desc_index_{0};
+};
+
+// ---------------------------------------------------------------------------
 // RocmAllocator
 // ---------------------------------------------------------------------------
 
@@ -126,6 +175,14 @@ class RocmAllocator : public allocator::Allocator {
   size_t active_memory_{0};
   size_t peak_memory_{0};
   SlabAllocator slab_allocator_;
+
+ public:
+  // Arena mode for HIP Graph capture.
+  // When active, malloc() returns deterministic addresses from the arena.
+  DecodeArena& arena() { return arena_; }
+
+ private:
+  DecodeArena arena_;
 };
 
 RocmAllocator& allocator();

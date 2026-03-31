@@ -19,13 +19,15 @@
 
 namespace mlx::core::rocm {
 
-// Number of output columns per block. More columns = more weight reuse in L2.
-// But more columns = more warps = more VGPRs. 16 is a good balance:
-// 16 warps × 32 threads = 512 threads, ~32 VGPRs/thread → fits in RDNA 3.5.
-static constexpr int TILE_N = 16;
+// TILE_N is passed as a runtime kernel argument. The host selects it from
+// rocm::ArchTuning::qmv_tile_n (per-arch config) and sets block dim to
+// (WARP_SIZE, tile_n). The kernel reads tile_n to compute column indices.
+// Performance: the shared memory load loop runs exactly 1 iteration for
+// standard configs (BSK=512, stride=tile_n*32=512), so no unrolling loss.
+static constexpr int TILE_N_MAX = 32; // Max for __launch_bounds__
 
 template <typename T, typename ScaleT, int BITS, int GROUP_SIZE>
-__global__ __launch_bounds__(TILE_N * WARP_SIZE)
+__global__ __launch_bounds__(TILE_N_MAX * WARP_SIZE)
 void qmv_tiled_kernel(
     const T* __restrict__ x,           // [M, K]
     const uint32_t* __restrict__ w,    // [N, K/pack_factor] as uint32
@@ -35,21 +37,22 @@ void qmv_tiled_kernel(
     int M,
     int N,
     int K,
-    bool has_bias)
+    bool has_bias,
+    int tile_n)                        // Runtime TILE_N from arch config
 {
   constexpr int PF = pack_factor_u32<BITS>;
   constexpr int PPT = packs_per_thread<BITS>;
   constexpr int VPT = values_per_thread<BITS>;
-  constexpr int BSK = VPT * WARP_SIZE; // 512 K-elements per step
+  constexpr int BSK = VPT * WARP_SIZE;
 
-  const int m = blockIdx.x;                                  // output row
-  const int n = blockIdx.y * TILE_N + threadIdx.y;           // output column
+  const int m = blockIdx.x;
+  const int n = blockIdx.y * tile_n + threadIdx.y;
   const int lane = threadIdx.x;
   const int tid = threadIdx.y * WARP_SIZE + threadIdx.x;
+  const int nthreads = tile_n * WARP_SIZE;
 
   const bool valid = (m < M && n < N);
 
-  // LDS: share X vector across all TILE_N warps
   __shared__ float x_shared[BSK];
 
   const int w_stride = K / PF;
@@ -63,9 +66,8 @@ void qmv_tiled_kernel(
   float acc = 0.0f;
 
   for (int k_base = 0; k_base < K; k_base += BSK) {
-    // Cooperative X load — all TILE_N * WARP_SIZE threads participate
     __syncthreads();
-    for (int i = tid; i < BSK; i += TILE_N * WARP_SIZE) {
+    for (int i = tid; i < BSK; i += nthreads) {
       int k = k_base + i;
       x_shared[i] = (k < K) ? to_float(x_row[k]) : 0.0f;
     }
@@ -112,7 +114,7 @@ void qmv_tiled_kernel(
 
 // Gather variant for MoE models
 template <typename T, typename ScaleT, int BITS, int GROUP_SIZE>
-__global__ __launch_bounds__(TILE_N * WARP_SIZE)
+__global__ __launch_bounds__(TILE_N_MAX * WARP_SIZE)
 void gather_qmv_tiled_kernel(
     const T* __restrict__ x,
     const uint32_t* __restrict__ w,
@@ -122,7 +124,8 @@ void gather_qmv_tiled_kernel(
     const uint32_t* __restrict__ rhs_indices,
     T* __restrict__ out,
     int B, int M, int N, int K, int E, int LHS_B,
-    bool has_bias)
+    bool has_bias,
+    int tile_n)
 {
   constexpr int PF = pack_factor_u32<BITS>;
   constexpr int PPT = packs_per_thread<BITS>;
@@ -131,9 +134,10 @@ void gather_qmv_tiled_kernel(
 
   const int batch = blockIdx.z;
   const int m = blockIdx.x;
-  const int n = blockIdx.y * TILE_N + threadIdx.y;
+  const int n = blockIdx.y * tile_n + threadIdx.y;
   const int lane = threadIdx.x;
   const int tid = threadIdx.y * WARP_SIZE + threadIdx.x;
+  const int nthreads = tile_n * WARP_SIZE;
 
   const bool valid = (batch < B && m < M && n < N);
 
@@ -156,7 +160,7 @@ void gather_qmv_tiled_kernel(
 
   for (int k_base = 0; k_base < K; k_base += BSK) {
     __syncthreads();
-    for (int i = tid; i < BSK; i += TILE_N * WARP_SIZE) {
+    for (int i = tid; i < BSK; i += nthreads) {
       int k = k_base + i;
       x_shared[i] = (k < K && valid) ? to_float(x_row[k]) : 0.0f;
     }

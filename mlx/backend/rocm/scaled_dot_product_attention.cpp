@@ -28,6 +28,23 @@ void sdpa_vector(
     const std::optional<array>& sinks,
     Stream s);
 
+// Defined in flash_attention_wmma.hip
+bool supports_sdpa_flash_wmma(
+    const array& q,
+    const array& k,
+    const array& v,
+    bool has_arr_mask,
+    bool output_logsumexp);
+
+void sdpa_flash_wmma(
+    const array& q,
+    const array& k,
+    const array& v,
+    float scale,
+    array& o,
+    bool do_causal,
+    Stream s);
+
 // Defined in flash_attention.hip
 bool supports_sdpa_flash(
     const array& q,
@@ -122,6 +139,9 @@ void ScaledDotProductAttention::eval_gpu(
     mask_arr = prepare_sdpa_input(inputs[3], s);
   }
 
+  // Prefer WMMA flash attention when available (bf16/fp16, standard dims)
+  bool wmma_supported = supports_sdpa_flash_wmma(
+      q, k, v, has_arr_mask, output_logsumexp_) && !has_sinks_;
   bool vector_supported = supports_sdpa_vector(
       q, k, v, has_mask, has_arr_mask, do_causal_, output_logsumexp_);
   bool flash_supported = supports_sdpa_flash(
@@ -129,7 +149,10 @@ void ScaledDotProductAttention::eval_gpu(
   bool flash_first = flash_supported &&
       prefer_flash_for_decode(q, k, has_arr_mask, has_sinks_);
 
-  if (flash_first) {
+  if (wmma_supported && q.shape(2) > 4) {
+    // Use WMMA kernel for prefill (qL > 4); decode still uses vector kernel
+    sdpa_flash_wmma(q, k, v, scale_, out, do_causal_, s);
+  } else if (flash_first) {
     if (has_sinks_) {
       sdpa_flash(q, k, v, scale_, out, do_causal_, mask_arr, inputs.back(), s);
     } else {

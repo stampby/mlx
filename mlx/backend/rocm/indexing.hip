@@ -1196,10 +1196,18 @@ void SliceUpdate::eval_gpu(const std::vector<array>& inputs, array& out) {
     return;
   }
 
-  auto ctype = in.flags().contiguous && in.size() == in.data_size()
-      ? CopyType::Vector
-      : CopyType::General;
-  copy_gpu(in, out, in.data_size() == 1 ? CopyType::Scalar : ctype, stream());
+  // Donation: if the input buffer is uniquely owned, share it directly
+  // instead of copying. Helps prefill and any slice_update where the
+  // source array has no other references.
+  if (in.data_shared_ptr() != nullptr && in.data_shared_ptr().use_count() == 1 &&
+      in.flags().contiguous && in.data_size() == in.size()) {
+    out.copy_shared_buffer(in);
+  } else {
+    auto ctype = in.flags().contiguous && in.size() == in.data_size()
+        ? CopyType::Vector
+        : CopyType::General;
+    copy_gpu(in, out, in.data_size() == 1 ? CopyType::Scalar : ctype, stream());
+  }
 
   // Calculate out strides, initial offset
   auto [data_offset, out_strides] =

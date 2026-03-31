@@ -549,21 +549,19 @@ inline int select_qmv_threads_per_col(int K, int N, int bits, int batch_count) {
   return threads_per_col;
 }
 
-enum class RocmQmvArchTier {
-  Rdna,
-  Rdna3Plus,
-  CdnaLike,
-};
+// Use shared arch detection from config.h (RocmArchTier, ArchTuning).
+// Local aliases for backward compatibility within this file.
+using RocmQmvArchTier = rocm::RocmArchTier;
 
-inline RocmQmvArchTier detect_rocm_qmv_arch_tier(rocm::Device& d) {
-  static std::mutex arch_mutex;
-  static std::unordered_map<int, RocmQmvArchTier> arch_cache;
+inline rocm::HWInfo detect_rocm_hw_info(rocm::Device& d) {
+  static std::mutex hw_mutex;
+  static std::unordered_map<int, rocm::HWInfo> hw_cache;
 
   int hip_device = d.hip_device();
   {
-    std::lock_guard<std::mutex> lock(arch_mutex);
-    auto it = arch_cache.find(hip_device);
-    if (it != arch_cache.end()) {
+    std::lock_guard<std::mutex> lock(hw_mutex);
+    auto it = hw_cache.find(hip_device);
+    if (it != hw_cache.end()) {
       return it->second;
     }
   }
@@ -572,27 +570,53 @@ inline RocmQmvArchTier detect_rocm_qmv_arch_tier(rocm::Device& d) {
   d.make_current();
   hipError_t err = hipGetDeviceProperties(&props, hip_device);
 
-  RocmQmvArchTier tier =
-      (WARP_SIZE == 32) ? RocmQmvArchTier::Rdna : RocmQmvArchTier::CdnaLike;
+  rocm::HWInfo hw{};
+  hw.tier = (WARP_SIZE == 32) ? RocmQmvArchTier::Rdna2 : RocmQmvArchTier::Cdna;
+
   if (err == hipSuccess) {
+    hw.num_cus = props.multiProcessorCount;
+    hw.max_threads_per_cu = props.maxThreadsPerMultiProcessor;
+    hw.shared_mem_per_cu = props.sharedMemPerBlock;
+    hw.l2_cache_bytes = props.l2CacheSize;
+
     const char* arch_name = props.gcnArchName;
     if (arch_name != nullptr) {
-      if (std::strstr(arch_name, "gfx11") != nullptr ||
-          std::strstr(arch_name, "gfx12") != nullptr) {
-        tier = RocmQmvArchTier::Rdna3Plus;
+      if (std::strstr(arch_name, "gfx1200") != nullptr ||
+          std::strstr(arch_name, "gfx1201") != nullptr) {
+        hw.tier = RocmQmvArchTier::Rdna4;
+        hw.simds_per_cu = 2;
+        hw.has_wmma = true;
+      } else if (std::strstr(arch_name, "gfx1150") != nullptr ||
+                 std::strstr(arch_name, "gfx1151") != nullptr ||
+                 std::strstr(arch_name, "gfx1152") != nullptr) {
+        hw.tier = RocmQmvArchTier::Rdna35;
+        hw.simds_per_cu = 2;
+        hw.has_wmma = true;
+      } else if (std::strstr(arch_name, "gfx11") != nullptr) {
+        hw.tier = RocmQmvArchTier::Rdna3;
+        hw.simds_per_cu = 2;
+        hw.has_wmma = true;
       } else if (std::strstr(arch_name, "gfx10") != nullptr) {
-        tier = RocmQmvArchTier::Rdna;
+        hw.tier = RocmQmvArchTier::Rdna2;
+        hw.simds_per_cu = 2;
+        hw.has_wmma = false;
       } else if (std::strstr(arch_name, "gfx9") != nullptr) {
-        tier = RocmQmvArchTier::CdnaLike;
+        hw.tier = RocmQmvArchTier::Cdna;
+        hw.simds_per_cu = 4;
+        hw.has_wmma = (std::strstr(arch_name, "gfx942") != nullptr);
       }
     }
   }
 
   {
-    std::lock_guard<std::mutex> lock(arch_mutex);
-    arch_cache[hip_device] = tier;
+    std::lock_guard<std::mutex> lock(hw_mutex);
+    hw_cache[hip_device] = hw;
   }
-  return tier;
+  return hw;
+}
+
+inline RocmQmvArchTier detect_rocm_qmv_arch_tier(rocm::Device& d) {
+  return detect_rocm_hw_info(d).tier;
 }
 
 inline int select_qmv_qmm_crossover_m_threshold(
@@ -613,24 +637,10 @@ inline int select_qmv_qmm_crossover_m_threshold(
   int medium_shape_limit;
   int large_shape_limit;
 
-  switch (detect_rocm_qmv_arch_tier(d)) {
-    case RocmQmvArchTier::Rdna3Plus:
-      small_shape_limit = 36;
-      medium_shape_limit = 24;
-      large_shape_limit = 16;
-      break;
-    case RocmQmvArchTier::Rdna:
-      small_shape_limit = 28;
-      medium_shape_limit = 20;
-      large_shape_limit = 14;
-      break;
-    case RocmQmvArchTier::CdnaLike:
-    default:
-      small_shape_limit = 20;
-      medium_shape_limit = 14;
-      large_shape_limit = 10;
-      break;
-  }
+  auto tuning = rocm::get_arch_tuning(detect_rocm_qmv_arch_tier(d));
+  small_shape_limit = tuning.qmv_crossover_small;
+  medium_shape_limit = tuning.qmv_crossover_medium;
+  large_shape_limit = tuning.qmv_crossover_large;
 
   if (batch_count > 1 && can_use_batched_qmv) {
     small_shape_limit += 8;
@@ -2918,38 +2928,31 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   // Always prefer shared unless K is tiny (where LDS overhead isn't worth it).
   bool use_noshared_qmv_variant = use_tiny_k_qmv;
 
-  // L2-optimized tiled QMV: use TILE_N=16 columns per block for better
-  // weight reuse in L2 cache. All 16 warps process the same K-range,
-  // so adjacent weight rows stay hot in L2 across columns.
-  // Use for non-batched single-row decode with aligned dimensions.
+  // L2-optimized tiled QMV with arch-tuned TILE_N.
+  // TILE_N is passed as a runtime argument — no template instantiation needed.
+  auto hw_info = detect_rocm_hw_info(enc.device());
+  auto arch_tuning = rocm::get_arch_tuning(hw_info);
+  int tile_n = arch_tuning.qmv_tile_n;
+  // Allow env override for benchmarking
+  if (auto env = std::getenv("MLX_ROCM_QMV_TILE_N"); env && *env)
+    tile_n = std::atoi(env);
+  // Ensure N alignment
+  while (tile_n > 1 && N % tile_n != 0) tile_n /= 2;
+
   static bool use_tiled = (std::getenv("MLX_ROCM_QMV_NO_TILED") == nullptr);
   if (use_tiled && use_fast_qmv && !can_use_batched_qmv &&
-      N % rocm::TILE_N == 0 && mode_ == QuantizationMode::Affine) {
-    enc.launch_kernel([&, x_ptr, w_ptr, scales_ptr, biases_ptr, out_ptr](hipStream_t stream) {
-      dim3 tiled_block(WARP_SIZE, rocm::TILE_N);
-      dim3 tiled_grid(M, (N + rocm::TILE_N - 1) / rocm::TILE_N);
+      tile_n >= 8 && mode_ == QuantizationMode::Affine) {
+    enc.launch_kernel([&, x_ptr, w_ptr, scales_ptr, biases_ptr, out_ptr, tile_n](hipStream_t stream) {
+      dim3 tiled_block(WARP_SIZE, tile_n);
+      dim3 tiled_grid(M, (N + tile_n - 1) / tile_n);
 
-      auto launch_tiled = [&](auto type_tag, auto scale_tag, auto bits_tag, auto gs_tag) {
-        using TT = typename decltype(type_tag)::type;
-        using ST = typename decltype(scale_tag)::type;
-        constexpr int BB = bits_tag.value;
-        constexpr int GS = gs_tag.value;
-        hipLaunchKernelGGL(
-            (rocm::qmv_tiled_kernel<TT, ST, BB, GS>),
-            tiled_grid, tiled_block, 0, stream,
-            (const TT*)x_ptr, (const uint32_t*)w_ptr,
-            (const ST*)scales_ptr, (const ST*)biases_ptr,
-            (TT*)out_ptr, M, N, K, has_bias);
-      };
-
-      // Dispatch by type/bits/group_size
       #define LAUNCH_TILED(T, ScaleT, BITS_V, GS_V) \
         hipLaunchKernelGGL( \
             (rocm::qmv_tiled_kernel<T, ScaleT, BITS_V, GS_V>), \
             tiled_grid, tiled_block, 0, stream, \
             (const T*)x_ptr, (const uint32_t*)w_ptr, \
             (const ScaleT*)scales_ptr, (const ScaleT*)biases_ptr, \
-            (T*)out_ptr, M, N, K, has_bias)
+            (T*)out_ptr, M, N, K, has_bias, tile_n)
 
       if (x.dtype() == bfloat16) {
         if (bits_ == 4) {

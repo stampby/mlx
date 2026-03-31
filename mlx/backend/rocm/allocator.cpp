@@ -357,6 +357,13 @@ Buffer RocmAllocator::malloc(size_t size) {
         "Please use CPU backend instead.");
   }
 
+  // Arena fast path: deterministic bump allocation for HIP Graph capture
+  if (arena_.active()) {
+    RocmBuffer* buf = arena_.malloc(size);
+    if (buf) return Buffer{buf};
+    // Arena exhausted — fall through to normal path
+  }
+
   auto orig_size = size;
   std::unique_lock lock(mutex_);
 
@@ -430,6 +437,12 @@ Buffer RocmAllocator::malloc(size_t size) {
 void RocmAllocator::free(Buffer buffer) {
   auto* buf = static_cast<RocmBuffer*>(buffer.ptr());
   if (!buf) {
+    return;
+  }
+
+  // Arena fast path: no-op (memory freed in bulk on arena.end())
+  if (arena_.active()) {
+    arena_.free(buf);
     return;
   }
 
@@ -528,6 +541,77 @@ size_t RocmAllocator::set_cache_limit(size_t limit) {
 void RocmAllocator::clear_cache() {
   std::lock_guard lk(mutex_);
   buffer_cache_.clear();
+}
+
+// ---------------------------------------------------------------------------
+// DecodeArena implementation
+// ---------------------------------------------------------------------------
+
+DecodeArena::~DecodeArena() {
+  end();
+}
+
+bool DecodeArena::begin(size_t capacity_bytes) {
+  if (base_) end();
+
+  // Align capacity to page boundary
+  capacity_bytes = (capacity_bytes + 4095) & ~size_t(4095);
+
+  bool managed = false;
+  void* data = nullptr;
+  try {
+    data = rocm_unified_malloc(capacity_bytes, managed);
+  } catch (...) {
+    return false;
+  }
+
+  base_ = data;
+  capacity_ = capacity_bytes;
+  offset_ = 0;
+  is_managed_ = managed;
+  desc_index_ = 0;
+  descriptors_.clear();
+  descriptors_.reserve(512); // Typical decode step has ~300 allocations
+  return true;
+}
+
+void DecodeArena::reset() {
+  offset_ = 0;
+  desc_index_ = 0;
+}
+
+void DecodeArena::end() {
+  if (!base_) return;
+  rocm_unified_free(base_, is_managed_);
+  base_ = nullptr;
+  capacity_ = 0;
+  offset_ = 0;
+  descriptors_.clear();
+  desc_index_ = 0;
+}
+
+RocmBuffer* DecodeArena::malloc(size_t size) {
+  if (!base_) return nullptr;
+
+  // Align to 256 bytes for GPU access patterns
+  size_t aligned = (size + 255) & ~size_t(255);
+  if (offset_ + aligned > capacity_) return nullptr;
+
+  void* ptr = static_cast<char*>(base_) + offset_;
+  offset_ += aligned;
+
+  // Reuse or create a RocmBuffer descriptor
+  if (desc_index_ < descriptors_.size()) {
+    auto& d = descriptors_[desc_index_];
+    d.data = ptr;
+    d.size = size;
+    desc_index_++;
+    return &d;
+  }
+
+  descriptors_.push_back(RocmBuffer{ptr, size, is_managed_, -1});
+  desc_index_++;
+  return &descriptors_.back();
 }
 
 RocmAllocator& allocator() {
