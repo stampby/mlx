@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <mutex>
+#include <unordered_map>
 
 namespace mlx::core::rocm {
 
@@ -306,7 +307,9 @@ void hipblaslt_gemm_impl(
       &max_ws,
       sizeof(max_ws));
 
-  hipblasLtMatmulHeuristicResult_t heuristic;
+  // Request multiple algorithms for better occupancy/performance
+  static constexpr int kMaxAlgos = 8;
+  hipblasLtMatmulHeuristicResult_t heuristics[kMaxAlgos];
   int returned_algo_count = 0;
 
   status = hipblasLtMatmulAlgoGetHeuristic(
@@ -317,8 +320,8 @@ void hipblaslt_gemm_impl(
       layout_c.layout,
       layout_d.layout,
       pref_guard.pref,
-      1, // requestedAlgoCount
-      &heuristic,
+      kMaxAlgos,
+      heuristics,
       &returned_algo_count);
 
   if (status != HIPBLAS_STATUS_SUCCESS || returned_algo_count == 0) {
@@ -327,6 +330,90 @@ void hipblaslt_gemm_impl(
         std::to_string(static_cast<int>(status)) +
         ", returned=" + std::to_string(returned_algo_count) + ")");
   }
+
+  // Auto-tune: on first call for each (M,N,K) shape, benchmark all returned
+  // algorithms and cache the winner. Subsequent calls reuse the cached result.
+  struct TuneKey {
+    int M, N, K, batch;
+    bool operator==(const TuneKey& o) const {
+      return M == o.M && N == o.N && K == o.K && batch == o.batch;
+    }
+  };
+  struct TuneKeyHash {
+    size_t operator()(const TuneKey& k) const {
+      return std::hash<int64_t>()(
+          (int64_t(k.M) << 40) ^ (int64_t(k.N) << 20) ^ k.K ^ (int64_t(k.batch) << 50));
+    }
+  };
+  static std::unordered_map<TuneKey, int, TuneKeyHash> tune_cache;
+
+  TuneKey key{M, N, K, batch_count};
+  int best_algo_idx = 0;
+
+  // Auto-tuning: benchmark all algorithms to find the fastest for each shape.
+  // Runs automatically for new shapes. Once cached, uses the winner with zero overhead.
+  // Tuning adds ~10ms per unique (M,N,K) shape, amortized over the session.
+  static constexpr bool do_tune = true;
+
+  auto it = tune_cache.find(key);
+  if (it != tune_cache.end()) {
+    best_algo_idx = it->second;
+  } else if (do_tune && returned_algo_count > 1) {
+    double best_time = 1e30;
+    for (int algo_idx = 0; algo_idx < returned_algo_count; algo_idx++) {
+      size_t ws_need = heuristics[algo_idx].workspaceSize;
+      void* ws_p = nullptr;
+      size_t ws_s = 0;
+      if (ws_need > 0) {
+        auto [p, s] = ensure_workspace(device_id, ws_need);
+        ws_p = p;
+        ws_s = s;
+        if (!ws_p) continue;
+      }
+
+      // Warm-up
+      (void)hipblasLtMatmul(
+          handle, matmul_guard.desc, alpha,
+          a_ptr, layout_a.layout, b_ptr, layout_b.layout,
+          beta, c_ptr, layout_c.layout, c_ptr, layout_d.layout,
+          &heuristics[algo_idx].algo, ws_p, ws_s, stream);
+      (void)hipStreamSynchronize(stream);
+
+      // Timed run
+      hipEvent_t start_ev, stop_ev;
+      (void)hipEventCreate(&start_ev);
+      (void)hipEventCreate(&stop_ev);
+      (void)hipEventRecord(start_ev, stream);
+
+      static constexpr int kBenchIters = 3;
+      for (int r = 0; r < kBenchIters; r++) {
+        (void)hipblasLtMatmul(
+            handle, matmul_guard.desc, alpha,
+            a_ptr, layout_a.layout, b_ptr, layout_b.layout,
+            beta, c_ptr, layout_c.layout, c_ptr, layout_d.layout,
+            &heuristics[algo_idx].algo, ws_p, ws_s, stream);
+      }
+
+      (void)hipEventRecord(stop_ev, stream);
+      (void)hipStreamSynchronize(stream);
+      float ms = 0;
+      (void)hipEventElapsedTime(&ms, start_ev, stop_ev);
+      (void)hipEventDestroy(start_ev);
+      (void)hipEventDestroy(stop_ev);
+
+      double avg = ms / kBenchIters;
+      if (avg < best_time) {
+        best_time = avg;
+        best_algo_idx = algo_idx;
+      }
+    }
+    tune_cache[key] = best_algo_idx;
+  } else {
+    // No tuning: heuristic top pick (index 0)
+    tune_cache[key] = 0;
+  }
+
+  auto& heuristic = heuristics[best_algo_idx];
 
   // --- Workspace allocation ---
   size_t ws_needed = heuristic.workspaceSize;

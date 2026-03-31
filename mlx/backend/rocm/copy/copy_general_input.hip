@@ -3,6 +3,8 @@
 #include "mlx/backend/rocm/copy/copy.hpp"
 #include "mlx/backend/rocm/device.h"
 #include "mlx/backend/rocm/kernel_utils.hpp"
+#include "mlx/backend/rocm/device/config.h"
+#include "mlx/backend/rocm/device/utils.hpp"
 #include "mlx/dtype_utils.h"
 
 #include <hip/hip_runtime.h>
@@ -13,37 +15,25 @@ static constexpr int TILE_SIZE = 16;
 
 namespace rocm {
 
-// Helper function to convert linear index to strided offset
-template <typename IdxT>
-__device__ IdxT linear_to_strided(
-    IdxT elem,
-    const int* shape,
-    const int64_t* strides,
+// General copy kernel - strided input to contiguous output (by-value args)
+template <typename In, typename Out, typename IdxT>
+__global__ void copy_g_byval(
+    const In* in,
+    Out* out,
+    IdxT size,
+    hip_array<int32_t, MAX_NDIM> shape,
+    hip_array<int64_t, MAX_NDIM> strides,
     int ndim) {
+  IdxT index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= size) return;
+
   IdxT loc = 0;
+  IdxT elem = index;
   for (int i = ndim - 1; i >= 0 && elem > 0; --i) {
     loc += (elem % shape[i]) * IdxT(strides[i]);
     elem /= shape[i];
   }
-  return loc;
-}
-
-// General copy kernel - strided input to contiguous output (dynamic ndim)
-template <typename In, typename Out, typename IdxT>
-__global__ void copy_g_dynamic(
-    const In* in,
-    Out* out,
-    IdxT size,
-    const int* shape,
-    const int64_t* strides,
-    int ndim) {
-  IdxT index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index >= size) {
-    return;
-  }
-
-  IdxT idx = linear_to_strided(index, shape, strides, ndim);
-  out[index] = cast_to<Out>(in[idx]);
+  out[index] = cast_to<Out>(in[loc]);
 }
 
 // Column to row transpose kernel
@@ -53,7 +43,7 @@ __global__ void copy_col_row(
     T* out,
     int64_t rows,
     int64_t cols) {
-  __shared__ T tile[TILE_SIZE][TILE_SIZE + 1];  // +1 to avoid bank conflicts
+  __shared__ T tile[TILE_SIZE][TILE_SIZE + 1];
 
   int tile_row = blockIdx.x * TILE_SIZE;
   int tile_col = blockIdx.y * TILE_SIZE;
@@ -61,7 +51,6 @@ __global__ void copy_col_row(
   int tidx = threadIdx.x;
   int tidy = threadIdx.y;
 
-  // Load from column-major input
   int in_row = tile_row + tidx;
   int in_col = tile_col + tidy;
   if (in_row < rows && in_col < cols) {
@@ -70,7 +59,6 @@ __global__ void copy_col_row(
 
   __syncthreads();
 
-  // Store to row-major output
   int out_row = tile_row + tidy;
   int out_col = tile_col + tidx;
   if (out_row < rows && out_col < cols) {
@@ -89,10 +77,10 @@ void copy_general_input(
     int64_t offset_out,
     const Shape& shape,
     const Strides& strides_in) {
-  
+
   int ndim = shape.size();
   size_t data_size = out.size();
-  
+
   if (data_size == 0) {
     return;
   }
@@ -117,16 +105,14 @@ void copy_general_input(
     return;
   }
 
-  // Allocate device memory for shape and strides
-  array shape_arr({ndim}, int32, nullptr, {});
-  array strides_arr({ndim}, int64, nullptr, {});
-  shape_arr.set_data(allocator::malloc(shape_arr.nbytes()));
-  strides_arr.set_data(allocator::malloc(strides_arr.nbytes()));
-  encoder.add_temporary(shape_arr);
-  encoder.add_temporary(strides_arr);
+  // Pack shape/strides into by-value structs (no device allocation or hipMemcpyAsync)
+  rocm::hip_array<int32_t, MAX_NDIM> shape_arg = {};
+  rocm::hip_array<int64_t, MAX_NDIM> strides_arg = {};
+  for (int i = 0; i < ndim; i++) {
+    shape_arg.data_[i] = static_cast<int32_t>(shape[i]);
+    strides_arg.data_[i] = strides_in[i];
+  }
 
-  void* shape_ptr = gpu_ptr<void>(shape_arr);
-  void* strides_ptr = gpu_ptr<void>(strides_arr);
   const void* in_ptr = gpu_ptr<void>(in);
   void* out_ptr = gpu_ptr<void>(out);
 
@@ -134,38 +120,19 @@ void copy_general_input(
     dispatch_all_types(out.dtype(), [&](auto out_type_tag) {
       using InType = hip_type_t<MLX_GET_TYPE(in_type_tag)>;
       using OutType = hip_type_t<MLX_GET_TYPE(out_type_tag)>;
-      
-      encoder.launch_kernel([
-                               &,
-                               shape_ptr,
-                               strides_ptr,
-                               in_ptr,
-                               out_ptr](hipStream_t stream) {
-        // Copy shape and strides to device
-        (void)hipMemcpyAsync(
-            shape_ptr,
-            shape.data(),
-            ndim * sizeof(int32_t),
-            hipMemcpyHostToDevice,
-            stream);
-        (void)hipMemcpyAsync(
-            strides_ptr,
-            strides_in.data(),
-            ndim * sizeof(int64_t),
-            hipMemcpyHostToDevice,
-            stream);
 
+      encoder.launch_kernel([=](hipStream_t stream) {
         int block_size = 256;
         int num_blocks = (data_size + block_size - 1) / block_size;
 
         hipLaunchKernelGGL(
-            (rocm::copy_g_dynamic<InType, OutType, int64_t>),
+            (rocm::copy_g_byval<InType, OutType, int64_t>),
             dim3(num_blocks), dim3(block_size), 0, stream,
             static_cast<const InType*>(in_ptr) + offset_in,
             static_cast<OutType*>(out_ptr) + offset_out,
             static_cast<int64_t>(data_size),
-            static_cast<const int*>(shape_ptr),
-            static_cast<const int64_t*>(strides_ptr),
+            shape_arg,
+            strides_arg,
             ndim);
       });
     });
