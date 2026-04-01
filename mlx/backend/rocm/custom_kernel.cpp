@@ -196,7 +196,7 @@ CustomKernelFunction hip_kernel(
              const std::vector<std::pair<std::string, TemplateArg>>&
                  template_args = {},
              std::optional<float> init_value = std::nullopt,
-             bool verbose = false,
+             bool /*ensure_row_contiguous_unused*/ = false,
              StreamOrDevice s_ = {}) {
     if (inputs.size() != input_names.size()) {
       std::ostringstream msg;
@@ -237,14 +237,6 @@ CustomKernelFunction hip_kernel(
         output_dtypes,
         template_args,
         shape_infos);
-
-    if (verbose) {
-      std::cout << "Generated source code for `" << kernel_name
-                << "`:" << std::endl
-                << "```" << std::endl
-                << kernel_source << std::endl
-                << "```" << std::endl;
-    }
 
     return array::make_arrays(
         std::move(output_shapes),

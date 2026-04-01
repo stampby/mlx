@@ -82,7 +82,7 @@ void qmv_tiled_kernel(
       x_local[i] = x_shared[lane * VPT + i];
     }
 
-    // Coalesced weight load + dequant + accumulate
+    // Vectorized weight load + dequant + accumulate
     int w_offset = k_base / PF + lane * PPT;
 
     float group_qdot = 0.0f;
@@ -91,10 +91,20 @@ void qmv_tiled_kernel(
     int k_val = k_base + lane * VPT;
     int group_idx = k_val / GROUP_SIZE;
 
+    uint32_t w_local[PPT];
+    // Warp-uniform branch: all lanes in bounds except possibly last K-tile
+    if (k_base + BSK <= K) {
+      load_weight_vec<BITS>(w_row + w_offset, w_local);
+    } else {
+      #pragma unroll
+      for (int p = 0; p < PPT; p++) {
+        w_local[p] = (w_offset + p < w_stride) ? w_row[w_offset + p] : 0u;
+      }
+    }
+
     #pragma unroll
     for (int p = 0; p < PPT; p++) {
-      uint32_t packed = (w_offset + p < w_stride) ? w_row[w_offset + p] : 0u;
-      dequant_and_dot<BITS>(packed, &x_local[p * PF], group_qdot, group_xsum);
+      dequant_and_dot<BITS>(w_local[p], &x_local[p * PF], group_qdot, group_xsum);
     }
 
     float scale = (group_idx < num_groups) ? to_float(s_row[group_idx]) : 0.0f;
@@ -180,10 +190,19 @@ void gather_qmv_tiled_kernel(
     int k_val = k_base + lane * VPT;
     int group_idx = k_val / GROUP_SIZE;
 
+    uint32_t w_local[PPT];
+    if (k_base + BSK <= K) {
+      load_weight_vec<BITS>(w_row + w_offset, w_local);
+    } else {
+      #pragma unroll
+      for (int p = 0; p < PPT; p++) {
+        w_local[p] = (w_offset + p < w_stride) ? w_row[w_offset + p] : 0u;
+      }
+    }
+
     #pragma unroll
     for (int p = 0; p < PPT; p++) {
-      uint32_t packed = (w_offset + p < w_stride) ? w_row[w_offset + p] : 0u;
-      dequant_and_dot<BITS>(packed, &x_local[p * PF], group_qdot, group_xsum);
+      dequant_and_dot<BITS>(w_local[p], &x_local[p * PF], group_qdot, group_xsum);
     }
 
     float scale = (group_idx < num_groups) ? to_float(s_row[group_idx]) : 0.0f;

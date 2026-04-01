@@ -76,6 +76,37 @@ __device__ __forceinline__ void dequant_and_dot(
   }
 }
 
+// --- Vectorized weight load ---
+//
+// Loads PPT uint32 words in a single wide memory transaction instead of
+// PPT scalar loads. For 4-bit (PPT=2), emits global_load_dwordx2 (64-bit).
+// For 8-bit (PPT=4), emits global_load_dwordx4 (128-bit).
+// Pointer must be naturally aligned (8-byte for uint2, 16-byte for uint4).
+
+template <int BITS>
+__device__ __forceinline__ void load_weight_vec(
+    const uint32_t* __restrict__ ptr,
+    uint32_t (&out)[packs_per_thread<BITS>])
+{
+  constexpr int PPT = packs_per_thread<BITS>;
+  if constexpr (PPT == 2) {
+    uint2 v = *reinterpret_cast<const uint2*>(ptr);
+    out[0] = v.x;
+    out[1] = v.y;
+  } else if constexpr (PPT == 4) {
+    uint4 v = *reinterpret_cast<const uint4*>(ptr);
+    out[0] = v.x;
+    out[1] = v.y;
+    out[2] = v.z;
+    out[3] = v.w;
+  } else {
+    #pragma unroll
+    for (int p = 0; p < PPT; p++) {
+      out[p] = ptr[p];
+    }
+  }
+}
+
 // --- Type conversion helpers ---
 
 __device__ __forceinline__ float to_float(__half x) {
