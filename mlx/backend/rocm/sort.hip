@@ -10,11 +10,14 @@
 
 // Workaround: rocprim headers use placement new in __device__ code,
 // which requires __device__ overloads of operator new/delete.
+// ROCm 7.12+ (clang 22+) already provides these via cuda_wrappers/new.
 #ifdef __HIP_DEVICE_COMPILE__
+#ifndef __CLANG_CUDA_WRAPPERS_NEW
 __device__ inline void* operator new(size_t, void* p) noexcept { return p; }
 __device__ inline void* operator new[](size_t, void* p) noexcept { return p; }
 __device__ inline void operator delete(void*, void*) noexcept {}
 __device__ inline void operator delete[](void*, void*) noexcept {}
+#endif
 #endif
 
 #include <rocprim/rocprim.hpp>
