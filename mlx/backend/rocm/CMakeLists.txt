@@ -10,8 +10,6 @@ find_package(rocblas REQUIRED CONFIG)
 find_package(rocthrust REQUIRED CONFIG)
 find_package(rocprim REQUIRED CONFIG)
 find_package(hiprand REQUIRED CONFIG)
-find_package(rocwmma REQUIRED CONFIG)
-
 # Ensure HIP architectures are set - respect user-provided value from command
 # line The user can set this via -DCMAKE_HIP_ARCHITECTURES=gfx1011
 #
@@ -29,6 +27,20 @@ endif()
 message(
   STATUS "ROCm backend using HIP architectures: ${CMAKE_HIP_ARCHITECTURES}")
 
+# Check if any target architecture supports WMMA (RDNA 3 / gfx11xx and RDNA 4 / gfx12xx)
+set(MLX_HAS_ROCM_WMMA OFF)
+foreach(arch ${CMAKE_HIP_ARCHITECTURES})
+  if(arch MATCHES "^gfx1[12]")
+    set(MLX_HAS_ROCM_WMMA ON)
+    break()
+  endif()
+endforeach()
+message(STATUS "ROCm WMMA support: ${MLX_HAS_ROCM_WMMA}")
+
+if(MLX_HAS_ROCM_WMMA)
+  find_package(rocwmma REQUIRED CONFIG)
+endif()
+
 # Build architecture flags
 set(HIP_ARCH_FLAGS "")
 foreach(arch ${CMAKE_HIP_ARCHITECTURES})
@@ -42,8 +54,10 @@ get_target_property(ROCTHRUST_INCLUDES roc::rocthrust
                     INTERFACE_INCLUDE_DIRECTORIES)
 get_target_property(ROCPRIM_INCLUDES roc::rocprim INTERFACE_INCLUDE_DIRECTORIES)
 get_target_property(HIPRAND_INCLUDES hip::hiprand INTERFACE_INCLUDE_DIRECTORIES)
-get_target_property(ROCWMMA_INCLUDES roc::rocwmma
-                    INTERFACE_INCLUDE_DIRECTORIES)
+if(MLX_HAS_ROCM_WMMA)
+  get_target_property(ROCWMMA_INCLUDES roc::rocwmma
+                      INTERFACE_INCLUDE_DIRECTORIES)
+endif()
 
 # Find GCC installation for C++ standard library headers ROCm's clang needs to
 # know where to find libstdc++ headers
@@ -106,11 +120,13 @@ foreach(inc ${HIPRAND_INCLUDES})
     list(APPEND HIP_INCLUDE_FLAGS "-I${inc}")
   endif()
 endforeach()
-foreach(inc ${ROCWMMA_INCLUDES})
-  if(inc)
-    list(APPEND HIP_INCLUDE_FLAGS "-I${inc}")
-  endif()
-endforeach()
+if(MLX_HAS_ROCM_WMMA)
+  foreach(inc ${ROCWMMA_INCLUDES})
+    if(inc)
+      list(APPEND HIP_INCLUDE_FLAGS "-I${inc}")
+    endif()
+  endforeach()
+endif()
 
 message(STATUS "HIP include flags: ${HIP_INCLUDE_FLAGS}")
 
@@ -140,7 +156,6 @@ set(HIP_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/rope.hip
     ${CMAKE_CURRENT_SOURCE_DIR}/scaled_dot_product_attention.hip
     ${CMAKE_CURRENT_SOURCE_DIR}/flash_attention.hip
-    ${CMAKE_CURRENT_SOURCE_DIR}/flash_attention_wmma.hip
     ${CMAKE_CURRENT_SOURCE_DIR}/scan.hip
     ${CMAKE_CURRENT_SOURCE_DIR}/softmax.hip
     ${CMAKE_CURRENT_SOURCE_DIR}/sort.hip
@@ -154,6 +169,11 @@ set(HIP_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/quantized/qmm.hip
     ${CMAKE_CURRENT_SOURCE_DIR}/quantized/qmv_tiled_kernel.hip
     ${CMAKE_CURRENT_SOURCE_DIR}/conv/gemm_conv.hip)
+
+if(MLX_HAS_ROCM_WMMA)
+  list(APPEND HIP_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/flash_attention_wmma.hip)
+endif()
 
 # Create output directory for compiled objects
 set(HIP_OBJ_DIR "${CMAKE_CURRENT_BINARY_DIR}/hip_objs")
@@ -242,6 +262,9 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/gemms/hipblaslt_gemm.cpp)
 
 target_compile_definitions(mlx PRIVATE MLX_USE_ROCM)
+if(MLX_HAS_ROCM_WMMA)
+  target_compile_definitions(mlx PRIVATE MLX_HAS_ROCM_WMMA)
+endif()
 
 # Make mlx depend on the HIP kernels library
 add_dependencies(mlx mlx_rocm_kernels_lib)
