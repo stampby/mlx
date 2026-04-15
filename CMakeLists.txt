@@ -36,6 +36,7 @@ option(MLX_BUILD_PYTHON_BINDINGS "Build python bindings for mlx" OFF)
 option(MLX_BUILD_METAL "Build metal backend" ON)
 option(MLX_BUILD_CPU "Build cpu backend" ON)
 option(MLX_BUILD_CUDA "Build cuda backend" OFF)
+option(MLX_BUILD_ROCM "Build ROCm/HIP backend" OFF)
 option(MLX_METAL_DEBUG "Enhance metal debug workflow" OFF)
 option(MLX_ENABLE_X64_MAC "Enable building for x64 macOS" OFF)
 option(MLX_BUILD_GGUF "Include support for GGUF format" ON)
@@ -159,6 +160,54 @@ if(MLX_BUILD_CUDA)
   if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.1" AND CUDAToolkit_VERSION
                                                           VERSION_LESS "13.2")
     message(FATAL_ERROR "CUDA Toolkit 13.1 is not supported.")
+  endif()
+endif()
+
+if(MLX_BUILD_ROCM)
+  # Find ROCm/HIP
+  list(APPEND CMAKE_PREFIX_PATH "/opt/rocm" "$ENV{ROCM_PATH}")
+  find_package(hip REQUIRED)
+  find_package(hipblas QUIET)
+  find_package(hipblaslt QUIET)
+  find_package(rocblas QUIET)
+  find_package(miopen QUIET)
+
+  message(STATUS "ROCm found: ${hip_VERSION}")
+  message(STATUS "HIP compiler: ${HIP_HIPCC_EXECUTABLE}")
+
+  # Set HIP as the language for .hip.cpp files
+  enable_language(HIP)
+
+  # GPU architecture
+  if(NOT DEFINED GPU_TARGETS)
+    set(GPU_TARGETS "gfx1151" CACHE STRING "GPU architectures to target")
+  endif()
+  message(STATUS "ROCm GPU targets: ${GPU_TARGETS}")
+
+  # Compile definitions
+  target_compile_definitions(mlx PUBLIC MLX_BUILD_HIP=1)
+  target_compile_definitions(mlx PUBLIC __HIP_PLATFORM_AMD__=1)
+
+  # Include directories
+  target_include_directories(mlx PRIVATE ${hip_INCLUDE_DIRS})
+
+  # Link libraries
+  target_link_libraries(mlx PRIVATE hip::device)
+  if(hipblas_FOUND)
+    target_link_libraries(mlx PRIVATE roc::hipblas)
+    message(STATUS "hipBLAS found")
+  endif()
+  if(hipblaslt_FOUND)
+    target_link_libraries(mlx PRIVATE roc::hipblaslt)
+    message(STATUS "hipBLASLt found")
+  endif()
+  if(rocblas_FOUND)
+    target_link_libraries(mlx PRIVATE roc::rocblas)
+    message(STATUS "rocBLAS found")
+  endif()
+  if(miopen_FOUND)
+    target_link_libraries(mlx PRIVATE MIOpen)
+    message(STATUS "MIOpen found")
   endif()
 endif()
 

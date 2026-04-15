@@ -102,186 +102,72 @@ add_custom_command(
     -DMLX_JIT_SOURCES=${MLX_JIT_SOURCES_ARG} -P
     "${CMAKE_CURRENT_SOURCE_DIR}/bin2h.cmake"
   DEPENDS bin2h.cmake ${MLX_JIT_SOURCES})
-add_custom_target(cuda_jit_sources DEPENDS gen/cuda_jit_sources.h)
-add_dependencies(mlx cuda_jit_sources)
+add_custom_target(rocm_jit_sources DEPENDS gen/cuda_jit_sources.h)
+add_dependencies(mlx rocm_jit_sources)
 target_include_directories(mlx PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/gen")
 
-# ------------------------ Compilation configs ------------------------
+# ------------------------ ROCm/HIP Compilation configs ------------------------
 
-target_compile_definitions(mlx PRIVATE MLX_USE_CUDA)
+target_compile_definitions(mlx PRIVATE MLX_USE_HIP)
+target_compile_definitions(mlx PRIVATE __HIP_PLATFORM_AMD__)
 
-# Enable defining device lambda functions.
-target_compile_options(mlx
-                       PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>")
+# HIP files use .hip.cpp extension — set their language to HIP
+file(GLOB_RECURSE HIP_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.hip.cpp")
+set_source_files_properties(${HIP_SOURCES} PROPERTIES LANGUAGE HIP)
 
-# Enable calling host constexpr functions from device. This is needed because
-# the constexpr version of isnan is host only.
-target_compile_options(
-  mlx PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>")
+# GPU architecture target
+set(GPU_TARGETS "gfx1151" CACHE STRING "AMD GPU targets")
+set(CMAKE_HIP_ARCHITECTURES ${GPU_TARGETS})
 
-if(MSVC)
-  # Ignore warnings from CUTLASS.
-  target_compile_options(
-    mlx PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcudafe="--diag_suppress=2908">)
-else()
-  # Required for generating optimized CUTLASS code.
-  target_compile_options(
-    mlx PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fno-strict-aliasing>")
+# HIP compile options
+target_compile_options(mlx PRIVATE "$<$<COMPILE_LANGUAGE:HIP>:-fno-strict-aliasing>")
+target_compile_options(mlx PRIVATE "$<$<COMPILE_LANGUAGE:HIP>:-fgpu-rdc>")
+
+message(STATUS "ROCm GPU targets: ${GPU_TARGETS}")
+
+# No CUTLASS on ROCm — skip Hopper-specific kernels entirely
+# ROCm equivalent optimizations use hipBLASLt
+
+# ------------------------ ROCm Dependencies ------------------------
+
+# Make HIP runtime APIs available in all files
+target_include_directories(mlx PRIVATE ${hip_INCLUDE_DIRS} /opt/rocm/include)
+
+# Link ROCm libraries
+target_link_libraries(mlx PRIVATE hip::device)
+
+# hipBLAS / hipBLASLt (replaces cuBLAS)
+if(hipblas_FOUND)
+  target_link_libraries(mlx PRIVATE roc::hipblas)
+endif()
+if(hipblaslt_FOUND)
+  target_link_libraries(mlx PRIVATE roc::hipblaslt)
+endif()
+if(rocblas_FOUND)
+  target_link_libraries(mlx PRIVATE roc::rocblas)
 endif()
 
-# Suppress nvcc warnings on C++ headers.
-target_compile_options(
-  mlx
-  PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:-Xcudafe="--diag_suppress=27,997,1394,20011,20208">
-)
-
-# Ignore some valid nvcc warnings, we might want to fix them in future.
-target_compile_options(
-  mlx PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcudafe="--diag_suppress=177,550">)
-
-# Use stronger binaries compression. This feature was introduced in CUDA 12.8
-# and requires drivers released after CUDA 12.4.
-if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8.0)
-  target_compile_options(
-    mlx PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:--compress-mode=size>")
+# rocFFT (replaces cuFFT)
+find_package(rocfft QUIET)
+if(rocfft_FOUND)
+  target_link_libraries(mlx PRIVATE roc::rocfft)
+  message(STATUS "rocFFT found")
 endif()
 
-# Use native CUDA arch by default.
-if(NOT DEFINED MLX_CUDA_ARCHITECTURES)
-  execute_process(
-    COMMAND __nvcc_device_query
-    OUTPUT_VARIABLE MLX_CUDA_ARCHITECTURES
-    OUTPUT_STRIP_TRAILING_WHITESPACE)
-  if(MLX_CUDA_ARCHITECTURES STREQUAL "")
-    message(
-      FATAL_ERROR
-        "Can not get native CUDA arch, must set MLX_CUDA_ARCHITECTURES")
-  elseif(MLX_CUDA_ARCHITECTURES GREATER_EQUAL 90)
-    # Use arch-specific compute capability whenever possible.
-    set(MLX_CUDA_ARCHITECTURES "${MLX_CUDA_ARCHITECTURES}a")
-  endif()
-endif()
-message(STATUS "CUDA architectures: ${MLX_CUDA_ARCHITECTURES}")
-set_target_properties(mlx PROPERTIES CUDA_ARCHITECTURES
-                                     "${MLX_CUDA_ARCHITECTURES}")
-
-# Skip Hopper-only kernels when not building for sm90a.
-if(NOT DEFINED ENV{MLX_DISABLE_SM90A_KERNELS}
-   AND (("90a" IN_LIST MLX_CUDA_ARCHITECTURES) OR ("90a-real" IN_LIST
-                                                   MLX_CUDA_ARCHITECTURES)))
-  target_compile_definitions(mlx PRIVATE MLX_CUDA_SM90A_ENABLED)
+# MIOpen (replaces cuDNN)
+if(miopen_FOUND)
+  target_link_libraries(mlx PRIVATE MIOpen)
 endif()
 
-# Search CUDA libs from installed python packages.
-if(WIN32)
-  # Resolve paths of unfound DLL at runtime.
-  if(BUILD_SHARED_LIBS)
-    target_link_libraries(mlx PRIVATE "delayimp.lib")
-    target_sources(mlx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/delayload.cpp)
-  else()
-    # For static library the delayload must be compiled into final executables.
-    target_link_libraries(mlx PUBLIC "delayimp.lib")
-    target_sources(
-      mlx PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/delayload.cpp>)
-  endif()
-  # Get all the CUDA DLLs we could link with.
-  file(
-    GLOB CUDA_DLL_NAMES
-    RELATIVE "${CUDAToolkit_BIN_DIR}/x64"
-    "${CUDAToolkit_BIN_DIR}/x64/*.dll")
-  # Delay load CUDA and cuDNN libs.
-  foreach(CUDA_DLL ${CUDA_DLL_NAMES} ${CUDNN_DLL_NAMES})
-    target_link_options(mlx PUBLIC "/DELAYLOAD:${CUDA_DLL}")
-  endforeach()
-  # Pass the locations where CUDA DLLs are placed.
-  if(NOT MLX_LOAD_CUDA_LIBS_FROM_PYTHON)
-    target_compile_definitions(
-      mlx PUBLIC MLX_CUDA_BIN_DIR="${CUDAToolkit_BIN_DIR}/x64"
-                 MLX_CUDNN_BIN_DIR="${CUDNN_BIN_DIR}")
-  endif()
-else()
-  # For POSIX we rely on RPATH to search for CUDA libs.
-  if(MLX_LOAD_CUDA_LIBS_FROM_PYTHON)
-    set_property(
-      TARGET mlx
-      APPEND
-      PROPERTY INSTALL_RPATH
-               # The paths here should match the install_requires in setup.py.
-               "$ORIGIN/../../nvidia/cublas/lib"
-               "$ORIGIN/../../nvidia/cuda_nvrtc/lib"
-               "$ORIGIN/../../nvidia/cudnn/lib"
-               "$ORIGIN/../../nvidia/nccl/lib")
-  endif()
+# RCCL (replaces NCCL) — for distributed
+find_package(rccl QUIET)
+if(rccl_FOUND)
+  target_link_libraries(mlx PRIVATE rccl)
+  message(STATUS "RCCL found")
 endif()
 
-# ------------------------ Dependencies ------------------------
-
-# Use fixed version of CCCL.
-FetchContent_Declare(
-  cccl
-  URL "https://github.com/NVIDIA/cccl/releases/download/v3.1.3/cccl-v3.1.3.zip")
-FetchContent_MakeAvailable(cccl)
-target_include_directories(mlx BEFORE PRIVATE "${cccl_SOURCE_DIR}/include")
-
-# Install CCCL headers for JIT.
-install(DIRECTORY ${cccl_SOURCE_DIR}/include/cuda
-        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/cccl)
-install(DIRECTORY ${cccl_SOURCE_DIR}/include/nv
-        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/cccl)
-
-# The binary of C++ tests will not be installed so it can not find the CCCL
-# headers, and we have to hard-code the path.
-if(MLX_BUILD_TESTS)
-  target_compile_definitions(mlx
-                             PRIVATE MLX_CCCL_DIR="${cccl_SOURCE_DIR}/include")
-endif()
-
-# Use fixed version of NVTX.
-FetchContent_Declare(
-  nvtx3
-  GIT_REPOSITORY https://github.com/NVIDIA/NVTX.git
-  GIT_TAG v3.1.1
-  GIT_SHALLOW TRUE
-  SOURCE_SUBDIR c EXCLUDE_FROM_ALL)
-FetchContent_MakeAvailable(nvtx3)
-target_link_libraries(mlx PUBLIC $<BUILD_INTERFACE:nvtx3-cpp>)
-
-# Make cuda runtime APIs available in non-cuda files.
-target_include_directories(mlx PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
-
-# Use cublasLt.
-target_link_libraries(mlx PRIVATE CUDA::cublasLt)
-
-# Use cuFFT.
-target_link_libraries(mlx PRIVATE CUDA::cufft)
-
-# Use NVRTC and driver APIs.
-target_link_libraries(mlx PRIVATE CUDA::nvrtc CUDA::cuda_driver)
-
-# Use the frontend APIs of cuDNN.
-FetchContent_Declare(
-  cudnn
-  GIT_REPOSITORY https://github.com/NVIDIA/cudnn-frontend.git
-  GIT_TAG v1.16.0
-  GIT_SHALLOW TRUE
-  EXCLUDE_FROM_ALL)
-set(CUDNN_FRONTEND_SKIP_JSON_LIB ON)
-set(CUDNN_FRONTEND_BUILD_SAMPLES OFF)
-set(CUDNN_FRONTEND_BUILD_TESTS OFF)
-set(CUDNN_FRONTEND_BUILD_PYTHON_BINDINGS OFF)
-FetchContent_MakeAvailable(cudnn)
-target_link_libraries(mlx PRIVATE cudnn_frontend)
-# Link with the actual cuDNN libraries.
-target_link_libraries(mlx PRIVATE CUDNN::cudnn_all)
-
-# Use header-only CUTLASS.
-FetchContent_Declare(
-  cutlass
-  GIT_REPOSITORY https://github.com/NVIDIA/cutlass.git
-  GIT_TAG v4.3.5
-  GIT_SHALLOW TRUE
-  SOURCE_SUBDIR include EXCLUDE_FROM_ALL)
-FetchContent_MakeAvailable(cutlass)
-target_include_directories(
-  mlx SYSTEM PRIVATE $<BUILD_INTERFACE:${cutlass_SOURCE_DIR}/include>)
+# ROCm RPATH
+set_property(
+  TARGET mlx
+  APPEND
+  PROPERTY INSTALL_RPATH "/opt/rocm/lib")

@@ -1,19 +1,19 @@
 target_sources(
   mlx
-  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/qmm.cu
-          ${CMAKE_CURRENT_SOURCE_DIR}/qmv.cu
-          ${CMAKE_CURRENT_SOURCE_DIR}/fp_qmv.cu
-          ${CMAKE_CURRENT_SOURCE_DIR}/qmm_impl_naive_m16_k.cu
-          ${CMAKE_CURRENT_SOURCE_DIR}/qmm_impl_naive_m16_n.cu
-          ${CMAKE_CURRENT_SOURCE_DIR}/qmm_impl_naive_m32_k.cu
-          ${CMAKE_CURRENT_SOURCE_DIR}/qmm_impl_naive_m32_n.cu
-          ${CMAKE_CURRENT_SOURCE_DIR}/qmm_impl_naive_m64_k.cu
-          ${CMAKE_CURRENT_SOURCE_DIR}/qmm_impl_naive_m64_n.cu
-          ${CMAKE_CURRENT_SOURCE_DIR}/qmm_impl_sm80_m16.cu
-          ${CMAKE_CURRENT_SOURCE_DIR}/qmm_impl_sm80_m32.cu
-          ${CMAKE_CURRENT_SOURCE_DIR}/qmm_impl_sm80_m64.cu
-          ${CMAKE_CURRENT_SOURCE_DIR}/qmm_impl_sm90_m128_n16_m1.cu
-          ${CMAKE_CURRENT_SOURCE_DIR}/qmm_impl_sm90_m128_n32_m1.cu
-          ${CMAKE_CURRENT_SOURCE_DIR}/qmm_impl_sm90_m128_n64_m2.cu
-          ${CMAKE_CURRENT_SOURCE_DIR}/qmm_impl_sm90_m128_n128_m2.cu
-          ${CMAKE_CURRENT_SOURCE_DIR}/qmm_impl_sm90_m128_n256_m2.cu)
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/qmm.hip.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/qmv.hip.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/fp_qmv.hip.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/qmm_impl_naive_m16_k.hip.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/qmm_impl_naive_m16_n.hip.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/qmm_impl_naive_m32_k.hip.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/qmm_impl_naive_m32_n.hip.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/qmm_impl_naive_m64_k.hip.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/qmm_impl_naive_m64_n.hip.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/qmm_impl_sm80_m16.hip.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/qmm_impl_sm80_m32.hip.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/qmm_impl_sm80_m64.hip.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/qmm_impl_sm90_m128_n16_m1.hip.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/qmm_impl_sm90_m128_n32_m1.hip.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/qmm_impl_sm90_m128_n64_m2.hip.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/qmm_impl_sm90_m128_n128_m2.hip.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/qmm_impl_sm90_m128_n256_m2.hip.cpp)
