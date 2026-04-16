@@ -52,7 +52,7 @@ inline __device__ void atomic_add(complex64_t* out, complex64_t val) {
   atomic_add_general(out, val);
 }
 
-inline __device__ void atomic_add(__nv_bfloat16* out, __nv_bfloat16 val) {
+inline __device__ void atomic_add(__hip_bfloat16* out, __hip_bfloat16 val) {
 #if __CUDA_ARCH__ < 800
   atomic_add_general(out, val);
 #else

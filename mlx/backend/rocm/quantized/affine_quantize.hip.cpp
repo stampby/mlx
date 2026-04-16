@@ -17,7 +17,7 @@ namespace cg = cooperative_groups;
 template <typename T, int group_size, int bits>
 __global__ void
 affine_quantize(const T* w, uint8_t* out, T* scales, T* biases, size_t size) {
-  auto block_size = cg::this_thread_block().dim_threads();
+  auto block_size = cg::this_thread_block().size();
   auto block_idx = cg::this_thread_block().group_index();
   auto idx_in_block = cg::this_thread_block().thread_index();
 
@@ -134,7 +134,7 @@ __global__ void affine_dequantize(
     const T* biases,
     T* out,
     size_t size) {
-  auto block_size = cg::this_thread_block().dim_threads();
+  auto block_size = cg::this_thread_block().size();
   auto block_idx = cg::this_thread_block().group_index();
   auto idx_in_block = cg::this_thread_block().thread_index();
 
@@ -291,7 +291,7 @@ void affine_quantize(
   dispatch_float_types(w.dtype(), "affine_quantize", [&](auto type_tag) {
     dispatch_groups(group_size_, [&](auto group_size) {
       dispatch_bits(bits_, [&](auto bits) {
-        using T = hip_type_t<MLX_GET_TYPE(type_tag)>;
+        using T = cuda_type_t<MLX_GET_TYPE(type_tag)>;
         auto kernel = cu::affine_quantize<T, group_size.value, bits.value>;
         auto [num_blocks, block_dims] =
             get_launch_args(size, grid_shape, w.strides(), large);
@@ -346,7 +346,7 @@ void affine_dequantize(
   dispatch_float_types(w.dtype(), "affine_dequantize", [&](auto type_tag) {
     dispatch_groups(group_size_, [&](auto group_size) {
       dispatch_bits(bits_, [&](auto bits) {
-        using T = hip_type_t<MLX_GET_TYPE(type_tag)>;
+        using T = cuda_type_t<MLX_GET_TYPE(type_tag)>;
         auto kernel = cu::affine_dequantize<T, group_size.value, bits.value>;
         auto [num_blocks, block_dims] =
             get_launch_args(size, grid_shape, w.strides(), large);

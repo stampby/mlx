@@ -35,7 +35,7 @@ __device__ void adjust_matrix_offsets(
     const Shape w_shape,
     const Strides w_strides,
     const Strides s_strides) {
-  uint32_t idx = cg::this_grid().block_index().z;
+  uint32_t idx = cg::this_grid().group_index().z;
   if (x_batch_ndims == 1) {
     x += idx * x_strides[0];
   } else {
@@ -189,12 +189,12 @@ __global__ void fp_qmv_batched(
     int rows,
     int cols,
     int vec_batch_ndims,
-    const __grid_constant__ Shape vec_shape,
-    const __grid_constant__ Strides vec_strides,
+    const  Shape vec_shape,
+    const  Strides vec_strides,
     int mat_batch_ndims,
-    const __grid_constant__ Shape mat_shape,
-    const __grid_constant__ Strides mat_strides,
-    const __grid_constant__ Strides scales_strides) {
+    const  Shape mat_shape,
+    const  Strides mat_strides,
+    const  Strides scales_strides) {
   adjust_matrix_offsets<T>(
       vec,
       mat,
@@ -254,7 +254,7 @@ void fp_qmv(
   encoder.set_input_array(vec);
   encoder.set_output_array(out);
   dispatch_float_types(out.dtype(), "qmv", [&](auto type_tag) {
-    using T = hip_type_t<MLX_GET_TYPE(type_tag)>;
+    using T = cuda_type_t<MLX_GET_TYPE(type_tag)>;
     if constexpr (!std::is_same_v<T, double>) {
       dim3 block_dims{WARP_SIZE, rows_per_block};
       uint32_t blocks_y = (N + rows_per_block - 1) / rows_per_block;

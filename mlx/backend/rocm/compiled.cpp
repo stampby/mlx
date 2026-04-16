@@ -9,7 +9,7 @@
 #include "mlx/primitives.h"
 
 #include <fmt/format.h>
-#include <nvtx3/nvtx3.hpp>
+// NVTX not available on ROCm — profiling markers disabled
 
 namespace mlx::core {
 
@@ -39,7 +39,7 @@ struct FusedKernelBuilder {
       if (!is_scalar(x) && !contiguous) {
         params.push_back(
             fmt::format(
-                "const __grid_constant__ hip::std::array<int64_t, NDIM> {}_strides",
+                "const  hip::std::array<int64_t, NDIM> {}_strides",
                 xname));
       }
     }
@@ -50,7 +50,7 @@ struct FusedKernelBuilder {
     }
     if (!contiguous) {
       params.push_back(
-          "const __grid_constant__ hip::std::array<int32_t, NDIM> shape");
+          "const  hip::std::array<int32_t, NDIM> shape");
     }
     params.push_back("IdxT size");
 
@@ -228,7 +228,7 @@ constexpr const char* g_jit_includes = R"(
 void Compiled::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  nvtx3::scoped_range r("Compiled::eval_gpu");
+  
   auto& s = stream();
 
   // Determine the work per thread for the vectorized reads/writes. We take it

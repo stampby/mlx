@@ -8,7 +8,7 @@
 
 #include <hip/hip_cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
-#include <cub/block/block_load.hip.h>
+#include <hipcub/block/block_load.hip.h>
 #include <hipcub/hipcub.hpp>
 
 namespace mlx::core {
@@ -96,7 +96,7 @@ template <
 __global__ void col_reduce_looped(
     T* in,
     U* out,
-    const __grid_constant__ ColReduceArgs args,
+    const  ColReduceArgs args,
     int64_t out_size) {
   auto grid = cg::this_grid();
   auto block = cg::this_thread_block();
@@ -144,7 +144,7 @@ __global__ void col_reduce_looped(
     if (args.reduction_stride % N_READS == 0) {
       for (size_t r = start; r < end; r += BM) {
         T vals[N_READS];
-        hipcub::LoadDirectBlockedVectorized(thread_x, in + loop.location(), vals);
+        hiphipcub::LoadDirectBlockedVectorized(thread_x, in + loop.location(), vals);
         for (int i = 0; i < N_READS; i++) {
           totals[i] = op(totals[i], cast_to<U>(vals[i]));
         }
@@ -153,7 +153,7 @@ __global__ void col_reduce_looped(
     } else {
       for (size_t r = start; r < end; r += BM) {
         T vals[N_READS];
-        hipcub::LoadDirectBlocked(thread_x, in + loop.location(), vals);
+        hiphipcub::LoadDirectBlocked(thread_x, in + loop.location(), vals);
         for (int i = 0; i < N_READS; i++) {
           totals[i] = op(totals[i], cast_to<U>(vals[i]));
         }
@@ -163,7 +163,7 @@ __global__ void col_reduce_looped(
   } else {
     for (size_t r = start; r < end; r += BM) {
       T vals[N_READS];
-      hipcub::LoadDirectBlocked(
+      hiphipcub::LoadDirectBlocked(
           thread_x,
           in + loop.location(),
           vals,
@@ -195,7 +195,7 @@ __global__ void col_reduce_looped(
     if (BLOCKS > 1) {
       out += tile_out * out_size * args.reduction_stride;
     }
-    hipcub::StoreDirectBlocked(
+    hiphipcub::StoreDirectBlocked(
         warp.meta_group_rank(),
         out + tile_y * args.reduction_stride + tile_x * BN,
         totals,
@@ -207,7 +207,7 @@ template <typename T, typename U, typename Op, int N_READS = 4>
 __global__ void col_reduce_small(
     const T* in,
     U* out,
-    const __grid_constant__ ColReduceArgs args,
+    const  ColReduceArgs args,
     size_t total) {
   Op op;
   auto grid = cg::this_grid();
@@ -281,7 +281,7 @@ void col_reduce_looped(
     dispatch_reduce_ops(reduce_type, [&](auto reduce_type_tag) {
       dispatch_reduce_ndim(args.reduce_ndim, [&](auto reduce_ndim) {
         using OP = MLX_GET_TYPE(reduce_type_tag);
-        using T = hip_type_t<MLX_GET_TYPE(type_tag)>;
+        using T = cuda_type_t<MLX_GET_TYPE(type_tag)>;
         using U = typename cu::ReduceResult<OP, T>::type;
 
         constexpr int N_READS = 4;
@@ -321,7 +321,7 @@ void col_reduce_small(
   dispatch_all_types(in.dtype(), [&](auto type_tag) {
     dispatch_reduce_ops(reduce_type, [&](auto reduce_type_tag) {
       using OP = MLX_GET_TYPE(reduce_type_tag);
-      using T = hip_type_t<MLX_GET_TYPE(type_tag)>;
+      using T = cuda_type_t<MLX_GET_TYPE(type_tag)>;
       using U = typename cu::ReduceResult<OP, T>::type;
 
       constexpr int N_READS = 16 / sizeof(T);
@@ -386,7 +386,7 @@ void col_reduce_two_pass(
     dispatch_reduce_ops(reduce_type, [&](auto reduce_type_tag) {
       dispatch_reduce_ndim(args.reduce_ndim, [&](auto reduce_ndim) {
         using OP = MLX_GET_TYPE(reduce_type_tag);
-        using T = hip_type_t<MLX_GET_TYPE(type_tag)>;
+        using T = cuda_type_t<MLX_GET_TYPE(type_tag)>;
         using U = typename cu::ReduceResult<OP, T>::type;
 
         constexpr int N_READS = 4;
@@ -424,7 +424,7 @@ void col_reduce_two_pass(
     dispatch_reduce_ops(reduce_type, [&](auto reduce_type_tag) {
       dispatch_reduce_ndim(second_args.reduce_ndim, [&](auto reduce_ndim) {
         using OP = MLX_GET_TYPE(reduce_type_tag);
-        using T = hip_type_t<MLX_GET_TYPE(type_tag)>;
+        using T = cuda_type_t<MLX_GET_TYPE(type_tag)>;
         using U = typename cu::ReduceResult<OP, T>::type;
 
         constexpr int N_READS = 4;

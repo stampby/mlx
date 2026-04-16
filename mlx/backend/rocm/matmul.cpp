@@ -9,7 +9,7 @@
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/primitives.h"
 
-#include <nvtx3/nvtx3.hpp>
+// NVTX not available on ROCm — profiling markers disabled
 #include <numeric>
 
 namespace mlx::core {
@@ -174,7 +174,7 @@ void gather_mm_rhs(
 } // namespace
 
 void Matmul::eval_gpu(const std::vector<array>& inputs, array& out) {
-  nvtx3::scoped_range r("Matmul::eval_gpu");
+  
   auto& s = stream();
   auto& encoder = cu::get_command_encoder(s);
 
@@ -205,7 +205,7 @@ void Matmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 }
 
 void BlockMaskedMM::eval_gpu(const std::vector<array>& inputs, array& out) {
-  nvtx3::scoped_range r("BlockMaskedMM::eval_gpu");
+  
   if (!issubdtype(out.dtype(), floating)) {
     throw std::runtime_error(
         "[BlockMaskedMM] Does not yet support non-floating point types.");
@@ -281,7 +281,7 @@ void BlockMaskedMM::eval_gpu(const std::vector<array>& inputs, array& out) {
 }
 
 void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
-  nvtx3::scoped_range r("AddMM::eval_gpu");
+  
   auto& s = stream();
   auto& encoder = cu::get_command_encoder(s);
 
@@ -399,7 +399,7 @@ void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
 }
 
 void GatherMM::eval_gpu(const std::vector<array>& inputs, array& out) {
-  nvtx3::scoped_range r("GatherMM::eval_gpu");
+  
   auto& s = stream();
   auto& encoder = cu::get_command_encoder(s);
 
@@ -448,7 +448,7 @@ void GatherMM::eval_gpu(const std::vector<array>& inputs, array& out) {
 }
 
 void SegmentedMM::eval_gpu(const std::vector<array>& inputs, array& out) {
-  nvtx3::scoped_range r("SegmentedMM::eval_gpu");
+  
   auto& s = stream();
   auto& encoder = cu::get_command_encoder(s);
 

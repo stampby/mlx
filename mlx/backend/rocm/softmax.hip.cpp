@@ -11,7 +11,7 @@
 
 #include <hip/hip_cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
-#include <nvtx3/nvtx3.hpp>
+// NVTX not available on ROCm — profiling markers disabled
 
 #include <cassert>
 
@@ -107,7 +107,7 @@ __global__ void softmax(const T* in, T* out, int axis_size) {
 } // namespace cu
 
 void Softmax::eval_gpu(const std::vector<array>& inputs, array& out) {
-  nvtx3::scoped_range r("Softmax::eval_gpu");
+  
   assert(inputs.size() == 1);
   auto& s = stream();
   auto& encoder = cu::get_command_encoder(s);
@@ -141,7 +141,7 @@ void Softmax::eval_gpu(const std::vector<array>& inputs, array& out) {
   encoder.set_input_array(in);
   encoder.set_output_array(out);
   dispatch_float_types(out.dtype(), "softmax", [&](auto type_tag) {
-    using DataType = hip_type_t<MLX_GET_TYPE(type_tag)>;
+    using DataType = cuda_type_t<MLX_GET_TYPE(type_tag)>;
     constexpr int N_READS = 16 / sizeof(DataType);
     dispatch_block_dim(hip::ceil_div(axis_size, N_READS), [&](auto block_dim) {
       auto kernel = cu::softmax<DataType, DataType, block_dim(), N_READS>;

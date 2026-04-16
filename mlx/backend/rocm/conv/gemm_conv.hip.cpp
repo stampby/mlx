@@ -20,7 +20,7 @@ __global__ void naive_unfold_nd(
     T* out,
     int filter_size,
     int out_pixels,
-    const __grid_constant__ ConvParams<NDIM> params) {
+    const  ConvParams<NDIM> params) {
   auto block = cg::this_thread_block();
   auto tid = block.group_index();
   auto lid = block.thread_index();
@@ -28,7 +28,7 @@ __global__ void naive_unfold_nd(
   int index_batch = tid.z / out_pixels; // [0, N)
   int index_out_spatial = tid.z % out_pixels; // [0, H_out * W_out)
   int index_wt_spatial =
-      tid.x * block.dim_threads().x + lid.x; // [0, H_wt * W_wt)
+      tid.x * block.size().x + lid.x; // [0, H_wt * W_wt)
 
   if (index_wt_spatial >= filter_size / params.C) {
     return;
@@ -113,7 +113,7 @@ array unfold_inputs_nd(
   encoder.set_input_array(in);
   encoder.set_output_array(unfolded);
   dispatch_float_types(in.dtype(), "unfold", [&](auto type_tag) {
-    using DataType = hip_type_t<MLX_GET_TYPE(type_tag)>;
+    using DataType = cuda_type_t<MLX_GET_TYPE(type_tag)>;
     encoder.add_kernel_node(
         cu::naive_unfold_nd<DataType, NDIM>,
         num_blocks,

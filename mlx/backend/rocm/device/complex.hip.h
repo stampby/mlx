@@ -5,29 +5,29 @@
 // Make multiplication and division faster.
 #define LIBCUDACXX_ENABLE_SIMPLIFIED_COMPLEX_OPERATIONS
 
-#include <cuda/std/complex>
-#include <cuda/std/type_traits>
+#include <complex>
+#include <type_traits>
 
 namespace mlx::core::cu {
 
-// TODO: Consider using a faster implementation as cuda::std::complex has to
+// TODO: Consider using a faster implementation as std::complex has to
 // conform to C++ standard.
 template <typename T>
-using complex_t = cuda::std::complex<T>;
+using complex_t = std::complex<T>;
 
 using complex64_t = complex_t<float>;
 using complex128_t = complex_t<double>;
 
 template <typename T>
-struct is_complex : cuda::std::false_type {};
+struct is_complex : std::false_type {};
 
 template <typename T>
-struct is_complex<cuda::std::complex<T>> : cuda::std::true_type {};
+struct is_complex<std::complex<T>> : std::true_type {};
 
 template <typename T>
 inline constexpr bool is_complex_v = is_complex<T>::value;
 
-// cuda::std::complex is missing some operators.
+// std::complex is missing some operators.
 template <typename T>
 inline __host__ __device__ complex_t<T> operator%(
     complex_t<T> a,

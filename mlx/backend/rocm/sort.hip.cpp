@@ -12,7 +12,7 @@
 #include "mlx/dtype_utils.h"
 #include "mlx/primitives.h"
 
-#include <nvtx3/nvtx3.hpp>
+// NVTX not available on ROCm — profiling markers disabled
 #include <hip/std/limits>
 #include <hip/std/type_traits>
 
@@ -384,9 +384,9 @@ __global__ void block_sort_nc_kernel(
     int size_sorted_axis,
     int64_t in_stride_sorted_axis,
     int64_t out_stride_sorted_axis,
-    const __grid_constant__ Shape nc_shape,
-    const __grid_constant__ Strides in_nc_strides,
-    const __grid_constant__ Strides out_nc_strides,
+    const  Shape nc_shape,
+    const  Strides in_nc_strides,
+    const  Strides out_nc_strides,
     int nc_dim) {
   using sort_kernel =
       KernelMergeSort<T, U, ARG_SORT, BLOCK_THREADS, N_PER_THREAD>;
@@ -516,8 +516,8 @@ __global__ void mb_block_sort_kernel(
     IdxT* out_idxs,
     int size_sorted_axis,
     int64_t stride_sorted_axis,
-    const __grid_constant__ Shape nc_shape,
-    const __grid_constant__ Strides nc_strides,
+    const  Shape nc_shape,
+    const  Strides nc_strides,
     int nc_dim) {
   using sort_kernel = KernelMultiBlockMergeSort<
       ValT,
@@ -763,7 +763,7 @@ void single_block_sort(
 
   dispatch_all_types(in.dtype(), [&](auto type_tag) {
     using CTYPE = MLX_GET_TYPE(type_tag);
-    using ValT = hip_type_t<CTYPE>;
+    using ValT = cuda_type_t<CTYPE>;
     dispatch_block_dim(bn, [&](auto block_dim) {
       constexpr int BLOCK_THREADS = block_dim();
       if constexpr (BLOCK_THREADS < 1024) {
@@ -882,7 +882,7 @@ void multi_block_sort(
 
   dispatch_all_types(in.dtype(), [&](auto type_tag) {
     using CTYPE = MLX_GET_TYPE(type_tag);
-    using ValT = hip_type_t<CTYPE>;
+    using ValT = cuda_type_t<CTYPE>;
     using IdxT = uint32_t;
     constexpr int BLOCK_THREADS = sizeof(ValT) == 8 ? 256 : 512;
     dim3 grid(n_blocks, n_rows, 1);
@@ -1054,24 +1054,24 @@ void gpu_sort(
 } // namespace
 
 void ArgSort::eval_gpu(const std::vector<array>& inputs, array& out) {
-  nvtx3::scoped_range r("ArgSort::eval_gpu");
+  
   assert(inputs.size() == 1);
   gpu_sort(stream(), inputs[0], out, axis_, true);
 }
 
 void Sort::eval_gpu(const std::vector<array>& inputs, array& out) {
-  nvtx3::scoped_range r("Sort::eval_gpu");
+  
   assert(inputs.size() == 1);
   gpu_sort(stream(), inputs[0], out, axis_, false);
 }
 
 void ArgPartition::eval_gpu(const std::vector<array>& inputs, array& out) {
-  nvtx3::scoped_range r("ArgPartition::eval_gpu");
+  
   gpu_sort(stream(), inputs[0], out, axis_, true);
 }
 
 void Partition::eval_gpu(const std::vector<array>& inputs, array& out) {
-  nvtx3::scoped_range r("Partition::eval_gpu");
+  
   gpu_sort(stream(), inputs[0], out, axis_, false);
 }
 

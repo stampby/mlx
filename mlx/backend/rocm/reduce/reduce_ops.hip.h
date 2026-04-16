@@ -41,7 +41,7 @@ struct Sum {
     atomic_reduce<T, Sum>(x, y);
   }
 
-  __device__ void atomic_update(__nv_bfloat16* x, __nv_bfloat16 y) {
+  __device__ void atomic_update(__hip_bfloat16* x, __hip_bfloat16 y) {
     atomic_add(x, y);
   }
 
@@ -70,15 +70,15 @@ struct Min {
   template <typename T>
   __device__ __forceinline__ T operator()(T a, T b) {
     if constexpr (is_complex_v<T>) {
-      if (cuda::std::isnan(a.real()) || cuda::std::isnan(a.imag())) {
+      if (std::isnan(a.real()) || std::isnan(a.imag())) {
         return a;
       }
-      if (cuda::std::isnan(b.real()) || cuda::std::isnan(b.imag())) {
+      if (std::isnan(b.real()) || std::isnan(b.imag())) {
         return b;
       }
-    } else if constexpr (!cuda::std::is_integral_v<T>) {
-      if (cuda::std::isnan(a) || cuda::std::isnan(b)) {
-        return cuda::std::numeric_limits<float>::quiet_NaN();
+    } else if constexpr (!std::is_integral_v<T>) {
+      if (std::isnan(a) || std::isnan(b)) {
+        return std::numeric_limits<float>::quiet_NaN();
       }
     }
     return a < b ? a : b;
@@ -94,15 +94,15 @@ struct Max {
   template <typename T>
   __device__ __forceinline__ T operator()(T a, T b) {
     if constexpr (is_complex_v<T>) {
-      if (cuda::std::isnan(a.real()) || cuda::std::isnan(a.imag())) {
+      if (std::isnan(a.real()) || std::isnan(a.imag())) {
         return a;
       }
-      if (cuda::std::isnan(b.real()) || cuda::std::isnan(b.imag())) {
+      if (std::isnan(b.real()) || std::isnan(b.imag())) {
         return b;
       }
-    } else if constexpr (!cuda::std::is_integral_v<T>) {
-      if (cuda::std::isnan(a) || cuda::std::isnan(b)) {
-        return cuda::std::numeric_limits<float>::quiet_NaN();
+    } else if constexpr (!std::is_integral_v<T>) {
+      if (std::isnan(a) || std::isnan(b)) {
+        return std::numeric_limits<float>::quiet_NaN();
       }
     }
     return a > b ? a : b;
@@ -130,16 +130,16 @@ struct ReduceResult<Or, T> {
 
 template <typename T>
 struct ReduceResult<Sum, T> {
-  using type = cuda::std::conditional_t<
-      (cuda::std::is_integral_v<T> && sizeof(T) <= 4),
+  using type = std::conditional_t<
+      (std::is_integral_v<T> && sizeof(T) <= 4),
       int32_t,
       T>;
 };
 
 template <typename T>
 struct ReduceResult<Prod, T> {
-  using type = cuda::std::conditional_t<
-      (cuda::std::is_integral_v<T> && sizeof(T) <= 4),
+  using type = std::conditional_t<
+      (std::is_integral_v<T> && sizeof(T) <= 4),
       int32_t,
       T>;
 };

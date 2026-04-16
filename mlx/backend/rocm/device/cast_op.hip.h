@@ -4,15 +4,15 @@
 
 #include "mlx/backend/rocm/device/complex.hip.h"
 
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
+#include <hip/hip_bf16.h>
+#include <hip/hip_fp16.h>
 
 namespace mlx::core::cu {
 
 // An op that does static_cast, with custom conversions for some types.
 template <typename SrcT, typename DstT, typename = void>
 struct CastOp {
-  static constexpr bool is_castable = cuda::std::is_convertible_v<SrcT, DstT>;
+  static constexpr bool is_castable = std::is_convertible_v<SrcT, DstT>;
 
   __device__ DstT operator()(SrcT x) {
     return static_cast<DstT>(x);
@@ -40,8 +40,8 @@ struct CastOp<bool, complex_t<T>> {
 
 // Converting a complex number to real number discards the imaginary part.
 template <typename T, typename DstT>
-struct CastOp<complex_t<T>, DstT, cuda::std::enable_if_t<!is_complex_v<DstT>>> {
-  static constexpr bool is_castable = cuda::std::is_convertible_v<T, DstT>;
+struct CastOp<complex_t<T>, DstT, std::enable_if_t<!is_complex_v<DstT>>> {
+  static constexpr bool is_castable = std::is_convertible_v<T, DstT>;
 
   __device__ DstT operator()(complex_t<T> x) {
     static_assert(!is_complex_v<DstT>);
@@ -51,8 +51,8 @@ struct CastOp<complex_t<T>, DstT, cuda::std::enable_if_t<!is_complex_v<DstT>>> {
 
 // Allow converting a real number to complex number.
 template <typename SrcT, typename T>
-struct CastOp<SrcT, complex_t<T>, cuda::std::enable_if_t<!is_complex_v<SrcT>>> {
-  static constexpr bool is_castable = cuda::std::is_convertible_v<SrcT, T>;
+struct CastOp<SrcT, complex_t<T>, std::enable_if_t<!is_complex_v<SrcT>>> {
+  static constexpr bool is_castable = std::is_convertible_v<SrcT, T>;
 
   __device__ complex_t<T> operator()(SrcT x) {
     static_assert(!is_complex_v<SrcT>);
@@ -65,7 +65,7 @@ template <typename SrcT, typename DstT>
 struct CastOp<
     SrcT,
     DstT,
-    cuda::std::enable_if_t<cuda::std::is_same_v<SrcT, DstT>>> {
+    std::enable_if_t<std::is_same_v<SrcT, DstT>>> {
   static constexpr bool is_castable = true;
 
   __device__ SrcT operator()(SrcT x) {
@@ -80,10 +80,10 @@ template <typename SrcT, typename DstT>
 struct CastOp<
     SrcT,
     DstT,
-    cuda::std::enable_if_t<
-        !cuda::std::is_convertible_v<SrcT, DstT> && !is_complex_v<SrcT> &&
-        (cuda::std::is_same_v<DstT, __half> ||
-         cuda::std::is_same_v<DstT, __nv_bfloat16>)>> {
+    std::enable_if_t<
+        !std::is_convertible_v<SrcT, DstT> && !is_complex_v<SrcT> &&
+        (std::is_same_v<DstT, __half> ||
+         std::is_same_v<DstT, __hip_bfloat16>)>> {
   static constexpr bool is_castable = true;
 
   __device__ DstT operator()(SrcT x) {
@@ -95,12 +95,12 @@ template <typename SrcT, typename DstT>
 struct CastOp<
     SrcT,
     DstT,
-    cuda::std::enable_if_t<
-        !cuda::std::is_convertible_v<SrcT, DstT> && !is_complex_v<SrcT> &&
-        !cuda::std::is_same_v<DstT, __half> &&
-        !cuda::std::is_same_v<DstT, __nv_bfloat16> &&
-        (cuda::std::is_same_v<SrcT, __half> ||
-         cuda::std::is_same_v<SrcT, __nv_bfloat16>)>> {
+    std::enable_if_t<
+        !std::is_convertible_v<SrcT, DstT> && !is_complex_v<SrcT> &&
+        !std::is_same_v<DstT, __half> &&
+        !std::is_same_v<DstT, __hip_bfloat16> &&
+        (std::is_same_v<SrcT, __half> ||
+         std::is_same_v<SrcT, __hip_bfloat16>)>> {
   static constexpr bool is_castable = true;
 
   __device__ DstT operator()(SrcT x) {

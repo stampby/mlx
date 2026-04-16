@@ -4,7 +4,8 @@
 #include "mlx/backend/rocm/device/scatter_ops.hip.h"
 #include "mlx/backend/rocm/device/utils.hip.h"
 
-#include <cooperative_groups.h>
+// cooperative_groups not available on HIP — use HIP equivalents
+#include <hip/hip_cooperative_groups.h>
 
 namespace mlx::core::cu {
 
@@ -25,9 +26,9 @@ __global__ void scatter_axis(
     LocT idx_size_pre,
     LocT idx_size_axis,
     LocT idx_size_post,
-    const __grid_constant__ cuda::std::array<int32_t, NDIM> shape,
-    const __grid_constant__ cuda::std::array<int64_t, NDIM> upd_strides,
-    const __grid_constant__ cuda::std::array<int64_t, NDIM> idx_strides,
+    const  std::array<int32_t, NDIM> shape,
+    const  std::array<int64_t, NDIM> upd_strides,
+    const  std::array<int64_t, NDIM> idx_strides,
     int32_t axis,
     int32_t axis_size,
     int64_t upd_stride_axis,

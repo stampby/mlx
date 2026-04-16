@@ -12,7 +12,7 @@
 #include <cutlass/gemm/device/default_gemm_configuration.h>
 #include <cutlass/gemm/device/gemm_grouped.h>
 #include <cutlass/gemm/kernel/default_gemm_grouped.h>
-#include <nvtx3/nvtx3.hpp>
+// NVTX not available on ROCm — profiling markers disabled
 
 namespace mlx::core {
 

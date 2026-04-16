@@ -9,9 +9,9 @@
 #include "mlx/primitives.h"
 
 #include <hip/hip_cooperative_groups.h>
-#include <nvtx3/nvtx3.hpp>
-#include <cub/block/block_load.hip.h>
-#include <cub/block/block_reduce.hip.h>
+// NVTX not available on ROCm — profiling markers disabled
+#include <hipcub/block/block_load.hip.h>
+#include <hipcub/block/block_reduce.hip.h>
 
 #include <cassert>
 
@@ -98,9 +98,9 @@ __global__ void arg_reduce_general(
     const T* in,
     uint32_t* out,
     size_t size,
-    const __grid_constant__ Shape shape,
-    const __grid_constant__ Strides in_strides,
-    const __grid_constant__ Strides out_strides,
+    const  Shape shape,
+    const  Strides in_strides,
+    const  Strides out_strides,
     int32_t ndim,
     int64_t axis_stride,
     int32_t axis_size) {
@@ -125,7 +125,7 @@ __global__ void arg_reduce_general(
     best = op.reduce_many(best, vals, tid * N_READS);
   }
 
-  typedef hipcub::BlockReduce<IndexValPair<T>, BLOCK_DIM> BlockReduceT;
+  typedef hiphipcub::BlockReduce<IndexValPair<T>, BLOCK_DIM> BlockReduceT;
   __shared__ typename BlockReduceT::TempStorage temp;
 
   best = BlockReduceT(temp).Reduce(best, op);
@@ -138,7 +138,7 @@ __global__ void arg_reduce_general(
 } // namespace cu
 
 void ArgReduce::eval_gpu(const std::vector<array>& inputs, array& out) {
-  nvtx3::scoped_range r("ArgReduce::eval_gpu");
+  
   assert(inputs.size() == 1);
   auto& in = inputs[0];
 
@@ -160,7 +160,7 @@ void ArgReduce::eval_gpu(const std::vector<array>& inputs, array& out) {
   encoder.set_input_array(in);
   encoder.set_output_array(out);
   dispatch_real_types(in.dtype(), "ArgReduce", [&](auto type_tag) {
-    using T = hip_type_t<MLX_GET_TYPE(type_tag)>;
+    using T = cuda_type_t<MLX_GET_TYPE(type_tag)>;
     constexpr uint32_t N_READS = 4;
     dispatch_block_dim(hip::ceil_div(axis_size, N_READS), [&](auto block_dim) {
       dim3 num_blocks = get_2d_grid_dims(out.shape(), out.strides());

@@ -8,7 +8,7 @@
 #include "mlx/primitives.h"
 
 #include <hip/hip_cooperative_groups.h>
-#include <nvtx3/nvtx3.hpp>
+// NVTX not available on ROCm — profiling markers disabled
 
 namespace mlx::core {
 
@@ -47,14 +47,14 @@ __global__ void ternary_g_nd(
     const T* c,
     T* out,
     IdxT size_rest,
-    const __grid_constant__ hip::std::array<int32_t, NDIM> shape,
-    const __grid_constant__ hip::std::array<int64_t, NDIM> a_strides,
-    const __grid_constant__ hip::std::array<int64_t, NDIM> b_strides,
-    const __grid_constant__ hip::std::array<int64_t, NDIM> c_strides) {
+    const  hip::std::array<int32_t, NDIM> shape,
+    const  hip::std::array<int64_t, NDIM> a_strides,
+    const  hip::std::array<int64_t, NDIM> b_strides,
+    const  hip::std::array<int64_t, NDIM> c_strides) {
   auto block = cg::this_thread_block();
   auto grid = cg::this_grid();
   IdxT index_rest =
-      grid.block_index().y * block.dim_threads().y + block.thread_index().y;
+      grid.group_index().y * block.size().y + block.thread_index().y;
   if (index_rest >= size_rest) {
     return;
   }
@@ -64,7 +64,7 @@ __global__ void ternary_g_nd(
   auto b_stride_x = b_strides[NDIM - 1];
   auto c_stride_x = c_strides[NDIM - 1];
   IdxT index_x =
-      grid.block_index().x * block.dim_threads().x + block.thread_index().x;
+      grid.group_index().x * block.size().x + block.thread_index().x;
   auto [a_idx, b_idx, c_idx] = elem_to_loc_nd<NDIM>(
       index_rest * shape_x,
       shape.data(),
@@ -93,15 +93,15 @@ __global__ void ternary_g(
     const T* c,
     T* out,
     IdxT size_rest,
-    const __grid_constant__ Shape shape,
-    const __grid_constant__ Strides a_strides,
-    const __grid_constant__ Strides b_strides,
-    const __grid_constant__ Strides c_strides,
+    const  Shape shape,
+    const  Strides a_strides,
+    const  Strides b_strides,
+    const  Strides c_strides,
     int ndim) {
   auto block = cg::this_thread_block();
   auto grid = cg::this_grid();
   IdxT index_rest =
-      grid.block_index().y * block.dim_threads().y + block.thread_index().y;
+      grid.group_index().y * block.size().y + block.thread_index().y;
   if (index_rest >= size_rest) {
     return;
   }
@@ -111,7 +111,7 @@ __global__ void ternary_g(
   auto b_stride_x = b_strides[ndim - 1];
   auto c_stride_x = c_strides[ndim - 1];
   IdxT index_x =
-      grid.block_index().x * block.dim_threads().x + block.thread_index().x;
+      grid.group_index().x * block.size().x + block.thread_index().x;
   auto [a_idx, b_idx, c_idx] = elem_to_loc(
       index_rest * shape_x,
       shape.data(),
@@ -154,7 +154,7 @@ void ternary_op_gpu_inplace(
   encoder.set_input_array(c);
   encoder.set_output_array(out);
   dispatch_all_types(out.dtype(), [&](auto type_tag) {
-    using DType = hip_type_t<MLX_GET_TYPE(type_tag)>;
+    using DType = cuda_type_t<MLX_GET_TYPE(type_tag)>;
 
     auto topt = get_ternary_op_type(a, b, c);
     if (topt == TernaryOpType::VectorVectorVector ||
@@ -261,7 +261,7 @@ void ternary_op_gpu(
 }
 
 void Select::eval_gpu(const std::vector<array>& inputs, array& out) {
-  nvtx3::scoped_range r("Select::eval_gpu");
+  
   auto& s = out.primitive().stream();
   ternary_op_gpu<cu::Select>(inputs, out, s);
 }

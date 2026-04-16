@@ -4,7 +4,7 @@
 
 namespace mlx::core {
 void Round::eval_gpu(const std::vector<array>& inputs, array& out) {
-  nvtx3::scoped_range r("Round::eval_gpu");
+  
   assert(inputs.size() == 1);
   const auto& in = inputs[0];
   auto& s = out.primitive().stream();

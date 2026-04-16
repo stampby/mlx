@@ -10,7 +10,7 @@
 
 #include <hip/hip_cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
-#include <nvtx3/nvtx3.hpp>
+// NVTX not available on ROCm — profiling markers disabled
 
 namespace mlx::core {
 
@@ -22,7 +22,7 @@ inline __device__ float3 plus_f3(const float3& a, const float3& b) {
   return {a.x + b.x, a.y + b.y, a.z + b.z};
 }
 
-// Similar to cub::BlockReduce, but result is broadcasted to every thread.
+// Similar to hipcub::BlockReduce, but result is broadcasted to every thread.
 template <typename T, int BLOCK_DIM>
 struct BlockBroadcastReduce {
   static_assert(WARP_SIZE <= BLOCK_DIM && BLOCK_DIM <= WARP_SIZE * WARP_SIZE);
@@ -228,7 +228,7 @@ bool LayerNorm::use_fallback(Stream s) {
 void LayerNorm::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  nvtx3::scoped_range r("LayerNorm::eval_gpu");
+  
   auto& s = stream();
   auto& out = outputs[0];
   auto& encoder = cu::get_command_encoder(s);
@@ -272,7 +272,7 @@ void LayerNorm::eval_gpu(
   encoder.set_input_array(b);
   encoder.set_output_array(out);
   dispatch_float_types(out.dtype(), "layernorm", [&](auto type_tag) {
-    using DataType = hip_type_t<MLX_GET_TYPE(type_tag)>;
+    using DataType = cuda_type_t<MLX_GET_TYPE(type_tag)>;
     constexpr int N_READS = 16 / sizeof(DataType);
     dispatch_block_dim(hip::ceil_div(axis_size, N_READS), [&](auto block_dim) {
       auto kernel = cu::layer_norm<DataType, block_dim(), N_READS>;
@@ -295,7 +295,7 @@ void LayerNorm::eval_gpu(
 void LayerNormVJP::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  nvtx3::scoped_range r("LayerNormVJP::eval_gpu");
+  
   auto& s = stream();
   auto& encoder = cu::get_command_encoder(s);
 
@@ -379,7 +379,7 @@ void LayerNormVJP::eval_gpu(
   encoder.set_output_array(gw_temp);
   dispatch_float_types(gx.dtype(), "layernorm_vjp", [&](auto type_tag) {
     dispatch_bool(has_w, [&](auto has_w_constant) {
-      using DataType = hip_type_t<MLX_GET_TYPE(type_tag)>;
+      using DataType = cuda_type_t<MLX_GET_TYPE(type_tag)>;
       constexpr int N_READS = 16 / sizeof(DataType);
       dispatch_block_dim(
           hip::ceil_div(axis_size, N_READS), [&](auto block_dim) {

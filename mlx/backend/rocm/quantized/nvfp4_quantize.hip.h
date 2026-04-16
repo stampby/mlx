@@ -6,7 +6,7 @@
 
 namespace mlx::core::cu {
 
-using bf16x4 = Vector4_t<__nv_bfloat16>;
+using bf16x4 = Vector4_t<__hip_bfloat16>;
 using fp16x4 = Vector4_t<__half>;
 using f32x4 = Vector4_t<float>;
 
@@ -296,7 +296,7 @@ __device__ __forceinline__ uint16_t scale_cvt_Tx4_to_fp4x4_fast(
     const Vector4_t<T> input,
     const float scale,
     uint32_t rbits) {
-  if constexpr (std::is_same<T, __nv_bfloat16>::value) {
+  if constexpr (std::is_same<T, __hip_bfloat16>::value) {
     return scale_cvt_bf16x4_to_fp4x4<USE_SR>(input, scale, rbits);
   } else if constexpr (std::is_same<T, __half>::value) {
     return scale_cvt_fp16x4_to_fp4x4<USE_SR>(input, scale, rbits);

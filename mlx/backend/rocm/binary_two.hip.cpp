@@ -9,7 +9,7 @@
 #include "mlx/primitives.h"
 
 #include <hip/hip_cooperative_groups.h>
-#include <nvtx3/nvtx3.hpp>
+// NVTX not available on ROCm — profiling markers disabled
 
 namespace mlx::core {
 
@@ -141,13 +141,13 @@ __global__ void binary_two_g_nd(
     Out* out_a,
     Out* out_b,
     IdxT size_rest,
-    const __grid_constant__ hip::std::array<int32_t, NDIM> shape,
-    const __grid_constant__ hip::std::array<int64_t, NDIM> a_strides,
-    const __grid_constant__ hip::std::array<int64_t, NDIM> b_strides) {
+    const  hip::std::array<int32_t, NDIM> shape,
+    const  hip::std::array<int64_t, NDIM> a_strides,
+    const  hip::std::array<int64_t, NDIM> b_strides) {
   auto block = cg::this_thread_block();
   auto grid = cg::this_grid();
   IdxT index_rest =
-      grid.block_index().y * block.dim_threads().y + block.thread_index().y;
+      grid.group_index().y * block.size().y + block.thread_index().y;
   if (index_rest >= size_rest) {
     return;
   }
@@ -156,7 +156,7 @@ __global__ void binary_two_g_nd(
   auto a_stride_x = a_strides[NDIM - 1];
   auto b_stride_x = b_strides[NDIM - 1];
   IdxT index_x =
-      grid.block_index().x * block.dim_threads().x + block.thread_index().x;
+      grid.group_index().x * block.size().x + block.thread_index().x;
   auto [a_idx, b_idx] = elem_to_loc_nd<NDIM>(
       index_rest * shape_x, shape.data(), a_strides.data(), b_strides.data());
   auto a_vec =
@@ -183,14 +183,14 @@ __global__ void binary_two_g(
     Out* out_a,
     Out* out_b,
     IdxT size_rest,
-    const __grid_constant__ Shape shape,
-    const __grid_constant__ Strides a_strides,
-    const __grid_constant__ Strides b_strides,
+    const  Shape shape,
+    const  Strides a_strides,
+    const  Strides b_strides,
     int ndim) {
   auto block = cg::this_thread_block();
   auto grid = cg::this_grid();
   IdxT index_rest =
-      grid.block_index().y * block.dim_threads().y + block.thread_index().y;
+      grid.group_index().y * block.size().y + block.thread_index().y;
   if (index_rest >= size_rest) {
     return;
   }
@@ -199,7 +199,7 @@ __global__ void binary_two_g(
   auto a_stride_x = a_strides[ndim - 1];
   auto b_stride_x = b_strides[ndim - 1];
   IdxT index_x =
-      grid.block_index().x * block.dim_threads().x + block.thread_index().x;
+      grid.group_index().x * block.size().x + block.thread_index().x;
   auto [a_idx, b_idx] = elem_to_loc(
       index_rest * shape_x,
       shape.data(),
@@ -265,8 +265,8 @@ void binary_two_op_gpu_inplace(
       using CTYPE_IN = MLX_GET_TYPE(in_type_tag);
       using CTYPE_OUT = MLX_GET_TYPE(out_type_tag);
       if constexpr (cu::supports_binary_two_op<Op, CTYPE_IN, CTYPE_OUT>()) {
-        using InType = hip_type_t<CTYPE_IN>;
-        using OutType = hip_type_t<CTYPE_OUT>;
+        using InType = cuda_type_t<CTYPE_IN>;
+        using OutType = cuda_type_t<CTYPE_OUT>;
 
         auto bopt = get_binary_op_type(a, b);
         if (bopt == BinaryOpType::General) {
@@ -402,7 +402,7 @@ void binary_two_op_gpu(
 void DivMod::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  nvtx3::scoped_range r("DivMod::eval_gpu");
+  
   auto& s = outputs[0].primitive().stream();
   binary_two_op_gpu<cu::DivMod>(inputs, outputs, name(), s);
 }

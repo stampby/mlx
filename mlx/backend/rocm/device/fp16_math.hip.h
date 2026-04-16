@@ -2,9 +2,9 @@
 
 #pragma once
 
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda/std/type_traits>
+#include <hip/hip_bf16.h>
+#include <hip/hip_fp16.h>
+#include <type_traits>
 
 namespace mlx::core::cu {
 
@@ -15,9 +15,9 @@ namespace mlx::core::cu {
 #define MLX_DEFINE_BINARY_OP(NAME, HALF_OP)                        \
   template <typename T>                                            \
   __forceinline__ __device__ auto NAME(T x, T y) {                 \
-    if constexpr (cuda::std::is_same_v<T, __half>) {               \
+    if constexpr (std::is_same_v<T, __half>) {               \
       return HALF_OP(x, y);                                        \
-    } else if constexpr (cuda::std::is_same_v<T, __nv_bfloat16>) { \
+    } else if constexpr (std::is_same_v<T, __hip_bfloat16>) { \
       return HALF_OP(x, y);                                        \
     } else {                                                       \
       return ::NAME(x, y);                                         \
@@ -35,22 +35,22 @@ MLX_DEFINE_BINARY_OP(min, __hmin)
 
 template <typename T, typename U>
 constexpr bool is_integral_except =
-    cuda::std::is_integral_v<T> && !cuda::std::is_same_v<T, U>;
+    std::is_integral_v<T> && !std::is_same_v<T, U>;
 
 template <typename T, typename U>
 constexpr bool is_arithmetic_except =
-    cuda::std::is_arithmetic_v<T> && !cuda::std::is_same_v<T, U>;
+    std::is_arithmetic_v<T> && !std::is_same_v<T, U>;
 
 #define MLX_DEFINE_HALF_OP(HALF, HALF2FLOAT, FLOAT2HALF, OP)          \
   template <                                                          \
       typename T,                                                     \
-      typename = cuda::std::enable_if_t<is_integral_except<T, HALF>>> \
+      typename = std::enable_if_t<is_integral_except<T, HALF>>> \
   __forceinline__ __device__ HALF operator OP(HALF x, T y) {          \
     return FLOAT2HALF(HALF2FLOAT(x) OP static_cast<float>(y));        \
   }                                                                   \
   template <                                                          \
       typename T,                                                     \
-      typename = cuda::std::enable_if_t<is_integral_except<T, HALF>>> \
+      typename = std::enable_if_t<is_integral_except<T, HALF>>> \
   __forceinline__ __device__ HALF operator OP(T x, HALF y) {          \
     return FLOAT2HALF(static_cast<float>(x) OP HALF2FLOAT(y));        \
   }
@@ -58,13 +58,13 @@ constexpr bool is_arithmetic_except =
 #define MLX_DEFINE_HALF_CMP(HALF, HALF2FLOAT, OP)                       \
   template <                                                            \
       typename T,                                                       \
-      typename = cuda::std::enable_if_t<is_arithmetic_except<T, HALF>>> \
+      typename = std::enable_if_t<is_arithmetic_except<T, HALF>>> \
   __forceinline__ __device__ bool operator OP(HALF x, T y) {            \
     return HALF2FLOAT(x) OP static_cast<float>(y);                      \
   }                                                                     \
   template <                                                            \
       typename T,                                                       \
-      typename = cuda::std::enable_if_t<is_arithmetic_except<T, HALF>>> \
+      typename = std::enable_if_t<is_arithmetic_except<T, HALF>>> \
   __forceinline__ __device__ bool operator OP(T x, HALF y) {            \
     return static_cast<float>(y) OP HALF2FLOAT(x);                      \
   }
@@ -73,22 +73,22 @@ MLX_DEFINE_HALF_OP(__half, __half2float, __float2half, +)
 MLX_DEFINE_HALF_OP(__half, __half2float, __float2half, -)
 MLX_DEFINE_HALF_OP(__half, __half2float, __float2half, *)
 MLX_DEFINE_HALF_OP(__half, __half2float, __float2half, /)
-MLX_DEFINE_HALF_OP(__nv_bfloat16, __bfloat162float, __float2bfloat16, +)
-MLX_DEFINE_HALF_OP(__nv_bfloat16, __bfloat162float, __float2bfloat16, -)
-MLX_DEFINE_HALF_OP(__nv_bfloat16, __bfloat162float, __float2bfloat16, *)
-MLX_DEFINE_HALF_OP(__nv_bfloat16, __bfloat162float, __float2bfloat16, /)
+MLX_DEFINE_HALF_OP(__hip_bfloat16, __bfloat162float, __float2bfloat16, +)
+MLX_DEFINE_HALF_OP(__hip_bfloat16, __bfloat162float, __float2bfloat16, -)
+MLX_DEFINE_HALF_OP(__hip_bfloat16, __bfloat162float, __float2bfloat16, *)
+MLX_DEFINE_HALF_OP(__hip_bfloat16, __bfloat162float, __float2bfloat16, /)
 MLX_DEFINE_HALF_CMP(__half, __half2float, <)
 MLX_DEFINE_HALF_CMP(__half, __half2float, >)
 MLX_DEFINE_HALF_CMP(__half, __half2float, <=)
 MLX_DEFINE_HALF_CMP(__half, __half2float, >=)
 MLX_DEFINE_HALF_CMP(__half, __half2float, ==)
 MLX_DEFINE_HALF_CMP(__half, __half2float, !=)
-MLX_DEFINE_HALF_CMP(__nv_bfloat16, __bfloat162float, <)
-MLX_DEFINE_HALF_CMP(__nv_bfloat16, __bfloat162float, >)
-MLX_DEFINE_HALF_CMP(__nv_bfloat16, __bfloat162float, <=)
-MLX_DEFINE_HALF_CMP(__nv_bfloat16, __bfloat162float, >=)
-MLX_DEFINE_HALF_CMP(__nv_bfloat16, __bfloat162float, ==)
-MLX_DEFINE_HALF_CMP(__nv_bfloat16, __bfloat162float, !=)
+MLX_DEFINE_HALF_CMP(__hip_bfloat16, __bfloat162float, <)
+MLX_DEFINE_HALF_CMP(__hip_bfloat16, __bfloat162float, >)
+MLX_DEFINE_HALF_CMP(__hip_bfloat16, __bfloat162float, <=)
+MLX_DEFINE_HALF_CMP(__hip_bfloat16, __bfloat162float, >=)
+MLX_DEFINE_HALF_CMP(__hip_bfloat16, __bfloat162float, ==)
+MLX_DEFINE_HALF_CMP(__hip_bfloat16, __bfloat162float, !=)
 
 #undef MLX_DEFINE_HALF_OP
 #undef MLX_DEFINE_HALF_CMP

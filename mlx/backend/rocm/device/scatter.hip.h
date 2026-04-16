@@ -4,7 +4,8 @@
 #include "mlx/backend/rocm/device/scatter_ops.hip.h"
 #include "mlx/backend/rocm/device/utils.hip.h"
 
-#include <cooperative_groups.h>
+// cooperative_groups not available on HIP — use HIP equivalents
+#include <hip/hip_cooperative_groups.h>
 
 namespace mlx::core::cu {
 
@@ -21,18 +22,18 @@ __global__ void scatter(
     const T* upd,
     T* out,
     LocT size,
-    const __grid_constant__ Shape upd_shape,
-    const __grid_constant__ Strides upd_strides,
+    const  Shape upd_shape,
+    const  Strides upd_strides,
     int32_t upd_ndim,
     LocT upd_post_idx_size,
-    const __grid_constant__ Shape out_shape,
-    const __grid_constant__ Strides out_strides,
+    const  Shape out_shape,
+    const  Strides out_strides,
     int32_t out_ndim,
-    const __grid_constant__ cuda::std::array<int32_t, NIDX> axes,
-    const __grid_constant__ cuda::std::array<IdxT*, NIDX> indices,
-    const __grid_constant__ cuda::std::array<int32_t, NIDX * IDX_NDIM>
+    const  std::array<int32_t, NIDX> axes,
+    const  std::array<IdxT*, NIDX> indices,
+    const  std::array<int32_t, NIDX * IDX_NDIM>
         indices_shape,
-    const __grid_constant__ cuda::std::array<int64_t, NIDX * IDX_NDIM>
+    const  std::array<int64_t, NIDX * IDX_NDIM>
         indices_strides) {
   LocT upd_idx = cg::this_grid().thread_rank();
   if (upd_idx >= size) {
@@ -75,11 +76,11 @@ __global__ void masked_scatter(
     IdxT size,
     IdxT src_batch_size,
     IdxT mask_batch_size,
-    const __grid_constant__ Shape dst_shape,
-    const __grid_constant__ Strides dst_strides,
+    const  Shape dst_shape,
+    const  Strides dst_strides,
     int32_t dst_ndim,
-    const __grid_constant__ Shape src_shape,
-    const __grid_constant__ Strides src_strides,
+    const  Shape src_shape,
+    const  Strides src_strides,
     int32_t src_ndim) {
   IdxT index = cg::this_grid().thread_rank();
   if (index >= size) {

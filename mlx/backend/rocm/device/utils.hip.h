@@ -11,11 +11,11 @@
 #include "mlx/backend/rocm/device/complex.hip.h"
 #include "mlx/backend/rocm/device/config.h"
 
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda/std/array>
-#include <cuda/std/limits>
-#include <cuda/std/tuple>
+#include <hip/hip_bf16.h>
+#include <hip/hip_fp16.h>
+#include <array>
+#include <limits>
+#include <tuple>
 
 namespace mlx::core::cu {
 
@@ -25,8 +25,8 @@ namespace mlx::core::cu {
 
 // To pass shape/strides to kernels via constant memory, their size must be
 // known at compile time.
-using Shape = cuda::std::array<int32_t, MAX_NDIM>;
-using Strides = cuda::std::array<int64_t, MAX_NDIM>;
+using Shape = std::array<int32_t, MAX_NDIM>;
+using Strides = std::array<int64_t, MAX_NDIM>;
 
 // Vectorized load/store.
 template <typename T, int N>
@@ -170,35 +170,35 @@ inline __device__ void store_vector(
 template <typename T, typename = void>
 struct Limits {
   static constexpr __host__ __device__ T max() {
-    return cuda::std::numeric_limits<T>::max();
+    return std::numeric_limits<T>::max();
   }
   static constexpr __host__ __device__ T min() {
-    return cuda::std::numeric_limits<T>::min();
+    return std::numeric_limits<T>::min();
   }
   static constexpr __host__ __device__ T finite_max() {
-    return cuda::std::numeric_limits<T>::max();
+    return std::numeric_limits<T>::max();
   }
   static constexpr __host__ __device__ T finite_min() {
-    return cuda::std::numeric_limits<T>::min();
+    return std::numeric_limits<T>::min();
   }
 };
 
 template <typename T>
 struct Limits<
     T,
-    cuda::std::enable_if_t<
-        cuda::std::is_same_v<T, float> || cuda::std::is_same_v<T, double>>> {
+    std::enable_if_t<
+        std::is_same_v<T, float> || std::is_same_v<T, double>>> {
   static constexpr __host__ __device__ T max() {
-    return cuda::std::numeric_limits<T>::infinity();
+    return std::numeric_limits<T>::infinity();
   }
   static constexpr __host__ __device__ T min() {
-    return -cuda::std::numeric_limits<T>::infinity();
+    return -std::numeric_limits<T>::infinity();
   }
   static constexpr __host__ __device__ T finite_max() {
-    return cuda::std::numeric_limits<T>::max();
+    return std::numeric_limits<T>::max();
   }
   static constexpr __host__ __device__ T finite_min() {
-    return cuda::std::numeric_limits<T>::lowest();
+    return std::numeric_limits<T>::lowest();
   }
 };
 
@@ -206,27 +206,27 @@ struct Limits<
 template <typename T>
 struct Limits<
     T,
-    cuda::std::enable_if_t<
-        cuda::std::is_same_v<T, __half> ||
-        cuda::std::is_same_v<T, __nv_bfloat16>>> {
+    std::enable_if_t<
+        std::is_same_v<T, __half> ||
+        std::is_same_v<T, __hip_bfloat16>>> {
   static constexpr __host__ __device__ T max() {
-    return cuda::std::numeric_limits<T>::infinity();
+    return std::numeric_limits<T>::infinity();
   }
   static constexpr __host__ __device__ T min() {
 #if CUDART_VERSION < 12000 && __CUDA_ARCH__ < 800
-    return -cuda::std::numeric_limits<float>::infinity();
+    return -std::numeric_limits<float>::infinity();
 #else
-    return -cuda::std::numeric_limits<T>::infinity();
+    return -std::numeric_limits<T>::infinity();
 #endif
   }
   static constexpr __host__ __device__ T finite_max() {
-    return cuda::std::numeric_limits<T>::max();
+    return std::numeric_limits<T>::max();
   }
   static constexpr __host__ __device__ T finite_min() {
 #if CUDART_VERSION < 12000 && __CUDA_ARCH__ < 800
-    return cuda::std::numeric_limits<float>::lowest();
+    return std::numeric_limits<float>::lowest();
 #else
-    return cuda::std::numeric_limits<T>::lowest();
+    return std::numeric_limits<T>::lowest();
 #endif
   }
 };
@@ -280,7 +280,7 @@ elem_to_loc_nd(IdxT elem, const int* shape, const int64_t* strides) {
 }
 
 template <int NDIM, typename IdxT = int64_t>
-inline __host__ __device__ cuda::std::tuple<IdxT, IdxT> elem_to_loc_nd(
+inline __host__ __device__ std::tuple<IdxT, IdxT> elem_to_loc_nd(
     IdxT elem,
     const int* shape,
     const int64_t* a_strides,
@@ -294,11 +294,11 @@ inline __host__ __device__ cuda::std::tuple<IdxT, IdxT> elem_to_loc_nd(
     b_loc += dim_idx * IdxT(b_strides[i]);
     elem /= shape[i];
   }
-  return cuda::std::make_tuple(a_loc, b_loc);
+  return std::make_tuple(a_loc, b_loc);
 }
 
 template <int NDIM, typename IdxT = int64_t>
-inline __host__ __device__ cuda::std::tuple<IdxT, IdxT, IdxT> elem_to_loc_nd(
+inline __host__ __device__ std::tuple<IdxT, IdxT, IdxT> elem_to_loc_nd(
     IdxT elem,
     const int* shape,
     const int64_t* a_strides,
@@ -315,11 +315,11 @@ inline __host__ __device__ cuda::std::tuple<IdxT, IdxT, IdxT> elem_to_loc_nd(
     c_loc += dim_idx * IdxT(c_strides[i]);
     elem /= shape[i];
   }
-  return cuda::std::make_tuple(a_loc, b_loc, c_loc);
+  return std::make_tuple(a_loc, b_loc, c_loc);
 }
 
 template <typename IdxT = int64_t>
-inline __host__ __device__ cuda::std::tuple<IdxT, IdxT> elem_to_loc(
+inline __host__ __device__ std::tuple<IdxT, IdxT> elem_to_loc(
     IdxT elem,
     const int* shape,
     const int64_t* a_strides,
@@ -333,11 +333,11 @@ inline __host__ __device__ cuda::std::tuple<IdxT, IdxT> elem_to_loc(
     b_loc += dim_idx * IdxT(b_strides[i]);
     elem /= shape[i];
   }
-  return cuda::std::make_tuple(a_loc, b_loc);
+  return std::make_tuple(a_loc, b_loc);
 }
 
 template <typename IdxT = int64_t>
-inline __host__ __device__ cuda::std::tuple<IdxT, IdxT, IdxT> elem_to_loc(
+inline __host__ __device__ std::tuple<IdxT, IdxT, IdxT> elem_to_loc(
     IdxT elem,
     const int* shape,
     const int64_t* a_strides,
@@ -354,7 +354,7 @@ inline __host__ __device__ cuda::std::tuple<IdxT, IdxT, IdxT> elem_to_loc(
     c_loc += dim_idx * IdxT(c_strides[i]);
     elem /= shape[i];
   }
-  return cuda::std::make_tuple(a_loc, b_loc, c_loc);
+  return std::make_tuple(a_loc, b_loc, c_loc);
 }
 
 ///////////////////////////////////////////////////////////////////////////////

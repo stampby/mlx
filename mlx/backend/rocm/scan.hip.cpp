@@ -12,7 +12,7 @@
 
 #include <hip/hip_cooperative_groups.h>
 #include <cooperative_groups/scan.h>
-#include <nvtx3/nvtx3.hpp>
+// NVTX not available on ROCm — profiling markers disabled
 
 #include <cassert>
 
@@ -381,7 +381,7 @@ void scan_gpu_inplace(
   encoder.set_output_array(out);
 
   dispatch_all_types(in.dtype(), [&](auto type_tag) {
-    using T = hip_type_t<MLX_GET_TYPE(type_tag)>;
+    using T = cuda_type_t<MLX_GET_TYPE(type_tag)>;
     dispatch_scan_ops(reduce_type, [&](auto scan_op_tag) {
       using Op = MLX_GET_TYPE(scan_op_tag);
       if constexpr (supports_scan_op<Op, T>()) {
@@ -453,7 +453,7 @@ void scan_gpu_inplace(
 }
 
 void Scan::eval_gpu(const std::vector<array>& inputs, array& out) {
-  nvtx3::scoped_range r("Scan::eval_gpu");
+  
   assert(inputs.size() == 1);
   auto in = inputs[0];
   auto& s = stream();

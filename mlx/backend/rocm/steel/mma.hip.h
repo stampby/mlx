@@ -25,8 +25,8 @@ mma_t(Tile16x16<U>& C, Tile16x16<T>& A, Tile16x16<T>& B) {}
  */
 __device__ __forceinline__ void mma_t(
     Tile16x16<float>& C,
-    Tile16x16<__nv_bfloat16>& A,
-    Tile16x16<__nv_bfloat16>& B) {
+    Tile16x16<__hip_bfloat16>& A,
+    Tile16x16<__hip_bfloat16>& B) {
 #if defined(MLX_CUDA_SM_80_ENABLED)
   asm volatile(
       "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "

@@ -22,12 +22,12 @@ __global__ void block_mask_copy_kernel(
     int block_size,
     int64_t rows,
     int64_t cols,
-    const __grid_constant__ Shape src_shape,
-    const __grid_constant__ Strides src_strides,
+    const  Shape src_shape,
+    const  Strides src_strides,
     int src_ndim,
     MaskT* mask,
-    const __grid_constant__ Shape mask_shape,
-    const __grid_constant__ Strides mask_strides,
+    const  Shape mask_shape,
+    const  Strides mask_strides,
     int mask_ndim,
     int64_t mask_row_stride,
     int64_t mask_col_stride,
@@ -96,7 +96,7 @@ void block_mask_copy(
   auto [num_blocks, block_dims] = get_launch_args(src, src.size() > INT32_MAX);
 
   dispatch_float_types(src.dtype(), "block_mask_copy", [&](auto type_tag) {
-    using T = hip_type_t<MLX_GET_TYPE(type_tag)>;
+    using T = cuda_type_t<MLX_GET_TYPE(type_tag)>;
 
     dispatch_mask_type<T>(mask.dtype(), [&]<typename MaskT>() {
       dispatch_bool(src_contiguous, [&](auto contiguous_tag) {

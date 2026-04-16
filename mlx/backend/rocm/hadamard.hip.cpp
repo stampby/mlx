@@ -9,7 +9,7 @@
 #include "mlx/primitives.h"
 
 #include <fmt/format.h>
-#include <nvtx3/nvtx3.hpp>
+// NVTX not available on ROCm — profiling markers disabled
 
 #include <algorithm>
 #include <cassert>
@@ -209,7 +209,7 @@ void hadamard_mn_contiguous(
 } // namespace
 
 void Hadamard::eval_gpu(const std::vector<array>& inputs, array& out) {
-  nvtx3::scoped_range r("Hadamard::eval_gpu");
+  
   assert(inputs.size() == 1);
 
   auto& in = inputs[0];

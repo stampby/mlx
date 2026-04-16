@@ -4,7 +4,7 @@
 
 namespace mlx::core {
 void BitwiseBinary::eval_gpu(const std::vector<array>& inputs, array& out) {
-  nvtx3::scoped_range r("BitwiseBinary::eval_gpu");
+  
   auto& s = out.primitive().stream();
   switch (op_) {
     case BitwiseBinary::And:

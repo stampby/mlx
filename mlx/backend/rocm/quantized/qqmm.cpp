@@ -8,7 +8,7 @@
 #include "mlx/backend/rocm/quantized/quantized_utils.h"
 #include "mlx/primitives.h"
 
-#include <nvtx3/nvtx3.hpp>
+// NVTX not available on ROCm — profiling markers disabled
 
 namespace mlx::core {
 
@@ -70,7 +70,7 @@ GemmScalars create_nvfp4_scalars(
 } // namespace
 
 void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
-  nvtx3::scoped_range r("QQMatmul::eval_gpu");
+  
 
   auto& s = stream();
   auto& encoder = cu::get_command_encoder(s);

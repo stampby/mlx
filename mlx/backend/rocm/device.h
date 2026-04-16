@@ -121,7 +121,6 @@ class CommandEncoder {
 
  private:
   hipGraphNode_t add_kernel_node_raw(const hipKernelNodeParams& params);
-  hipGraphNode_t add_kernel_node_raw(const hipKernelNodeParams& params);
 
   struct GraphNode {
     hipGraphNode_t node;

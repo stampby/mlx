@@ -8,7 +8,7 @@
 #include "mlx/primitives.h"
 #include "mlx/scheduler.h"
 
-#include <nvtx3/nvtx3.hpp>
+// NVTX not available on ROCm — profiling markers disabled
 
 namespace mlx::core::gpu {
 
@@ -33,7 +33,7 @@ void new_stream(Stream s) {
 }
 
 void eval(array& arr) {
-  nvtx3::scoped_range r("gpu::eval");
+  
   // Ensure HIP context is active on this thread. Required when MLX is called
   // from threads that have not yet established a HIP context (e.g. thread
   // pools, language runtimes that migrate work across OS threads).
@@ -71,12 +71,12 @@ void eval(array& arr) {
 }
 
 void finalize(Stream s) {
-  nvtx3::scoped_range r("gpu::finalize");
+  
   cu::get_command_encoder(s).commit();
 }
 
 void synchronize(Stream s) {
-  nvtx3::scoped_range r("gpu::synchronize");
+  
   cu::get_command_encoder(s).synchronize();
 }
 

@@ -11,7 +11,7 @@
 #include <vector>
 
 #include <hip/hip_cooperative_groups.h>
-#include <nvtx3/nvtx3.hpp>
+// NVTX not available on ROCm — profiling markers disabled
 
 #include "mlx/backend/common/utils.h"
 #include "mlx/backend/rocm/allocator.h"
@@ -376,7 +376,7 @@ void apply_inverse_scale(
 } // namespace
 
 void FFT::eval_gpu(const std::vector<array>& inputs, array& out) {
-  nvtx3::scoped_range r("FFT::eval_gpu");
+  
   auto& s = stream();
   auto& encoder = cu::get_command_encoder(s);
   auto& in = inputs[0];

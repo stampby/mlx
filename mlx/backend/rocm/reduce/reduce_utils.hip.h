@@ -8,7 +8,8 @@
 #include "mlx/backend/rocm/device.h"
 #include "mlx/backend/rocm/device/utils.hip.h"
 
-#include <cooperative_groups.h>
+// cooperative_groups not available on HIP — use HIP equivalents
+#include <hip/hip_cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 
 namespace mlx::core {

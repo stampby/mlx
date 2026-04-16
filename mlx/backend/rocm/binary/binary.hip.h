@@ -7,8 +7,9 @@
 #include "mlx/dtype_utils.h"
 #include "mlx/primitives.h"
 
-#include <cooperative_groups.h>
-#include <nvtx3/nvtx3.hpp>
+// cooperative_groups not available on HIP — use HIP equivalents
+#include <hip/hip_cooperative_groups.h>
+// NVTX not available on ROCm — profiling markers disabled
 
 namespace mlx::core {
 
@@ -129,13 +130,13 @@ __global__ void binary_g_nd(
     const In* b,
     Out* out,
     IdxT size_rest,
-    const __grid_constant__ cuda::std::array<int32_t, NDIM> shape,
-    const __grid_constant__ cuda::std::array<int64_t, NDIM> a_strides,
-    const __grid_constant__ cuda::std::array<int64_t, NDIM> b_strides) {
+    const  std::array<int32_t, NDIM> shape,
+    const  std::array<int64_t, NDIM> a_strides,
+    const  std::array<int64_t, NDIM> b_strides) {
   auto block = cg::this_thread_block();
   auto grid = cg::this_grid();
   IdxT index_rest =
-      grid.block_index().y * block.dim_threads().y + block.thread_index().y;
+      grid.group_index().y * block.size().y + block.thread_index().y;
   if (index_rest >= size_rest) {
     return;
   }
@@ -144,7 +145,7 @@ __global__ void binary_g_nd(
   auto a_stride_x = a_strides[NDIM - 1];
   auto b_stride_x = b_strides[NDIM - 1];
   IdxT index_x =
-      grid.block_index().x * block.dim_threads().x + block.thread_index().x;
+      grid.group_index().x * block.size().x + block.thread_index().x;
   auto [a_idx, b_idx] = elem_to_loc_nd<NDIM>(
       index_rest * shape_x, shape.data(), a_strides.data(), b_strides.data());
   auto a_vec =
@@ -166,14 +167,14 @@ __global__ void binary_g(
     const In* b,
     Out* out,
     IdxT size_rest,
-    const __grid_constant__ Shape shape,
-    const __grid_constant__ Strides a_strides,
-    const __grid_constant__ Strides b_strides,
+    const  Shape shape,
+    const  Strides a_strides,
+    const  Strides b_strides,
     int ndim) {
   auto block = cg::this_thread_block();
   auto grid = cg::this_grid();
   IdxT index_rest =
-      grid.block_index().y * block.dim_threads().y + block.thread_index().y;
+      grid.group_index().y * block.size().y + block.thread_index().y;
   if (index_rest >= size_rest) {
     return;
   }
@@ -182,7 +183,7 @@ __global__ void binary_g(
   auto a_stride_x = a_strides[ndim - 1];
   auto b_stride_x = b_strides[ndim - 1];
   IdxT index_x =
-      grid.block_index().x * block.dim_threads().x + block.thread_index().x;
+      grid.group_index().x * block.size().x + block.thread_index().x;
   auto [a_idx, b_idx] = elem_to_loc(
       index_rest * shape_x,
       shape.data(),

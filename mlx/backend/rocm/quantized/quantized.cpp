@@ -8,12 +8,12 @@
 #include "mlx/fast_primitives.h"
 #include "mlx/primitives.h"
 
-#include <nvtx3/nvtx3.hpp>
+// NVTX not available on ROCm — profiling markers disabled
 
 namespace mlx::core {
 
 void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
-  nvtx3::scoped_range r("QuantizedMatmul::eval_gpu");
+  
   auto& s = stream();
   auto& encoder = cu::get_command_encoder(s);
 
@@ -129,7 +129,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 }
 
 void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
-  nvtx3::scoped_range r("GatherQMM::eval_gpu");
+  
   auto& s = stream();
   auto& encoder = cu::get_command_encoder(s);
 
@@ -203,7 +203,7 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
 void fast::Quantize::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  nvtx3::scoped_range r("Quantize::eval_gpu");
+  
   auto& s = stream();
   auto& enc = cu::get_command_encoder(s);
   if (dequantize_) {

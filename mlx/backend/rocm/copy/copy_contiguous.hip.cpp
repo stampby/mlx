@@ -63,8 +63,8 @@ void copy_contiguous(
   dispatch_all_types(in.dtype(), [&](auto in_type_tag) {
     dispatch_all_types(out.dtype(), [&](auto out_type_tag) {
       dispatch_bool(out.data_size() > UINT32_MAX, [&](auto large) {
-        using InType = hip_type_t<MLX_GET_TYPE(in_type_tag)>;
-        using OutType = hip_type_t<MLX_GET_TYPE(out_type_tag)>;
+        using InType = cuda_type_t<MLX_GET_TYPE(in_type_tag)>;
+        using OutType = cuda_type_t<MLX_GET_TYPE(out_type_tag)>;
         using IdxT = std::conditional_t<large(), int64_t, uint32_t>;
         constexpr int N_READS = 16 / sizeof(InType);
         auto kernel = cu::copy_s<InType, OutType, IdxT, N_READS>;

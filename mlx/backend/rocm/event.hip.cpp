@@ -11,7 +11,7 @@
 #include <map>
 #include <vector>
 
-#include <nvtx3/nvtx3.hpp>
+// NVTX not available on ROCm — profiling markers disabled
 
 namespace mlx::core {
 
@@ -89,7 +89,7 @@ CudaEvent::~CudaEvent() {
 }
 
 void CudaEvent::wait() {
-  nvtx3::scoped_range r("cu::CudaEvent::wait");
+  
   event_.device.make_current();
   hipEventSynchronize(event_);
 }
@@ -249,7 +249,7 @@ AtomicEvent::AtomicEvent(Device& d) {
 }
 
 void AtomicEvent::wait(uint32_t value) {
-  nvtx3::scoped_range r("cu::AtomicEvent::wait");
+  
   if (coherent_) {
     event_wait(ptr(), value);
   } else {
@@ -264,7 +264,7 @@ void AtomicEvent::wait(hipStream_t stream, uint32_t value) {
 }
 
 void AtomicEvent::wait(Stream s, uint32_t value) {
-  nvtx3::scoped_range r("cu::AtomicEvent::wait(s)");
+  
   if (s.device == mlx::core::Device::cpu) {
     scheduler::enqueue(s, [*this, value]() mutable { wait(value); });
   } else {
@@ -276,7 +276,7 @@ void AtomicEvent::wait(Stream s, uint32_t value) {
 }
 
 void AtomicEvent::signal(uint32_t value) {
-  nvtx3::scoped_range r("cu::AtomicEvent::signal");
+  
   if (coherent_) {
     event_signal(ptr(), value);
   } else {
@@ -289,7 +289,7 @@ void AtomicEvent::signal(hipStream_t stream, uint32_t value) {
 }
 
 void AtomicEvent::signal(Stream s, uint32_t value) {
-  nvtx3::scoped_range r("cu::AtomicEvent::signal(s)");
+  
   if (s.device == mlx::core::Device::cpu) {
     // Signal through a GPU stream so the atomic is updated in GPU - updating
     // the atomic in CPU sometimes does not get GPU notified.
@@ -308,7 +308,7 @@ bool AtomicEvent::is_signaled(uint32_t val) const {
 }
 
 uint32_t AtomicEvent::value() const {
-  nvtx3::scoped_range r("cu::AtomicEvent::value");
+  
   if (coherent_) {
     hip::atomic_ref<uint32_t> ac(*ptr());
     return ac.load();

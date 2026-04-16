@@ -4,7 +4,7 @@
 
 namespace mlx::core {
 void Log::eval_gpu(const std::vector<array>& inputs, array& out) {
-  nvtx3::scoped_range r("Log::eval_gpu");
+  
   auto& s = out.primitive().stream();
   switch (base_) {
     case Base::e:

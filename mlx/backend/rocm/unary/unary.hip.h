@@ -7,8 +7,9 @@
 #include "mlx/dtype_utils.h"
 #include "mlx/primitives.h"
 
-#include <cooperative_groups.h>
-#include <nvtx3/nvtx3.hpp>
+// cooperative_groups not available on HIP — use HIP equivalents
+#include <hip/hip_cooperative_groups.h>
+// NVTX not available on ROCm — profiling markers disabled
 
 namespace mlx::core {
 
@@ -42,13 +43,13 @@ __global__ void unary_g(
     const In* in,
     Out* out,
     IdxT size_rest,
-    const __grid_constant__ Shape shape,
-    const __grid_constant__ Strides strides,
+    const  Shape shape,
+    const  Strides strides,
     int ndim) {
   auto block = cg::this_thread_block();
   auto grid = cg::this_grid();
   IdxT index_rest =
-      grid.block_index().y * block.dim_threads().y + block.thread_index().y;
+      grid.group_index().y * block.size().y + block.thread_index().y;
   if (index_rest >= size_rest) {
     return;
   }
@@ -56,7 +57,7 @@ __global__ void unary_g(
   auto shape_x = shape[ndim - 1];
   auto stride_x = strides[ndim - 1];
   IdxT index_x =
-      grid.block_index().x * block.dim_threads().x + block.thread_index().x;
+      grid.group_index().x * block.size().x + block.thread_index().x;
   auto idx =
       elem_to_loc(index_rest * shape_x, shape.data(), strides.data(), ndim);
   auto in_vec =

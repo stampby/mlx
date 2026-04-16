@@ -46,7 +46,7 @@ __global__ void kernel_sdpav_1pass(
     const T* V,
     T* O,
     const T* sinks,
-    __grid_constant__ const AttnParams params) {
+     const AttnParams params) {
   constexpr int BN = 32;
   constexpr int BD = 32;
 
@@ -201,7 +201,7 @@ __global__ void kernel_sdpav_2pass_1(
     float* partials,
     float* sums,
     float* maxs,
-    __grid_constant__ const AttnParams params) {
+     const AttnParams params) {
   constexpr int BN = 8;
   constexpr int BD = 32;
   constexpr int blocks = 32;
@@ -377,7 +377,7 @@ __global__ void kernel_sdpav_2pass_2(
     const float* sums,
     const float* maxs,
     T* O,
-    __grid_constant__ const AttnParams params) {
+     const AttnParams params) {
   constexpr int BN = 32;
   constexpr int BD = 32;
   constexpr int blocks = 32;
@@ -504,7 +504,7 @@ void sdpa_vector_1pass_fallback(
   dispatch_float_types(o.dtype(), "kernel_sdpav_1pass", [&](auto type_tag) {
     dispatch_bool(do_causal, [&](auto do_causal) {
       dispatch_headdim(params.D, [&](auto headdim) {
-        using DataType = hip_type_t<MLX_GET_TYPE(type_tag)>;
+        using DataType = cuda_type_t<MLX_GET_TYPE(type_tag)>;
 
         auto kernel =
             cu::kernel_sdpav_1pass<DataType, do_causal.value, headdim.value>;
@@ -575,7 +575,7 @@ void sdpa_vector_2pass_fallback(
   dispatch_float_types(o.dtype(), "kernel_sdpav_2pass", [&](auto type_tag) {
     dispatch_bool(do_causal, [&](auto do_causal) {
       dispatch_headdim(params.D, [&](auto headdim) {
-        using DataType = hip_type_t<MLX_GET_TYPE(type_tag)>;
+        using DataType = cuda_type_t<MLX_GET_TYPE(type_tag)>;
 
         {
           auto kernel = cu::

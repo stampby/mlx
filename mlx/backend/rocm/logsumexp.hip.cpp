@@ -10,8 +10,8 @@
 
 #include <hip/hip_cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
-#include <nvtx3/nvtx3.hpp>
-#include <cub/block/block_load.hip.h>
+// NVTX not available on ROCm — profiling markers disabled
+#include <hipcub/block/block_load.hip.h>
 
 #include <cassert>
 
@@ -98,7 +98,7 @@ __global__ void logsumexp(const T* in, T* out, int axis_size) {
 } // namespace cu
 
 void LogSumExp::eval_gpu(const std::vector<array>& inputs, array& out) {
-  nvtx3::scoped_range r("LogSumExp::eval_gpu");
+  
   assert(inputs.size() == 1);
   auto& s = stream();
   auto& encoder = cu::get_command_encoder(s);
@@ -143,7 +143,7 @@ void LogSumExp::eval_gpu(const std::vector<array>& inputs, array& out) {
   encoder.set_input_array(in);
   encoder.set_output_array(out);
   dispatch_float_types(out.dtype(), "logsumexp", [&](auto type_tag) {
-    using DataType = hip_type_t<MLX_GET_TYPE(type_tag)>;
+    using DataType = cuda_type_t<MLX_GET_TYPE(type_tag)>;
     constexpr int N_READS = 16 / sizeof(DataType);
     dispatch_block_dim(hip::ceil_div(axis_size, N_READS), [&](auto block_dim) {
       auto kernel = cu::logsumexp<DataType, float, block_dim(), N_READS>;

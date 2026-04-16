@@ -48,7 +48,7 @@ struct Tile16x16 {
    */
   __device__ __forceinline__ void load(uint32_t row_address) {
     if constexpr (
-        std::is_same_v<T2, __nv_bfloat162> || std::is_same_v<T2, __half2>) {
+        std::is_same_v<T2, __hip_bfloat162> || std::is_same_v<T2, __half2>) {
       asm volatile(
           "ldmatrix.sync.aligned.m8n8.x4.shared::cta.b16 {%0, %1, %2, %3}, [%4];\n"
           : "=r"(*(uint32_t*)&(values[0])),
@@ -90,7 +90,7 @@ struct Tile16x16 {
       x2[(row + 8) * (N / 2) + col + 0] = values[1];
       x2[(row + 8) * (N / 2) + col + 4] = values[3];
     } else if constexpr (
-        std::is_same_v<T2, float2> && std::is_same_v<U, __nv_bfloat16>) {
+        std::is_same_v<T2, float2> && std::is_same_v<U, __hip_bfloat16>) {
       x2[(row + 0) * (N / 2) + col + 0] =
           __floats2bfloat162_rn(values[0].x, values[0].y);
       x2[(row + 0) * (N / 2) + col + 4] =

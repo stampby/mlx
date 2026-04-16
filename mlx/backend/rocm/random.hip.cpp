@@ -6,7 +6,7 @@
 #include "mlx/primitives.h"
 
 #include <hip/hip_cooperative_groups.h>
-#include <nvtx3/nvtx3.hpp>
+// NVTX not available on ROCm — profiling markers disabled
 
 #include <cassert>
 
@@ -92,8 +92,8 @@ __global__ void rbits(
     bool odd,
     uint32_t bytes_per_key,
     int32_t ndim,
-    const __grid_constant__ Shape key_shape,
-    const __grid_constant__ Strides key_strides) {
+    const  Shape key_shape,
+    const  Strides key_strides) {
   auto grid = cg::this_grid();
   uint32_t thread_index = grid.thread_rank();
   uint32_t index_x = thread_index % grid_dims.x;
@@ -134,7 +134,7 @@ __global__ void rbits(
 } // namespace cu
 
 void RandomBits::eval_gpu(const std::vector<array>& inputs, array& out) {
-  nvtx3::scoped_range r("RandomBits::eval_gpu");
+  
   assert(inputs.size() == 1);
 
   // keys has shape (N1, ..., NK, 2)

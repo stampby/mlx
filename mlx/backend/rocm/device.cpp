@@ -6,7 +6,7 @@
 #include "mlx/utils.h"
 
 #include <fmt/format.h>
-#include <nvtx3/nvtx3.hpp>
+// NVTX not available on ROCm — profiling markers disabled
 #include <future>
 #include <unordered_set>
 
@@ -461,7 +461,7 @@ bool CommandEncoder::needs_commit() {
 }
 
 void CommandEncoder::commit() {
-  nvtx3::scoped_range r("CommandEncoder::commit");
+  
   if (!temporaries_.empty()) {
     add_completed_handler([temporaries = std::move(temporaries_)]() {});
   }

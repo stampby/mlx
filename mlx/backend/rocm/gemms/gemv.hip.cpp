@@ -89,9 +89,9 @@ __global__ void gemv_batched(
     T* out,
     int rows,
     int cols,
-    const __grid_constant__ Shape batch_shape,
-    const __grid_constant__ Strides mat_batch_strides,
-    const __grid_constant__ Strides vec_batch_strides,
+    const  Shape batch_shape,
+    const  Strides mat_batch_strides,
+    const  Strides vec_batch_strides,
     int batch_ndim) {
   auto block = cg::this_thread_block();
   auto batch_idx = block.group_index().y;
@@ -114,15 +114,15 @@ __global__ void gemv_gather(
     uint32_t* vec_indices,
     int rows,
     int cols,
-    const __grid_constant__ Shape mat_batch_shape,
-    const __grid_constant__ Strides mat_batch_strides,
+    const  Shape mat_batch_shape,
+    const  Strides mat_batch_strides,
     int mat_batch_ndim,
-    const __grid_constant__ Shape vec_batch_shape,
-    const __grid_constant__ Strides vec_batch_strides,
+    const  Shape vec_batch_shape,
+    const  Strides vec_batch_strides,
     int vec_batch_ndim,
-    const __grid_constant__ Shape index_shape,
-    const __grid_constant__ Strides mat_index_strides,
-    const __grid_constant__ Strides vec_index_strides,
+    const  Shape index_shape,
+    const  Strides mat_index_strides,
+    const  Strides vec_index_strides,
     int index_batch_ndim) {
   auto block = cg::this_thread_block();
   auto indices_idx = block.group_index().y;
@@ -202,7 +202,7 @@ void gemv(
   encoder.set_input_array(b);
   encoder.set_output_array(out);
   dispatch_inexact_types(out.dtype(), "gemv", [&](auto type_tag) {
-    using DataType = hip_type_t<MLX_GET_TYPE(type_tag)>;
+    using DataType = cuda_type_t<MLX_GET_TYPE(type_tag)>;
     dim3 block_dims{WARP_SIZE, rows_per_block};
     const DataType* mat;
     const DataType* vec;
@@ -277,7 +277,7 @@ void gather_mv(
   encoder.set_input_array(vec_indices);
   encoder.set_output_array(out);
   dispatch_inexact_types(out.dtype(), "gather_mv", [&](auto type_tag) {
-    using DataType = hip_type_t<MLX_GET_TYPE(type_tag)>;
+    using DataType = cuda_type_t<MLX_GET_TYPE(type_tag)>;
     dim3 block_dims{WARP_SIZE, rows_per_block};
     int rows = N;
     int cols = K;

@@ -7,7 +7,7 @@
 #include "mlx/dtype_utils.h"
 #include "mlx/fast_primitives.h"
 
-#include <nvtx3/nvtx3.hpp>
+// NVTX not available on ROCm — profiling markers disabled
 
 namespace mlx::core {
 
@@ -171,8 +171,8 @@ __global__ void rope(
     const int32_t* offset,
     float scale,
     float base,
-    const __grid_constant__ hip::std::array<int64_t, 3> strides,
-    const __grid_constant__ hip::std::array<int64_t, 3> out_strides,
+    const  hip::std::array<int64_t, 3> strides,
+    const  hip::std::array<int64_t, 3> out_strides,
     int64_t offset_stride,
     int n_head,
     uint3 dims) {
@@ -208,8 +208,8 @@ __global__ void rope_freqs(
     const float* freqs,
     float scale,
     float base,
-    const __grid_constant__ hip::std::array<int64_t, 3> strides,
-    const __grid_constant__ hip::std::array<int64_t, 3> out_strides,
+    const  hip::std::array<int64_t, 3> strides,
+    const  hip::std::array<int64_t, 3> out_strides,
     int64_t offset_stride,
     int n_head,
     uint3 dims,
@@ -248,7 +248,7 @@ bool RoPE::use_fallback(Stream s) {
 void RoPE::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  nvtx3::scoped_range r("RoPE::eval_gpu");
+  
 
   auto& s = stream();
   auto& encoder = cu::get_command_encoder(s);
@@ -330,7 +330,7 @@ void RoPE::eval_gpu(
   dispatch_float_types(out.dtype(), "rope", [&](auto type_tag) {
     dispatch_bool(traditional_, [&](auto traditional) {
       dispatch_bool(forward_, [&](auto forward) {
-        using DataType = hip_type_t<MLX_GET_TYPE(type_tag)>;
+        using DataType = cuda_type_t<MLX_GET_TYPE(type_tag)>;
         if (single && !with_freqs) {
           auto kernel =
               cu::rope_single<DataType, traditional.value, forward.value>;

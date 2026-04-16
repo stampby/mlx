@@ -10,7 +10,7 @@
 
 #include <hip/hip_cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
-#include <nvtx3/nvtx3.hpp>
+// NVTX not available on ROCm — profiling markers disabled
 
 namespace mlx::core {
 
@@ -22,7 +22,7 @@ inline __device__ float2 plus_f2(const float2& a, const float2& b) {
   return {a.x + b.x, a.y + b.y};
 }
 
-// Similar to cub::BlockReduce, but result is broadcasted to every thread.
+// Similar to hipcub::BlockReduce, but result is broadcasted to every thread.
 template <typename T, int BLOCK_DIM, int GROUP_DIM = WARP_SIZE>
 struct BlockBroadcastReduce {
   using TempStorage = T[std::max(BLOCK_DIM / WARP_SIZE, 1)];
@@ -68,7 +68,7 @@ __global__ void rms_norm_small(
   __shared__ typename BlockReduceT::TempStorage temp;
 
   auto row =
-      (grid.block_rank() * block.dim_threads().y) + block.thread_index().y;
+      (grid.block_rank() * block.size().y) + block.thread_index().y;
   if (row >= n_rows) {
     return;
   }
@@ -166,7 +166,7 @@ __global__ void rms_norm_vjp_small(
   __shared__ typename BlockReduceF2::TempStorage temp;
 
   auto row =
-      (grid.block_rank() * block.dim_threads().y) + block.thread_index().y;
+      (grid.block_rank() * block.size().y) + block.thread_index().y;
   if (row >= n_rows) {
     return;
   }
@@ -323,7 +323,7 @@ void dispatch_group_dim(int axis_size, F&& f) {
 void RMSNorm::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  nvtx3::scoped_range r("RMSNorm::eval_gpu");
+  
   auto& s = stream();
   auto& out = outputs[0];
   auto& encoder = cu::get_command_encoder(s);
@@ -364,7 +364,7 @@ void RMSNorm::eval_gpu(
   encoder.set_input_array(w);
   encoder.set_output_array(out);
   dispatch_float_types(out.dtype(), "rms_norm", [&](auto type_tag) {
-    using DataType = hip_type_t<MLX_GET_TYPE(type_tag)>;
+    using DataType = cuda_type_t<MLX_GET_TYPE(type_tag)>;
     constexpr int N_READS = 16 / sizeof(DataType);
     if (axis_size <= N_READS * 1024) {
       dispatch_group_dim<N_READS>(
@@ -405,7 +405,7 @@ void RMSNorm::eval_gpu(
 void RMSNormVJP::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  nvtx3::scoped_range r("RMSNormVJP::eval_gpu");
+  
   auto& s = stream();
   auto& encoder = cu::get_command_encoder(s);
 
@@ -473,7 +473,7 @@ void RMSNormVJP::eval_gpu(
   encoder.set_output_array(gw_temp);
   dispatch_float_types(gx.dtype(), "rms_norm_vjp", [&](auto type_tag) {
     dispatch_bool(has_w, [&](auto has_w_constant) {
-      using DataType = hip_type_t<MLX_GET_TYPE(type_tag)>;
+      using DataType = cuda_type_t<MLX_GET_TYPE(type_tag)>;
       constexpr int N_READS = 16 / sizeof(DataType);
       if (axis_size <= N_READS * 1024) {
         dispatch_group_dim<N_READS>(

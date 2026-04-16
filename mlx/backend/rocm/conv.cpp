@@ -7,7 +7,7 @@
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/primitives.h"
 
-#include <nvtx3/nvtx3.hpp>
+// NVTX not available on ROCm — profiling markers disabled
 
 #include <cassert>
 
@@ -257,7 +257,7 @@ void init_cudnn_conv_cache() {
 }
 
 void Convolution::eval_gpu(const std::vector<array>& inputs, array& out_) {
-  nvtx3::scoped_range r("Convolution::eval_gpu");
+  
   if (out_.size() == 0) {
     return;
   }

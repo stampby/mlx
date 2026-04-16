@@ -36,7 +36,7 @@ void init_reduce(
   dispatch_all_types(in.dtype(), [&](auto type_tag) {
     dispatch_reduce_ops(reduce_type, [&](auto reduce_type_tag) {
       using OP = MLX_GET_TYPE(reduce_type_tag);
-      using T = hip_type_t<MLX_GET_TYPE(type_tag)>;
+      using T = cuda_type_t<MLX_GET_TYPE(type_tag)>;
       using U = typename cu::ReduceResult<OP, T>::type;
       auto kernel = cu::init_reduce<T, U, OP>;
       dim3 grid = get_2d_grid_dims(out.shape(), out.strides());

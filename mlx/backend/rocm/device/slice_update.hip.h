@@ -5,7 +5,8 @@
 #include "mlx/backend/rocm/device/binary_ops.hip.h"
 #include "mlx/backend/rocm/device/utils.hip.h"
 
-#include <cooperative_groups.h>
+// cooperative_groups not available on HIP — use HIP equivalents
+#include <hip/hip_cooperative_groups.h>
 
 namespace mlx::core::cu {
 
@@ -23,10 +24,10 @@ __global__ void slice_update_op(
     const T* updates,
     T* out,
     int64_t update_size,
-    const __grid_constant__ Shape update_shape,
-    const __grid_constant__ Strides update_strides,
+    const  Shape update_shape,
+    const  Strides update_strides,
     int32_t update_ndim,
-    const __grid_constant__ Strides output_strides,
+    const  Strides output_strides,
     int64_t output_offset) {
   Op op;
 

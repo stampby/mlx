@@ -16,7 +16,7 @@
 #include <hip/hip_runtime.h>
 #include <fmt/format.h>
 #include <hip/hiprtc.h>
-#include <nvtx3/nvtx3.hpp>
+// NVTX not available on ROCm — profiling markers disabled
 
 #include <cassert>
 #include <numeric>
@@ -60,7 +60,7 @@ void append_indices_arg(
 } // namespace
 
 void Gather::eval_gpu(const std::vector<array>& inputs, array& out) {
-  nvtx3::scoped_range r("Gather::eval_gpu");
+  
   assert(inputs.size() > 0);
   const auto& src = inputs[0];
 
@@ -140,7 +140,7 @@ void Gather::eval_gpu(const std::vector<array>& inputs, array& out) {
 }
 
 void Scatter::eval_gpu(const std::vector<array>& inputs, array& out) {
-  nvtx3::scoped_range r("Gather::eval_gpu");
+  
   assert(inputs.size() > 1);
   auto& upd = inputs.back();
 
@@ -243,7 +243,7 @@ void Scatter::eval_gpu(const std::vector<array>& inputs, array& out) {
 }
 
 void GatherAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
-  nvtx3::scoped_range r("GatherAxis::eval_gpu");
+  
   assert(inputs.size() > 1);
   const auto& src = inputs[0];
   const auto& idx = inputs[1];
@@ -334,7 +334,7 @@ void GatherAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
 }
 
 void ScatterAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
-  nvtx3::scoped_range r("ScatterAxis::eval_gpu");
+  
   assert(inputs.size() > 2);
   const auto& src = inputs[0];
   const auto& idx = inputs[1];
@@ -441,7 +441,7 @@ void ScatterAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
 }
 
 void MaskedScatter::eval_gpu(const std::vector<array>& inputs, array& out) {
-  nvtx3::scoped_range r("MaskedScatter::eval_gpu");
+  
   assert(inputs.size() == 3);
 
   const array& dst = inputs[0];
@@ -567,7 +567,7 @@ void MaskedScatter::eval_gpu(const std::vector<array>& inputs, array& out) {
 }
 
 void SliceUpdate::eval_gpu(const std::vector<array>& inputs, array& out) {
-  nvtx3::scoped_range r("SliceUpdate::eval_gpu");
+  
   assert(inputs.size() == 2);
   if (out.size() == 0) {
     return;

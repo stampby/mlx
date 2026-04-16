@@ -6,7 +6,7 @@
 
 #include <hip/hip_cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
-#include <cub/block/block_load.hip.h>
+#include <hipcub/block/block_load.hip.h>
 
 namespace mlx::core {
 
@@ -36,14 +36,14 @@ __global__ void all_reduce(T* in, U* out, size_t block_step, size_t size) {
 
   size_t i = start;
   for (; i + block.size() * N <= check; i += block.size() * N) {
-    hipcub::LoadDirectBlockedVectorized<T, N>(block.thread_rank(), in + i, vals);
+    hiphipcub::LoadDirectBlockedVectorized<T, N>(block.thread_rank(), in + i, vals);
     for (int j = 0; j < N; j++) {
       accs[0] = op(accs[0], cast_to<U>(vals[j]));
     }
   }
 
   if (i < check) {
-    hipcub::LoadDirectBlocked(
+    hiphipcub::LoadDirectBlocked(
         block.thread_rank(), in + i, vals, check - i, cast_to<T>(init));
     for (int i = 0; i < N; i++) {
       accs[0] = op(accs[0], cast_to<U>(vals[i]));
@@ -112,7 +112,7 @@ void all_reduce(
     dispatch_all_types(dt, [&](auto type_tag) {
       dispatch_reduce_ops(reduce_type, [&](auto reduce_type_tag) {
         using OP = MLX_GET_TYPE(reduce_type_tag);
-        using T = hip_type_t<MLX_GET_TYPE(type_tag)>;
+        using T = cuda_type_t<MLX_GET_TYPE(type_tag)>;
         using U = typename cu::ReduceResult<OP, T>::type;
         auto kernel = cu::all_reduce<T, U, OP, N_READS>;
         encoder.add_kernel_node(
@@ -138,7 +138,7 @@ void all_reduce(
   dispatch_all_types(dt, [&](auto type_tag) {
     dispatch_reduce_ops(reduce_type, [&](auto reduce_type_tag) {
       using OP = MLX_GET_TYPE(reduce_type_tag);
-      using T = hip_type_t<MLX_GET_TYPE(type_tag)>;
+      using T = cuda_type_t<MLX_GET_TYPE(type_tag)>;
       using U = typename cu::ReduceResult<OP, T>::type;
       auto kernel = cu::all_reduce<T, U, OP, N_READS>;
       encoder.add_kernel_node(

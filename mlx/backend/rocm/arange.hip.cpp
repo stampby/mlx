@@ -8,7 +8,7 @@
 #include "mlx/primitives.h"
 
 #include <hip/hip_cooperative_groups.h>
-#include <nvtx3/nvtx3.hpp>
+// NVTX not available on ROCm — profiling markers disabled
 
 namespace mlx::core {
 
@@ -38,7 +38,7 @@ __global__ void arange(T* out, IdxT size, T start, T step) {
 } // namespace cu
 
 void Arange::eval_gpu(const std::vector<array>& inputs, array& out) {
-  nvtx3::scoped_range r("Arange::eval_gpu");
+  
   if (out.size() == 0) {
     return;
   }
@@ -48,7 +48,7 @@ void Arange::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   dispatch_int_float_types(out.dtype(), "Arange", [&](auto type_tag) {
     using CTYPE = MLX_GET_TYPE(type_tag);
-    using OutType = hip_type_t<CTYPE>;
+    using OutType = cuda_type_t<CTYPE>;
     constexpr int N_WRITES = 16 / sizeof(OutType);
     dispatch_bool(out.data_size() > INT32_MAX, [&](auto large) {
       using IdxT = std::conditional_t<large(), int64_t, int32_t>;

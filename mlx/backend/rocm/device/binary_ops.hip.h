@@ -2,7 +2,7 @@
 
 #include "mlx/backend/rocm/device/unary_ops.hip.h"
 
-#include <cuda/std/array>
+#include <array>
 
 namespace mlx::core::cu {
 
@@ -16,10 +16,10 @@ struct Add {
 struct FloorDivide {
   template <typename T>
   __device__ T operator()(T x, T y) {
-    if constexpr (cuda::std::is_integral_v<T>) {
+    if constexpr (std::is_integral_v<T>) {
       return x / y;
     } else {
-      return cuda::std::trunc(x / y);
+      return std::trunc(x / y);
     }
   }
 };
@@ -34,8 +34,8 @@ struct Divide {
 struct Remainder {
   template <typename T>
   __device__ T operator()(T x, T y) {
-    if constexpr (cuda::std::is_integral_v<T>) {
-      if constexpr (cuda::std::is_signed_v<T>) {
+    if constexpr (std::is_integral_v<T>) {
+      if constexpr (std::is_signed_v<T>) {
         auto r = x % y;
         if (r != 0 && (r < 0 != y < 0)) {
           r += y;
@@ -47,7 +47,7 @@ struct Remainder {
     } else if constexpr (is_complex_v<T>) {
       return x % y;
     } else {
-      T r = cuda::std::fmod(x, y);
+      T r = std::fmod(x, y);
       if (r != 0 && (r < 0 != y < 0)) {
         r = r + y;
       }
@@ -66,7 +66,7 @@ struct Equal {
 struct NaNEqual {
   template <typename T>
   __device__ bool operator()(T x, T y) {
-    using cuda::std::isnan;
+    using std::isnan;
     if constexpr (is_complex_v<T>) {
       return x == y ||
           (isnan(x.real()) && isnan(y.real()) && isnan(x.imag()) &&
@@ -111,17 +111,17 @@ struct LogAddExp {
   template <typename T>
   __device__ T operator()(T x, T y) {
     if constexpr (is_complex_v<T>) {
-      if (cuda::std::isnan(x.real()) || cuda::std::isnan(x.imag()) ||
-          cuda::std::isnan(y.real()) || cuda::std::isnan(y.imag())) {
+      if (std::isnan(x.real()) || std::isnan(x.imag()) ||
+          std::isnan(y.real()) || std::isnan(y.imag())) {
         return {
-            cuda::std::numeric_limits<float>::quiet_NaN(),
-            cuda::std::numeric_limits<float>::quiet_NaN()};
+            std::numeric_limits<float>::quiet_NaN(),
+            std::numeric_limits<float>::quiet_NaN()};
       }
       auto max = x.real() > y.real() ? x : y;
       auto min = x.real() < y.real() ? x : y;
       auto min_real = min.real();
       auto max_real = max.real();
-      if (!cuda::std::isfinite(min_real) && (min_real == max_real)) {
+      if (!std::isfinite(min_real) && (min_real == max_real)) {
         if (min_real < 0) {
           return min;
         } else {
@@ -131,15 +131,15 @@ struct LogAddExp {
         return Log1p{}(Exp{}(min - max)) + max;
       }
     } else {
-      if (cuda::std::isnan(x) || cuda::std::isnan(y)) {
-        return cuda::std::numeric_limits<T>::quiet_NaN();
+      if (std::isnan(x) || std::isnan(y)) {
+        return std::numeric_limits<T>::quiet_NaN();
       }
       T maxval = max(x, y);
       T minval = min(x, y);
-      return (minval == -cuda::std::numeric_limits<T>::infinity() ||
-              maxval == cuda::std::numeric_limits<T>::infinity())
+      return (minval == -std::numeric_limits<T>::infinity() ||
+              maxval == std::numeric_limits<T>::infinity())
           ? maxval
-          : T(maxval + cuda::std::log1p(cuda::std::exp(minval - maxval)));
+          : T(maxval + std::log1p(std::exp(minval - maxval)));
     }
   };
 };
@@ -147,15 +147,15 @@ struct LogAddExp {
 struct Maximum {
   template <typename T>
   __device__ T operator()(T x, T y) {
-    if constexpr (cuda::std::is_integral_v<T>) {
+    if constexpr (std::is_integral_v<T>) {
       return max(x, y);
     } else if constexpr (is_complex_v<T>) {
-      if (cuda::std::isnan(x.real()) || cuda::std::isnan(x.imag())) {
+      if (std::isnan(x.real()) || std::isnan(x.imag())) {
         return x;
       }
       return x > y ? x : y;
     } else {
-      if (cuda::std::isnan(x)) {
+      if (std::isnan(x)) {
         return x;
       }
       return x > y ? x : y;
@@ -166,15 +166,15 @@ struct Maximum {
 struct Minimum {
   template <typename T>
   __device__ T operator()(T x, T y) {
-    if constexpr (cuda::std::is_integral_v<T>) {
+    if constexpr (std::is_integral_v<T>) {
       return min(x, y);
     } else if constexpr (is_complex_v<T>) {
-      if (cuda::std::isnan(x.real()) || cuda::std::isnan(x.imag())) {
+      if (std::isnan(x.real()) || std::isnan(x.imag())) {
         return x;
       }
       return x < y ? x : y;
     } else {
-      if (cuda::std::isnan(x)) {
+      if (std::isnan(x)) {
         return x;
       }
       return x < y ? x : y;
@@ -203,10 +203,10 @@ struct NotEqual {
 struct Power {
   template <typename T>
   __device__ T operator()(T base, T exp) {
-    if constexpr (cuda::std::is_integral_v<T>) {
+    if constexpr (std::is_integral_v<T>) {
       T res = 1;
       // Raising an integer to a negative power is undefined
-      if constexpr (cuda::std::is_signed_v<T>) {
+      if constexpr (std::is_signed_v<T>) {
         if (exp < 0) {
           return 0;
         }
@@ -220,9 +220,9 @@ struct Power {
       }
       return res;
     } else if constexpr (is_complex_v<T>) {
-      return cuda::std::pow(base, exp);
+      return std::pow(base, exp);
     } else {
-      return cuda::std::pow(base, exp);
+      return std::pow(base, exp);
     }
   }
 };
@@ -286,13 +286,13 @@ struct RightShift {
 struct ArcTan2 {
   template <typename T>
   __device__ T operator()(T y, T x) {
-    return cuda::std::atan2(y, x);
+    return std::atan2(y, x);
   }
 };
 
 struct DivMod {
   template <typename T>
-  __device__ cuda::std::array<T, 2> operator()(T x, T y) {
+  __device__ std::array<T, 2> operator()(T x, T y) {
     return {FloorDivide{}(x, y), Remainder{}(x, y)};
   };
 };

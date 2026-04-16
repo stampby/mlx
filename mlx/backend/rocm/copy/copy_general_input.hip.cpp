@@ -17,12 +17,12 @@ __global__ void copy_g_nd(
     const In* in,
     Out* out,
     IdxT size_rest,
-    const __grid_constant__ hip::std::array<int32_t, NDIM> shape,
-    const __grid_constant__ hip::std::array<int64_t, NDIM> strides) {
+    const  hip::std::array<int32_t, NDIM> shape,
+    const  hip::std::array<int64_t, NDIM> strides) {
   auto block = cg::this_thread_block();
   auto grid = cg::this_grid();
   IdxT index_rest =
-      grid.block_index().y * block.dim_threads().y + block.thread_index().y;
+      grid.group_index().y * block.size().y + block.thread_index().y;
   if (index_rest >= size_rest) {
     return;
   }
@@ -30,7 +30,7 @@ __global__ void copy_g_nd(
   auto shape_x = shape[NDIM - 1];
   auto stride_x = strides[NDIM - 1];
   IdxT index_x =
-      grid.block_index().x * block.dim_threads().x + block.thread_index().x;
+      grid.group_index().x * block.size().x + block.thread_index().x;
   auto idx =
       elem_to_loc_nd<NDIM>(index_rest * shape_x, shape.data(), strides.data());
   auto in_vec =
@@ -48,13 +48,13 @@ __global__ void copy_g(
     const In* in,
     Out* out,
     IdxT size_rest,
-    const __grid_constant__ Shape shape,
-    const __grid_constant__ Strides strides,
+    const  Shape shape,
+    const  Strides strides,
     int ndim) {
   auto block = cg::this_thread_block();
   auto grid = cg::this_grid();
   IdxT index_rest =
-      grid.block_index().y * block.dim_threads().y + block.thread_index().y;
+      grid.group_index().y * block.size().y + block.thread_index().y;
   if (index_rest >= size_rest) {
     return;
   }
@@ -62,7 +62,7 @@ __global__ void copy_g(
   auto shape_x = shape[ndim - 1];
   auto stride_x = strides[ndim - 1];
   IdxT index_x =
-      grid.block_index().x * block.dim_threads().x + block.thread_index().x;
+      grid.group_index().x * block.size().x + block.thread_index().x;
   auto idx =
       elem_to_loc(index_rest * shape_x, shape.data(), strides.data(), ndim);
   auto in_vec =
@@ -84,8 +84,8 @@ copy_col_row(const In* in, Out* out, int64_t rows, int64_t cols) {
   auto block = cg::this_thread_block();
   auto grid = cg::this_grid();
 
-  auto tile_row = grid.block_index().x * TILE_SIZE * N_READS;
-  auto tile_col = grid.block_index().y * TILE_SIZE * N_READS;
+  auto tile_row = grid.group_index().x * TILE_SIZE * N_READS;
+  auto tile_col = grid.group_index().y * TILE_SIZE * N_READS;
 
   auto tidx = block.thread_index().x;
   auto tidy = N_READS * block.thread_index().y;
@@ -135,8 +135,8 @@ void copy_general_input(
     const Strides& strides_in) {
   dispatch_all_types(in.dtype(), [&](auto in_type_tag) {
     dispatch_all_types(out.dtype(), [&](auto out_type_tag) {
-      using InType = hip_type_t<MLX_GET_TYPE(in_type_tag)>;
-      using OutType = hip_type_t<MLX_GET_TYPE(out_type_tag)>;
+      using InType = cuda_type_t<MLX_GET_TYPE(in_type_tag)>;
+      using OutType = cuda_type_t<MLX_GET_TYPE(out_type_tag)>;
       const InType* in_ptr = gpu_ptr<InType>(in) + offset_in;
       OutType* out_ptr = gpu_ptr<OutType>(out) + offset_out;
       int ndim = shape.size();

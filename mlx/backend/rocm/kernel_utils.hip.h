@@ -12,11 +12,11 @@
 #include "mlx/backend/rocm/allocator.h"
 #include "mlx/backend/rocm/device/utils.hip.h"
 
-#include <cuda.h>
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
+#include <hip/hip_runtime.h>
+#include <hip/hip_bf16.h>
+#include <hip/hip_fp16.h>
 #include <fmt/format.h>
-#include <cuda/cmath>
+#include <cmath>
 
 namespace mlx::core {
 
@@ -74,7 +74,7 @@ struct CTypeToCudaType<float16_t> {
 
 template <>
 struct CTypeToCudaType<bfloat16_t> {
-  using type = __nv_bfloat16;
+  using type = __hip_bfloat16;
 };
 
 template <>
@@ -88,14 +88,14 @@ using cuda_type_t = typename CTypeToCudaType<T>::type;
 // Type traits for detecting floating numbers.
 template <typename T>
 inline constexpr bool is_floating_v =
-    cuda::std::is_same_v<T, float> || cuda::std::is_same_v<T, double> ||
-    cuda::std::is_same_v<T, float16_t> || cuda::std::is_same_v<T, bfloat16_t> ||
-    cuda::std::is_same_v<T, __half> || cuda::std::is_same_v<T, __nv_bfloat16>;
+    std::is_same_v<T, float> || std::is_same_v<T, double> ||
+    std::is_same_v<T, float16_t> || std::is_same_v<T, bfloat16_t> ||
+    std::is_same_v<T, __half> || std::is_same_v<T, __hip_bfloat16>;
 
 // Type traits for detecting complex numbers.
 template <typename T>
-inline constexpr bool is_complex_v = cuda::std::is_same_v<T, complex64_t> ||
-    cuda::std::is_same_v<T, complex128_t>;
+inline constexpr bool is_complex_v = std::is_same_v<T, complex64_t> ||
+    std::is_same_v<T, complex128_t>;
 
 // Type traits for detecting complex or real floating point numbers.
 template <typename T>
@@ -103,12 +103,12 @@ inline constexpr bool is_inexact_v = is_floating_v<T> || is_complex_v<T>;
 
 // Utility to copy data from vector to array in host.
 template <int NDIM = MAX_NDIM, typename T = int32_t>
-inline cuda::std::array<T, NDIM> const_param(const SmallVector<T>& vec) {
+inline std::array<T, NDIM> const_param(const SmallVector<T>& vec) {
   if (vec.size() > NDIM) {
     throw std::runtime_error(
         fmt::format("ndim can not be larger than {}.", NDIM));
   }
-  cuda::std::array<T, NDIM> result;
+  std::array<T, NDIM> result;
   std::copy_n(vec.begin(), vec.size(), result.begin());
   return result;
 }

@@ -6,7 +6,7 @@
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/fast_primitives.h"
 
-#include <nvtx3/nvtx3.hpp>
+// NVTX not available on ROCm — profiling markers disabled
 
 namespace mlx::core {
 
@@ -574,7 +574,7 @@ bool ScaledDotProductAttention::supports_bool_mask() {
 void ScaledDotProductAttention::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  nvtx3::scoped_range r("ScaledDotProductAttention::eval_gpu");
+  
 
   auto& s = stream();
 
@@ -631,7 +631,7 @@ bool ScaledDotProductAttentionVJP::use_fallback(const array& q, Stream s) {
 void ScaledDotProductAttentionVJP::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  nvtx3::scoped_range r("ScaledDotProductAttentionVJP::eval_gpu");
+  
 
   auto& s = stream();
 

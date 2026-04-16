@@ -11,7 +11,7 @@
 #include "mlx/fast_primitives.h"
 
 #include <fmt/format.h>
-#include <nvtx3/nvtx3.hpp>
+// NVTX not available on ROCm — profiling markers disabled
 
 namespace mlx::core::fast {
 
@@ -83,17 +83,17 @@ std::string build_kernel(
     // Add input shape, strides and ndim if present in the source
     if (arr.ndim() > 0) {
       if (std::get<0>(shape_infos[i])) {
-        kernel_source += "    const __grid_constant__ Shape ";
+        kernel_source += "    const  Shape ";
         kernel_source += name;
         kernel_source += "_shape,\n";
       }
       if (std::get<1>(shape_infos[i])) {
-        kernel_source += "    const __grid_constant__ Strides ";
+        kernel_source += "    const  Strides ";
         kernel_source += name;
         kernel_source += "_strides,\n";
       }
       if (std::get<2>(shape_infos[i])) {
-        kernel_source += "    const __grid_constant__ int ";
+        kernel_source += "    const  int ";
         kernel_source += name;
         kernel_source += "_ndim,\n";
       }
@@ -278,7 +278,7 @@ std::vector<array> precompiled_hip_kernel(
 void CustomKernel::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  nvtx3::scoped_range r("CustomKernel::eval_gpu");
+  
   auto& s = stream();
   auto& encoder = cu::get_command_encoder(s);
 

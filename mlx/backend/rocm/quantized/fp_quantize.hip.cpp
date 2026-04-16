@@ -63,7 +63,7 @@ __global__ void fp_quantize_dequantize(
 
   using Tx2 = Vector2_t<T>;
   uint32_t rbits = 0; // reserved bits for future use
-  auto block_size = cg::this_thread_block().dim_threads();
+  auto block_size = cg::this_thread_block().size();
   auto block_idx = cg::this_thread_block().group_index();
   auto idx_in_block = cg::this_thread_block().thread_index();
   auto tidx = block_idx.x * block_size.x + idx_in_block.x;
@@ -146,7 +146,7 @@ __global__ void fp_quantize_rowwise(
   using Tx2 = Vector2_t<T>;
   using Tx4 = Vector4_t<T>;
   uint32_t rbits = 0; // reserved bits for future use
-  auto block_size = cg::this_thread_block().dim_threads();
+  auto block_size = cg::this_thread_block().size();
   auto block_idx = cg::this_thread_block().group_index();
   auto idx_in_block = cg::this_thread_block().thread_index();
   auto tidx = block_idx.x * block_size.x + idx_in_block.x;
@@ -348,7 +348,7 @@ __global__ void fp_dequantize(
     T* out,
     size_t size,
     float* global_scale = nullptr) {
-  auto block_size = cg::this_thread_block().dim_threads();
+  auto block_size = cg::this_thread_block().size();
   auto block_idx = cg::this_thread_block().group_index();
   auto idx_in_block = cg::this_thread_block().thread_index();
 
@@ -425,7 +425,7 @@ void fp_quantize_dequantize(
   }
   enc.set_output_array(what);
   dispatch_float_types(w.dtype(), "fp_quantize_dequantize", [&](auto type_tag) {
-    using T = hip_type_t<MLX_GET_TYPE(type_tag)>;
+    using T = cuda_type_t<MLX_GET_TYPE(type_tag)>;
     if constexpr (!std::is_same_v<T, double>) {
       auto kernel = cu::fp_quantize_dequantize<T, 32, 4, true, false>;
       if (bits == 8) {
@@ -467,7 +467,7 @@ void fp_quantize(
   enc.set_output_array(scales);
   if (w.strides().back() != 1) {
     dispatch_float_types(w.dtype(), "fp_quantize_columnwise", [&](auto type_tag) {
-      using T = hip_type_t<MLX_GET_TYPE(type_tag)>;
+      using T = cuda_type_t<MLX_GET_TYPE(type_tag)>;
       if constexpr (!std::is_same_v<T, double>) {
         auto M = w.shape(-2);
         auto K = w.shape(-1);
@@ -498,7 +498,7 @@ void fp_quantize(
     });
   } else {
     dispatch_float_types(w.dtype(), "fp_quantize_rowwise", [&](auto type_tag) {
-      using T = hip_type_t<MLX_GET_TYPE(type_tag)>;
+      using T = cuda_type_t<MLX_GET_TYPE(type_tag)>;
       if constexpr (!std::is_same_v<T, double>) {
         auto kernel = cu::fp_quantize_rowwise<T, 32, 4, true, false>;
         if (bits == 8) {
@@ -552,7 +552,7 @@ void fp_dequantize(
   }
   enc.set_output_array(w);
   dispatch_float_types(w.dtype(), "fp_dequantize", [&](auto type_tag) {
-    using T = hip_type_t<MLX_GET_TYPE(type_tag)>;
+    using T = cuda_type_t<MLX_GET_TYPE(type_tag)>;
     if constexpr (!std::is_same_v<T, double>) {
       auto kernel = cu::fp_dequantize<T, 32, 4, true>;
       if (bits == 8) {

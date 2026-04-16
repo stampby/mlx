@@ -151,7 +151,7 @@ template <typename T, typename U, typename Op, int NDIM, int N_READS = 4>
 __global__ void row_reduce_looped(
     const T* in,
     U* out,
-    const __grid_constant__ RowReduceArgs args) {
+    const  RowReduceArgs args) {
   auto grid = cg::this_grid();
   auto block = cg::this_thread_block();
   auto warp = cg::tiled_partition<WARP_SIZE>(block);
@@ -248,7 +248,7 @@ void row_reduce_simple(
   dispatch_all_types(in.dtype(), [&](auto type_tag) {
     dispatch_reduce_ops(reduce_type, [&](auto reduce_type_tag) {
       using OP = MLX_GET_TYPE(reduce_type_tag);
-      using T = hip_type_t<MLX_GET_TYPE(type_tag)>;
+      using T = cuda_type_t<MLX_GET_TYPE(type_tag)>;
       using U = typename cu::ReduceResult<OP, T>::type;
 
       constexpr int N_READS = 16 / sizeof(T);
@@ -299,7 +299,7 @@ void row_reduce_looped(
   dispatch_all_types(in.dtype(), [&](auto type_tag) {
     dispatch_reduce_ops(reduce_type, [&](auto reduce_type_tag) {
       using OP = MLX_GET_TYPE(reduce_type_tag);
-      using T = hip_type_t<MLX_GET_TYPE(type_tag)>;
+      using T = cuda_type_t<MLX_GET_TYPE(type_tag)>;
       using U = typename cu::ReduceResult<OP, T>::type;
 
       constexpr int N_READS = 16 / sizeof(T);
