@@ -108,8 +108,8 @@ __device__ void rope_impl(
     const int* offset,
     float inv_freq,
     float scale,
-    const hip::std::array<int64_t, 3> strides,
-    const hip::std::array<int64_t, 3> out_strides,
+    const std::array<int64_t, 3> strides,
+    const std::array<int64_t, 3> out_strides,
     int64_t offset_stride,
     int n_head,
     uint3 pos,
@@ -172,8 +172,8 @@ __global__ void rope(
     const int32_t* offset,
     float scale,
     float base,
-    const  hip::std::array<int64_t, 3> strides,
-    const  hip::std::array<int64_t, 3> out_strides,
+    const  std::array<int64_t, 3> strides,
+    const  std::array<int64_t, 3> out_strides,
     int64_t offset_stride,
     int n_head,
     uint3 dims) {
@@ -209,8 +209,8 @@ __global__ void rope_freqs(
     const float* freqs,
     float scale,
     float base,
-    const  hip::std::array<int64_t, 3> strides,
-    const  hip::std::array<int64_t, 3> out_strides,
+    const  std::array<int64_t, 3> strides,
+    const  std::array<int64_t, 3> out_strides,
     int64_t offset_stride,
     int n_head,
     uint3 dims,
@@ -257,8 +257,8 @@ void RoPE::eval_gpu(
   auto& offset = inputs[1];
   auto& out = outputs[0];
 
-  hip::std::array<int64_t, 3> strides;
-  hip::std::array<int64_t, 3> out_strides;
+  std::array<int64_t, 3> strides;
+  std::array<int64_t, 3> out_strides;
   bool donated = false;
   int ndim = in.ndim();
 

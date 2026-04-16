@@ -341,15 +341,15 @@ void dispatch_scan_ops(Scan::ReduceType scan_op, F&& f) {
 
 template <typename Op>
 const char* op_to_string() {
-  if (hip::std::is_same_v<Op, cu::Max>) {
+  if (std::is_same_v<Op, cu::Max>) {
     return "Max";
-  } else if (hip::std::is_same_v<Op, cu::Min>) {
+  } else if (std::is_same_v<Op, cu::Min>) {
     return "Min";
-  } else if (hip::std::is_same_v<Op, cu::Sum>) {
+  } else if (std::is_same_v<Op, cu::Sum>) {
     return "Sum";
-  } else if (hip::std::is_same_v<Op, cu::Prod>) {
+  } else if (std::is_same_v<Op, cu::Prod>) {
     return "Prod";
-  } else if (hip::std::is_same_v<Op, cu::LogAddExp>) {
+  } else if (std::is_same_v<Op, cu::LogAddExp>) {
     return "LogAddExp";
   } else {
     throw std::invalid_argument("Unknown op.");
@@ -358,7 +358,7 @@ const char* op_to_string() {
 
 template <typename Op, typename T>
 constexpr bool supports_scan_op() {
-  if constexpr (hip::std::is_same_v<Op, LogAddExp>) {
+  if constexpr (std::is_same_v<Op, LogAddExp>) {
     return is_inexact_v<T>;
   } else {
     return true;

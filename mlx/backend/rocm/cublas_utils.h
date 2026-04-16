@@ -5,7 +5,7 @@
 #include "mlx/backend/rocm/device.h"
 #include "mlx/dtype_utils.h"
 
-#include <hipblaslt.h>
+#include <hipblaslt/hipblaslt.h>
 
 namespace mlx::core {
 namespace cublas_utils {

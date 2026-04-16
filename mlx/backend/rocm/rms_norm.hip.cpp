@@ -69,7 +69,7 @@ __global__ void rms_norm_small(
   __shared__ typename BlockReduceT::TempStorage temp;
 
   auto row =
-      (blockIdx.x * blockDim.x.y) + threadIdx.y;
+      (blockIdx.x * blockDim.y) + threadIdx.y;
   if (row >= n_rows) {
     return;
   }
@@ -167,7 +167,7 @@ __global__ void rms_norm_vjp_small(
   __shared__ typename BlockReduceF2::TempStorage temp;
 
   auto row =
-      (blockIdx.x * blockDim.x.y) + threadIdx.y;
+      (blockIdx.x * blockDim.y) + threadIdx.y;
   if (row >= n_rows) {
     return;
   }

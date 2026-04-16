@@ -21,9 +21,9 @@ __global__ void set_mm_device_pointers_nd(
     int8_t* b_start,
     int8_t* out_start,
     int item_size,
-    const  hip::std::array<int32_t, NDIM> batch_shape,
-    const  hip::std::array<int64_t, NDIM> a_batch_strides,
-    const  hip::std::array<int64_t, NDIM> b_batch_strides,
+    const  std::array<int32_t, NDIM> batch_shape,
+    const  std::array<int64_t, NDIM> a_batch_strides,
+    const  std::array<int64_t, NDIM> b_batch_strides,
     int64_t batch_stride,
     int batch_count) {
   auto index = cg::this_grid().thread_rank();
@@ -77,10 +77,10 @@ __global__ void set_addmm_device_pointers_nd(
     int8_t* c_start,
     int8_t* out_start,
     int item_size,
-    const  hip::std::array<int32_t, NDIM> batch_shape,
-    const  hip::std::array<int64_t, NDIM> a_batch_strides,
-    const  hip::std::array<int64_t, NDIM> b_batch_strides,
-    const  hip::std::array<int64_t, NDIM> c_batch_strides,
+    const  std::array<int32_t, NDIM> batch_shape,
+    const  std::array<int64_t, NDIM> a_batch_strides,
+    const  std::array<int64_t, NDIM> b_batch_strides,
+    const  std::array<int64_t, NDIM> c_batch_strides,
     int64_t batch_stride,
     int batch_count) {
   auto index = cg::this_grid().thread_rank();

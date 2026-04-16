@@ -18,12 +18,12 @@ __global__ void copy_g_nd(
     const In* in,
     Out* out,
     IdxT size_rest,
-    const  hip::std::array<int32_t, NDIM> shape,
-    const  hip::std::array<int64_t, NDIM> strides) {
+    const  std::array<int32_t, NDIM> shape,
+    const  std::array<int64_t, NDIM> strides) {
   // thread block
   // grid group
   IdxT index_rest =
-      blockIdx.y * blockDim.x.y + threadIdx.y;
+      blockIdx.y * blockDim.y + threadIdx.y;
   if (index_rest >= size_rest) {
     return;
   }
@@ -55,7 +55,7 @@ __global__ void copy_g(
   // thread block
   // grid group
   IdxT index_rest =
-      blockIdx.y * blockDim.x.y + threadIdx.y;
+      blockIdx.y * blockDim.y + threadIdx.y;
   if (index_rest >= size_rest) {
     return;
   }
@@ -105,7 +105,7 @@ copy_col_row(const In* in, Out* out, int64_t rows, int64_t cols) {
     }
   }
 
-  block.sync();
+  __syncthreads();
 
   auto out_ptr = out + (tile_row + tidy) * cols + tile_col;
 

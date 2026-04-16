@@ -70,14 +70,14 @@ struct Min {
   template <typename T>
   __device__ __forceinline__ T operator()(T a, T b) {
     if constexpr (is_complex_v<T>) {
-      if (std::isnan(a.real()) || std::isnan(a.imag())) {
+      if (::isnan(a.real()) || ::isnan(a.imag())) {
         return a;
       }
-      if (std::isnan(b.real()) || std::isnan(b.imag())) {
+      if (::isnan(b.real()) || ::isnan(b.imag())) {
         return b;
       }
     } else if constexpr (!std::is_integral_v<T>) {
-      if (std::isnan(a) || std::isnan(b)) {
+      if (::isnan(a) || ::isnan(b)) {
         return std::numeric_limits<float>::quiet_NaN();
       }
     }
@@ -94,14 +94,14 @@ struct Max {
   template <typename T>
   __device__ __forceinline__ T operator()(T a, T b) {
     if constexpr (is_complex_v<T>) {
-      if (std::isnan(a.real()) || std::isnan(a.imag())) {
+      if (::isnan(a.real()) || ::isnan(a.imag())) {
         return a;
       }
-      if (std::isnan(b.real()) || std::isnan(b.imag())) {
+      if (::isnan(b.real()) || ::isnan(b.imag())) {
         return b;
       }
     } else if constexpr (!std::is_integral_v<T>) {
-      if (std::isnan(a) || std::isnan(b)) {
+      if (::isnan(a) || ::isnan(b)) {
         return std::numeric_limits<float>::quiet_NaN();
       }
     }

@@ -28,27 +28,27 @@ __device__ __forceinline__ T nan_value();
 
 template <>
 __device__ __forceinline__ float nan_value<float>() {
-  return hip::std::numeric_limits<float>::quiet_NaN();
+  return std::numeric_limits<float>::quiet_NaN();
 }
 
 template <>
 __device__ __forceinline__ double nan_value<double>() {
-  return hip::std::numeric_limits<double>::quiet_NaN();
+  return std::numeric_limits<double>::quiet_NaN();
 }
 
 template <>
 __device__ __forceinline__ __half nan_value<__half>() {
-  return __float2half(hip::std::numeric_limits<float>::quiet_NaN());
+  return __float2half(std::numeric_limits<float>::quiet_NaN());
 }
 
 template <>
 __device__ __forceinline__ __hip_bfloat16 nan_value<__hip_bfloat16>() {
-  return __float2bfloat16(hip::std::numeric_limits<float>::quiet_NaN());
+  return __float2bfloat16(std::numeric_limits<float>::quiet_NaN());
 }
 
 template <>
 __device__ __forceinline__ complex64_t nan_value<complex64_t>() {
-  float qnan = hip::std::numeric_limits<float>::quiet_NaN();
+  float qnan = std::numeric_limits<float>::quiet_NaN();
   return complex64_t{qnan, qnan};
 }
 
@@ -62,7 +62,7 @@ struct InitValue {
 template <typename T>
 struct InitValue<
     T,
-    hip::std::enable_if_t<is_floating_v<T> || cu::is_complex_v<T>>> {
+    std::enable_if_t<is_floating_v<T> || cu::is_complex_v<T>>> {
   __device__ __forceinline__ static T value() {
     return nan_value<T>();
   }
@@ -78,9 +78,9 @@ __device__ __forceinline__ void thread_swap(T& a, T& b) {
 template <typename T>
 __device__ __forceinline__ bool check_nan(T a) {
   if constexpr (cu::is_complex_v<T>) {
-    return hip::std::isnan(a.real()) || hip::std::isnan(a.imag());
+    return hip::::isnan(a.real()) || hip::::isnan(a.imag());
   } else {
-    return hip::std::isnan(a);
+    return hip::::isnan(a);
   }
 }
 

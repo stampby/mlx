@@ -17,9 +17,9 @@ __global__ void copy_gg_dynamic_nd(
     const In* in,
     Out* out,
     IdxT size,
-    const  hip::std::array<int32_t, NDIM> shape,
-    const  hip::std::array<int64_t, NDIM> strides_in,
-    const  hip::std::array<int64_t, NDIM> strides_out,
+    const  std::array<int32_t, NDIM> shape,
+    const  std::array<int64_t, NDIM> strides_in,
+    const  std::array<int64_t, NDIM> strides_out,
     const int64_t* offset_in,
     const int64_t* offset_out) {
   IdxT index = cg::this_grid().thread_rank();

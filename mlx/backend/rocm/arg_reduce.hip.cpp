@@ -107,7 +107,7 @@ __global__ void arg_reduce_general(
     int32_t axis_size) {
   // thread block
 
-  int64_t index = cg::this_grid().block_rank();
+  int64_t index = blockIdx.x;
   if (index >= size) {
     return;
   }

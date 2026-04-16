@@ -337,7 +337,7 @@ struct Tanh {
 struct ToFP8 {
   template <typename T>
   __device__ uint8_t operator()(T x) {
-    return uint8_t /* fp8 stub */(x).__x;
+    return 0; // fp8 not available on HIP
   }
 };
 

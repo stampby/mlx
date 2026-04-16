@@ -49,7 +49,7 @@ __global__ void unary_g(
   // thread block
   // grid group
   IdxT index_rest =
-      blockIdx.y * blockDim.x.y + threadIdx.y;
+      blockIdx.y * blockDim.y + threadIdx.y;
   if (index_rest >= size_rest) {
     return;
   }
@@ -215,7 +215,6 @@ void unary_op_gpu(
 
 #define UNARY_GPU(func)                                               \
   void func::eval_gpu(const std::vector<array>& inputs, array& out) { \
-    nvtx3::scoped_range r(#func "::eval_gpu");                        \
     auto& s = out.primitive().stream();                               \
     unary_op_gpu<cu::func>(inputs, out, name(), s);                   \
   }

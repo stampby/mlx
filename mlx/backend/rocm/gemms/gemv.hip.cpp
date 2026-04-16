@@ -7,7 +7,7 @@
 #include "mlx/dtype_utils.h"
 
 #include <hip/hip_cooperative_groups.h>
-#include <cooperative_groups/reduce.h>
+// cooperative_groups/reduce.h not on HIP
 
 namespace mlx::core::cu {
 

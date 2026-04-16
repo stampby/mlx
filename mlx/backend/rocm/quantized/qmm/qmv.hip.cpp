@@ -32,7 +32,7 @@ dequant_fma(const T* x, const Q* w, S scale, T bias, T* out) {
   cutlass::NumericArrayConverter<T, Q, N> converter_tq;
   cutlass::Array<T, N> w_dq = converter_tq(w_vec);
   if constexpr (has_bias) {
-    if constexpr (hip::std::is_same_v<T, float>) {
+    if constexpr (std::is_same_v<T, float>) {
 #pragma unroll
       for (int i = 0; i < N; ++i) {
         w_dq[i] = w_dq[i] * T(scale) + bias;
@@ -55,7 +55,7 @@ template <
     typename T,
     typename Q,
     typename S,
-    typename = hip::std::enable_if_t<!hip::std::is_same_v<T, float>>>
+    typename = std::enable_if_t<!std::is_same_v<T, float>>>
 __device__ __forceinline__ void
 dequant_fma(const T* x, const Q* w, S scale, T bias, float* out) {
   // Read x/w into registers.
@@ -74,7 +74,7 @@ dequant_fma(const T* x, const Q* w, S scale, T bias, float* out) {
   }
 
   // Promote x/w to float.
-  static_assert(!hip::std::is_same_v<T, float>);
+  static_assert(!std::is_same_v<T, float>);
   cutlass::NumericArrayConverter<float, T, N> converter_ft;
   cutlass::Array<float, N> x_f = converter_ft(x_vec);
   cutlass::Array<float, N> w_f = converter_ft(w_dq);
@@ -106,7 +106,7 @@ __device__ __forceinline__ void qmv_kernel_impl(
   // For sub-byte Q, pointer moves by 8bits for each advance, e.g. w += 1 would
   // move past 2 elements for 4-bit Q.
   constexpr int bits = cute::sizeof_bits_v<Q>;
-  auto w_step = [&](int idx) { return idx * hip::std::min(8, bits) / 8; };
+  auto w_step = [&](int idx) { return idx * std::min(8, bits) / 8; };
 
   // How many groups (and scales/biases) in a row.
   int groups_per_row = k / group_size;
@@ -119,7 +119,7 @@ __device__ __forceinline__ void qmv_kernel_impl(
   }
 
   // Accumulations of current row.
-  hip::std::conditional_t<(bits >= 8), float, T> sums[elems_per_thread] = {};
+  std::conditional_t<(bits >= 8), float, T> sums[elems_per_thread] = {};
 
   auto dequant_fma_tile = [&](int idx) {
     S scale = scales[idx / group_size];

@@ -39,7 +39,7 @@ struct FusedKernelBuilder {
       if (!is_scalar(x) && !contiguous) {
         params.push_back(
             fmt::format(
-                "const  hip::std::array<int64_t, NDIM> {}_strides",
+                "const  std::array<int64_t, NDIM> {}_strides",
                 xname));
       }
     }
@@ -50,7 +50,7 @@ struct FusedKernelBuilder {
     }
     if (!contiguous) {
       params.push_back(
-          "const  hip::std::array<int32_t, NDIM> shape");
+          "const  std::array<int32_t, NDIM> shape");
     }
     params.push_back("IdxT size");
 
@@ -222,7 +222,7 @@ constexpr const char* g_jit_includes = R"(
 
 #include <hip/hip_cooperative_groups.h>
 
-#define inf hip::std::numeric_limits<float>::infinity()
+#define inf std::numeric_limits<float>::infinity()
 )";
 
 void Compiled::eval_gpu(

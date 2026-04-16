@@ -47,7 +47,7 @@ struct Remainder {
     } else if constexpr (is_complex_v<T>) {
       return x % y;
     } else {
-      T r = std::fmod(x, y);
+      T r = fmodf((float)x, (float)y);
       if (r != 0 && (r < 0 != y < 0)) {
         r = r + y;
       }
@@ -66,7 +66,7 @@ struct Equal {
 struct NaNEqual {
   template <typename T>
   __device__ bool operator()(T x, T y) {
-    using std::isnan;
+    using ::isnan;
     if constexpr (is_complex_v<T>) {
       return x == y ||
           (isnan(x.real()) && isnan(y.real()) && isnan(x.imag()) &&
@@ -74,7 +74,7 @@ struct NaNEqual {
           (x.real() == y.real() && isnan(x.imag()) && isnan(y.imag())) ||
           (isnan(x.real()) && isnan(y.real()) && x.imag() == y.imag());
     } else {
-      return x == y || (isnan(x) && isnan(y));
+      return x == y || (::isnan((float)x) && ::isnan((float)y));
     }
   }
 };
@@ -111,8 +111,8 @@ struct LogAddExp {
   template <typename T>
   __device__ T operator()(T x, T y) {
     if constexpr (is_complex_v<T>) {
-      if (std::isnan(x.real()) || std::isnan(x.imag()) ||
-          std::isnan(y.real()) || std::isnan(y.imag())) {
+      if (::isnan((float)x.real()) || ::isnan((float)x.imag()) ||
+          ::isnan((float)y.real()) || ::isnan((float)y.imag())) {
         return {
             std::numeric_limits<float>::quiet_NaN(),
             std::numeric_limits<float>::quiet_NaN()};
@@ -121,7 +121,7 @@ struct LogAddExp {
       auto min = x.real() < y.real() ? x : y;
       auto min_real = min.real();
       auto max_real = max.real();
-      if (!std::isfinite(min_real) && (min_real == max_real)) {
+      if (!::isfinite(min_real) && (min_real == max_real)) {
         if (min_real < 0) {
           return min;
         } else {
@@ -131,15 +131,15 @@ struct LogAddExp {
         return Log1p{}(Exp{}(min - max)) + max;
       }
     } else {
-      if (std::isnan(x) || std::isnan(y)) {
+      if (::isnan((float)x) || ::isnan((float)y)) {
         return std::numeric_limits<T>::quiet_NaN();
       }
-      T maxval = max(x, y);
-      T minval = min(x, y);
+      T maxval = (x > y) ? x : y;
+      T minval = (x < y) ? x : y;
       return (minval == -std::numeric_limits<T>::infinity() ||
               maxval == std::numeric_limits<T>::infinity())
           ? maxval
-          : T(maxval + std::log1p(std::exp(minval - maxval)));
+          : T((float)maxval + ::log1p(::exp((float)minval - (float)maxval)));
     }
   };
 };
@@ -148,14 +148,14 @@ struct Maximum {
   template <typename T>
   __device__ T operator()(T x, T y) {
     if constexpr (std::is_integral_v<T>) {
-      return max(x, y);
+      return (x > y) ? x : y;
     } else if constexpr (is_complex_v<T>) {
-      if (std::isnan(x.real()) || std::isnan(x.imag())) {
+      if (::isnan((float)x.real()) || ::isnan((float)x.imag())) {
         return x;
       }
       return x > y ? x : y;
     } else {
-      if (std::isnan(x)) {
+      if (::isnan((float)x)) {
         return x;
       }
       return x > y ? x : y;
@@ -167,14 +167,14 @@ struct Minimum {
   template <typename T>
   __device__ T operator()(T x, T y) {
     if constexpr (std::is_integral_v<T>) {
-      return min(x, y);
+      return (x < y) ? x : y;
     } else if constexpr (is_complex_v<T>) {
-      if (std::isnan(x.real()) || std::isnan(x.imag())) {
+      if (::isnan((float)x.real()) || ::isnan((float)x.imag())) {
         return x;
       }
       return x < y ? x : y;
     } else {
-      if (std::isnan(x)) {
+      if (::isnan((float)x)) {
         return x;
       }
       return x < y ? x : y;
@@ -222,7 +222,7 @@ struct Power {
     } else if constexpr (is_complex_v<T>) {
       return std::pow(base, exp);
     } else {
-      return std::pow(base, exp);
+      return T(powf((float)base, (float)exp));
     }
   }
 };
@@ -286,7 +286,7 @@ struct RightShift {
 struct ArcTan2 {
   template <typename T>
   __device__ T operator()(T y, T x) {
-    return std::atan2(y, x);
+    return atan2f((float)y, (float)x);
   }
 };
 

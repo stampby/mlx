@@ -17,13 +17,13 @@ __global__ void copy_gg_nd(
     const In* in,
     Out* out,
     IdxT size_rest,
-    const  hip::std::array<int32_t, NDIM> shape,
-    const  hip::std::array<int64_t, NDIM> strides_in,
-    const  hip::std::array<int64_t, NDIM> strides_out) {
+    const  std::array<int32_t, NDIM> shape,
+    const  std::array<int64_t, NDIM> strides_in,
+    const  std::array<int64_t, NDIM> strides_out) {
   // thread block
   // grid group
   IdxT index_rest =
-      blockIdx.y * blockDim.x.y + threadIdx.y;
+      blockIdx.y * blockDim.y + threadIdx.y;
   if (index_rest >= size_rest) {
     return;
   }
@@ -61,7 +61,7 @@ __global__ void copy_gg(
   // thread block
   // grid group
   IdxT index_rest =
-      blockIdx.y * blockDim.x.y + threadIdx.y;
+      blockIdx.y * blockDim.y + threadIdx.y;
   if (index_rest >= size_rest) {
     return;
   }

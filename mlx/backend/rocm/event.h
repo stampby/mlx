@@ -9,7 +9,7 @@
 #include <memory>
 
 #include <hip/hip_runtime.h>
-#include <hip/atomic>
+#include <atomic>
 
 namespace mlx::core::cu {
 

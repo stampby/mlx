@@ -22,7 +22,7 @@ constexpr const char* default_header = R"(
 
 #include <hip/hip_cooperative_groups.h>
 
-#define inf hip::std::numeric_limits<float>::infinity()
+#define inf std::numeric_limits<float>::infinity()
 
 )";
 

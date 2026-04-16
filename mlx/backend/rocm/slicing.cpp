@@ -68,7 +68,7 @@ array compute_dynamic_offset(
             const T* indices,
             int64_t* offset,
             const  Strides strides,
-            const  hip::std::array<int, NIDX> axes) {
+            const  std::array<int, NIDX> axes) {
           int64_t acc = 0;
           #pragma unroll
           for (int i = 0; i < NIDX; ++i) {

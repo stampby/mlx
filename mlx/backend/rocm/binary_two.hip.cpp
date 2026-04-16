@@ -142,13 +142,13 @@ __global__ void binary_two_g_nd(
     Out* out_a,
     Out* out_b,
     IdxT size_rest,
-    const  hip::std::array<int32_t, NDIM> shape,
-    const  hip::std::array<int64_t, NDIM> a_strides,
-    const  hip::std::array<int64_t, NDIM> b_strides) {
+    const  std::array<int32_t, NDIM> shape,
+    const  std::array<int64_t, NDIM> a_strides,
+    const  std::array<int64_t, NDIM> b_strides) {
   // thread block
   // grid group
   IdxT index_rest =
-      blockIdx.y * blockDim.x.y + threadIdx.y;
+      blockIdx.y * blockDim.y + threadIdx.y;
   if (index_rest >= size_rest) {
     return;
   }
@@ -191,7 +191,7 @@ __global__ void binary_two_g(
   // thread block
   // grid group
   IdxT index_rest =
-      blockIdx.y * blockDim.x.y + threadIdx.y;
+      blockIdx.y * blockDim.y + threadIdx.y;
   if (index_rest >= size_rest) {
     return;
   }

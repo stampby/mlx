@@ -86,8 +86,8 @@ class CudaStream : public CudaHandle<hipStream_t, hipStreamDestroy> {
 // Utility functions (replaces cuda:: namespace from CCCL)
 namespace mlx::core::rocm {
 
-template <typename T>
-constexpr T ceil_div(T a, T b) {
+template <typename T, typename U = T>
+constexpr auto ceil_div(T a, U b) -> decltype(a + b) {
     return (a + b - 1) / b;
 }
 

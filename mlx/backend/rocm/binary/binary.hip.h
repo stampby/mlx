@@ -136,7 +136,7 @@ __global__ void binary_g_nd(
   // thread block
   // grid group
   IdxT index_rest =
-      blockIdx.y * blockDim.x.y + threadIdx.y;
+      blockIdx.y * blockDim.y + threadIdx.y;
   if (index_rest >= size_rest) {
     return;
   }
@@ -174,7 +174,7 @@ __global__ void binary_g(
   // thread block
   // grid group
   IdxT index_rest =
-      blockIdx.y * blockDim.x.y + threadIdx.y;
+      blockIdx.y * blockDim.y + threadIdx.y;
   if (index_rest >= size_rest) {
     return;
   }
@@ -396,7 +396,6 @@ void binary_op_gpu(
 
 #define BINARY_GPU(func)                                              \
   void func::eval_gpu(const std::vector<array>& inputs, array& out) { \
-    nvtx3::scoped_range r(#func "::eval_gpu");                        \
     auto& s = out.primitive().stream();                               \
     binary_op_gpu<cu::func>(inputs, out, name(), s);                  \
   }
