@@ -1,3 +1,4 @@
+#include "mlx/backend/rocm/rocm_utils.h"
 #include "hip/hip_runtime.h"
 // Copyright © 2025 Apple Inc.
 
@@ -172,7 +173,7 @@ void CublasGemm::run_batched(
   encoder.set_output_array(pointers);
 
   int block_dims = std::min(batch_count, 256);
-  int num_blocks = hip::ceil_div(batch_count, block_dims);
+  int num_blocks = mlx::core::rocm::ceil_div(batch_count, block_dims);
   int64_t batch_stride = M_ * N_;
   int item_size = out.itemsize();
 
@@ -258,7 +259,7 @@ void CublasGemm::run_batched(
   encoder.set_output_array(pointers);
 
   int block_dims = std::min(batch_count, 256);
-  int num_blocks = hip::ceil_div(batch_count, block_dims);
+  int num_blocks = mlx::core::rocm::ceil_div(batch_count, block_dims);
   int64_t batch_stride = M_ * N_;
   int item_size = out.itemsize();
 

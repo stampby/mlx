@@ -46,10 +46,10 @@ __global__ void unary_g(
     const  Shape shape,
     const  Strides strides,
     int ndim) {
-  auto block = cg::this_thread_block();
-  auto grid = cg::this_grid();
+  // thread block
+  // grid group
   IdxT index_rest =
-      grid.group_index().y * block.size().y + block.thread_index().y;
+      blockIdx.y * blockDim.x.y + threadIdx.y;
   if (index_rest >= size_rest) {
     return;
   }
@@ -57,7 +57,7 @@ __global__ void unary_g(
   auto shape_x = shape[ndim - 1];
   auto stride_x = strides[ndim - 1];
   IdxT index_x =
-      grid.group_index().x * block.size().x + block.thread_index().x;
+      blockIdx.x * blockDim.x + threadIdx.x;
   auto idx =
       elem_to_loc(index_rest * shape_x, shape.data(), strides.data(), ndim);
   auto in_vec =
@@ -175,8 +175,8 @@ void unary_op_gpu_inplace(
             }
             dim0 = (dim0 + work_per_thread - 1) / work_per_thread;
             auto block_dims = get_block_dims(dim0, rest, 1);
-            uint32_t num_blocks_x = cuda::ceil_div(dim0, block_dims.x);
-            uint32_t num_blocks_y = cuda::ceil_div(rest, block_dims.y);
+            uint32_t num_blocks_x = mlx::core::rocm::ceil_div(dim0, block_dims.x);
+            uint32_t num_blocks_y = mlx::core::rocm::ceil_div(rest, block_dims.y);
             encoder.add_kernel_node(
                 kernel,
                 {num_blocks_x, num_blocks_y},

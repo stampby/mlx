@@ -1,3 +1,4 @@
+#include "mlx/backend/rocm/rocm_utils.h"
 #include "hip/hip_runtime.h"
 // Copyright © 2025 Apple Inc.
 
@@ -19,10 +20,10 @@ __global__ void copy_gg_nd(
     const  hip::std::array<int32_t, NDIM> shape,
     const  hip::std::array<int64_t, NDIM> strides_in,
     const  hip::std::array<int64_t, NDIM> strides_out) {
-  auto block = cg::this_thread_block();
-  auto grid = cg::this_grid();
+  // thread block
+  // grid group
   IdxT index_rest =
-      grid.group_index().y * block.size().y + block.thread_index().y;
+      blockIdx.y * blockDim.x.y + threadIdx.y;
   if (index_rest >= size_rest) {
     return;
   }
@@ -31,7 +32,7 @@ __global__ void copy_gg_nd(
   auto in_stride_x = strides_in[NDIM - 1];
   auto out_stride_x = strides_out[NDIM - 1];
   IdxT index_x =
-      grid.group_index().x * block.size().x + block.thread_index().x;
+      blockIdx.x * blockDim.x + threadIdx.x;
   auto [idx_in, idx_out] = elem_to_loc_nd<NDIM>(
       index_rest * shape_x,
       shape.data(),
@@ -57,10 +58,10 @@ __global__ void copy_gg(
     const  Strides strides_in,
     const  Strides strides_out,
     int ndim) {
-  auto block = cg::this_thread_block();
-  auto grid = cg::this_grid();
+  // thread block
+  // grid group
   IdxT index_rest =
-      grid.group_index().y * block.size().y + block.thread_index().y;
+      blockIdx.y * blockDim.x.y + threadIdx.y;
   if (index_rest >= size_rest) {
     return;
   }
@@ -69,7 +70,7 @@ __global__ void copy_gg(
   auto in_stride_x = strides_in[ndim - 1];
   auto out_stride_x = strides_out[ndim - 1];
   IdxT index_x =
-      grid.group_index().x * block.size().x + block.thread_index().x;
+      blockIdx.x * blockDim.x + threadIdx.x;
   auto [idx_in, idx_out] = elem_to_loc(
       index_rest * shape_x,
       shape.data(),
@@ -123,8 +124,8 @@ void copy_general(
 
             dim0 = (dim0 + work_per_thread - 1) / work_per_thread;
             auto block_dims = get_block_dims(dim0, rest, 1);
-            uint32_t num_blocks_x = hip::ceil_div(dim0, block_dims.x);
-            uint32_t num_blocks_y = hip::ceil_div(rest, block_dims.y);
+            uint32_t num_blocks_x = mlx::core::rocm::ceil_div(dim0, block_dims.x);
+            uint32_t num_blocks_y = mlx::core::rocm::ceil_div(rest, block_dims.y);
 
             if (ndim <= 3) {
               dispatch_1_2_3(ndim, [&](auto ndim_constant) {

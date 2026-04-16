@@ -1,3 +1,4 @@
+#include "mlx/backend/rocm/rocm_utils.h"
 // Copyright © 2025 Apple Inc.
 
 #include "mlx/backend/common/utils.h"
@@ -37,14 +38,14 @@ std::tuple<dim3, uint32_t> get_launch_args(
     bool large,
     int work_per_thread /* = 1 */,
     uint32_t max_block_dim /* = 1024 */) {
-  size_t nthreads = hip::ceil_div(size, work_per_thread);
+  size_t nthreads = mlx::core::rocm::ceil_div(size, work_per_thread);
   uint32_t block_dim = max_block_dim < nthreads ? max_block_dim : nthreads;
   dim3 num_blocks;
   if (large) {
     num_blocks = get_2d_grid_dims(shape, strides, work_per_thread);
-    num_blocks.x = hip::ceil_div(num_blocks.x, block_dim);
+    num_blocks.x = mlx::core::rocm::ceil_div(num_blocks.x, block_dim);
   } else {
-    num_blocks.x = hip::ceil_div(nthreads, block_dim);
+    num_blocks.x = mlx::core::rocm::ceil_div(nthreads, block_dim);
   }
   return std::make_tuple(num_blocks, block_dim);
 }

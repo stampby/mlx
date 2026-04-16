@@ -1,3 +1,4 @@
+#include "mlx/backend/rocm/rocm_utils.h"
 #include "hip/hip_runtime.h"
 // Copyright © 2025 Apple Inc.
 
@@ -51,7 +52,7 @@ __global__ void rbitsc(
     dim3 grid_dims,
     bool odd,
     uint32_t bytes_per_key) {
-  auto grid = cg::this_grid();
+  // grid group
   uint32_t thread_index = grid.thread_rank();
   uint32_t index_x = thread_index % grid_dims.x;
   uint32_t index_y = thread_index / grid_dims.x;
@@ -94,7 +95,7 @@ __global__ void rbits(
     int32_t ndim,
     const  Shape key_shape,
     const  Strides key_strides) {
-  auto grid = cg::this_grid();
+  // grid group
   uint32_t thread_index = grid.thread_rank();
   uint32_t index_x = thread_index % grid_dims.x;
   uint32_t index_y = thread_index / grid_dims.x;
@@ -166,7 +167,7 @@ void RandomBits::eval_gpu(const std::vector<array>& inputs, array& out) {
   while ((total / threads_y) >= UINT_MAX) {
     threads_y *= 2;
   }
-  uint32_t threads_x = hip::ceil_div(total, threads_y);
+  uint32_t threads_x = mlx::core::rocm::ceil_div(total, threads_y);
 
   dim3 grid_dims{
       static_cast<uint32_t>(num_keys), static_cast<uint32_t>(half_size + odd)};

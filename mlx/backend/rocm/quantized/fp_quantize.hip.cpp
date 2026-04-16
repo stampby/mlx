@@ -1,3 +1,4 @@
+#include "mlx/backend/rocm/rocm_utils.h"
 #include "hip/hip_runtime.h"
 // Copyright © 2025 Apple Inc.
 
@@ -400,7 +401,7 @@ get_columnwise_quantize_launch_args(size_t size, int group_size, int M, int K) {
 
   dim3 grid;
   grid.x =
-      hip::ceil_div(K, cols_per_block) * hip::ceil_div(M, rows_per_block);
+      mlx::core::rocm::ceil_div(K, cols_per_block) * mlx::core::rocm::ceil_div(M, rows_per_block);
   grid.y = 1;
   grid.z = 1;
 

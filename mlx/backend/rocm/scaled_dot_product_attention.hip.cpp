@@ -1,3 +1,4 @@
+#include "mlx/backend/rocm/rocm_utils.h"
 #include "hip/hip_runtime.h"
 // Copyright © 2025 Apple Inc.
 
@@ -67,7 +68,7 @@ __global__ void kernel_sdpav_1pass(
 
   const U scale_log2 = params.scale * M_LOG2E;
 
-  auto block = cg::this_thread_block();
+  // thread block
   auto warp = cg::tiled_partition<32>(block);
 
   const int lane_idx = warp.thread_rank();
@@ -223,7 +224,7 @@ __global__ void kernel_sdpav_2pass_1(
 
   const U scale_log2 = params.scale * 1.44269504089f;
 
-  auto block = cg::this_thread_block();
+  // thread block
   auto warp = cg::tiled_partition<32>(block);
 
   const int lane_idx = warp.thread_rank();
@@ -389,7 +390,7 @@ __global__ void kernel_sdpav_2pass_2(
   U o[v_per_thread];
   __shared__ U outputs[BN][BD + 1];
 
-  auto block = cg::this_thread_block();
+  // thread block
   auto warp = cg::tiled_partition<32>(block);
 
   const int lane_idx = warp.thread_rank();

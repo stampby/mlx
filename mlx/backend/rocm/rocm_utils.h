@@ -82,3 +82,13 @@ class CudaStream : public CudaHandle<hipStream_t, hipStreamDestroy> {
 };
 
 } // namespace mlx::core
+
+// Utility functions (replaces cuda:: namespace from CCCL)
+namespace mlx::core::rocm {
+
+template <typename T>
+constexpr T ceil_div(T a, T b) {
+    return (a + b - 1) / b;
+}
+
+} // namespace mlx::core::rocm

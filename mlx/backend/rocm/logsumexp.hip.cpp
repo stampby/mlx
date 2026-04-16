@@ -1,3 +1,4 @@
+#include "mlx/backend/rocm/rocm_utils.h"
 #include "hip/hip_runtime.h"
 // Copyright © 2025 Apple Inc.
 
@@ -11,7 +12,7 @@
 #include <hip/hip_cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 // NVTX not available on ROCm — profiling markers disabled
-#include <hipcub/block/block_load.hip.h>
+#include <hipcub/hipcub.hpp>
 
 #include <cassert>
 
@@ -30,11 +31,11 @@ inline __device__ T softmax_exp(T x) {
 
 template <typename T, typename AccT, int BLOCK_DIM, int N_READS = 4>
 __global__ void logsumexp(const T* in, T* out, int axis_size) {
-  auto grid = cg::this_grid();
-  auto block = cg::this_thread_block();
+  // grid group
+  // thread block
   auto warp = cg::tiled_partition<WARP_SIZE>(block);
 
-  in += grid.block_rank() * axis_size;
+  in += blockIdx.x * axis_size;
 
   cg::greater<AccT> max_op;
   cg::plus<AccT> plus_op;
@@ -43,8 +44,8 @@ __global__ void logsumexp(const T* in, T* out, int axis_size) {
   AccT prevmax;
   AccT maxval = Limits<AccT>::finite_min();
   AccT normalizer = 0;
-  for (int r = 0; r < hip::ceil_div(axis_size, BLOCK_DIM * N_READS); r++) {
-    auto index = r * BLOCK_DIM + block.thread_rank();
+  for (int r = 0; r < mlx::core::rocm::ceil_div(axis_size, BLOCK_DIM * N_READS); r++) {
+    auto index = r * BLOCK_DIM + threadIdx.x;
     auto vals = load_vector<N_READS>(in, index, axis_size, Limits<T>::min());
     prevmax = maxval;
 #pragma unroll
@@ -90,8 +91,8 @@ __global__ void logsumexp(const T* in, T* out, int axis_size) {
   normalizer = cg::reduce(warp, normalizer, plus_op);
 
   // Write output.
-  if (block.thread_rank() == 0) {
-    out[grid.block_rank()] = isinf(maxval) ? maxval : log(normalizer) + maxval;
+  if (threadIdx.x == 0) {
+    out[blockIdx.x] = isinf(maxval) ? maxval : log(normalizer) + maxval;
   }
 }
 
@@ -145,7 +146,7 @@ void LogSumExp::eval_gpu(const std::vector<array>& inputs, array& out) {
   dispatch_float_types(out.dtype(), "logsumexp", [&](auto type_tag) {
     using DataType = cuda_type_t<MLX_GET_TYPE(type_tag)>;
     constexpr int N_READS = 16 / sizeof(DataType);
-    dispatch_block_dim(hip::ceil_div(axis_size, N_READS), [&](auto block_dim) {
+    dispatch_block_dim(mlx::core::rocm::ceil_div(axis_size, N_READS), [&](auto block_dim) {
       auto kernel = cu::logsumexp<DataType, float, block_dim(), N_READS>;
       encoder.add_kernel_node(
           kernel,

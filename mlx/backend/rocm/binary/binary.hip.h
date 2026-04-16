@@ -133,10 +133,10 @@ __global__ void binary_g_nd(
     const  std::array<int32_t, NDIM> shape,
     const  std::array<int64_t, NDIM> a_strides,
     const  std::array<int64_t, NDIM> b_strides) {
-  auto block = cg::this_thread_block();
-  auto grid = cg::this_grid();
+  // thread block
+  // grid group
   IdxT index_rest =
-      grid.group_index().y * block.size().y + block.thread_index().y;
+      blockIdx.y * blockDim.x.y + threadIdx.y;
   if (index_rest >= size_rest) {
     return;
   }
@@ -145,7 +145,7 @@ __global__ void binary_g_nd(
   auto a_stride_x = a_strides[NDIM - 1];
   auto b_stride_x = b_strides[NDIM - 1];
   IdxT index_x =
-      grid.group_index().x * block.size().x + block.thread_index().x;
+      blockIdx.x * blockDim.x + threadIdx.x;
   auto [a_idx, b_idx] = elem_to_loc_nd<NDIM>(
       index_rest * shape_x, shape.data(), a_strides.data(), b_strides.data());
   auto a_vec =
@@ -171,10 +171,10 @@ __global__ void binary_g(
     const  Strides a_strides,
     const  Strides b_strides,
     int ndim) {
-  auto block = cg::this_thread_block();
-  auto grid = cg::this_grid();
+  // thread block
+  // grid group
   IdxT index_rest =
-      grid.group_index().y * block.size().y + block.thread_index().y;
+      blockIdx.y * blockDim.x.y + threadIdx.y;
   if (index_rest >= size_rest) {
     return;
   }
@@ -183,7 +183,7 @@ __global__ void binary_g(
   auto a_stride_x = a_strides[ndim - 1];
   auto b_stride_x = b_strides[ndim - 1];
   IdxT index_x =
-      grid.group_index().x * block.size().x + block.thread_index().x;
+      blockIdx.x * blockDim.x + threadIdx.x;
   auto [a_idx, b_idx] = elem_to_loc(
       index_rest * shape_x,
       shape.data(),
@@ -286,8 +286,8 @@ void binary_op_gpu_inplace(
                 }
                 dim0 = (dim0 + work_per_thread - 1) / work_per_thread;
                 auto block_dims = get_block_dims(dim0, rest, 1);
-                uint32_t num_blocks_x = cuda::ceil_div(dim0, block_dims.x);
-                uint32_t num_blocks_y = cuda::ceil_div(rest, block_dims.y);
+                uint32_t num_blocks_x = mlx::core::rocm::ceil_div(dim0, block_dims.x);
+                uint32_t num_blocks_y = mlx::core::rocm::ceil_div(rest, block_dims.y);
                 if (ndim <= 3) {
                   dispatch_1_2_3(ndim, [&](auto dims_constant) {
                     auto kernel = cu::binary_g_nd<

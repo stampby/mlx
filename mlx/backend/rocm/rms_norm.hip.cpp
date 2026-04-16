@@ -1,3 +1,4 @@
+#include "mlx/backend/rocm/rocm_utils.h"
 #include "hip/hip_runtime.h"
 // Copyright © 2025 Apple Inc.
 
@@ -61,14 +62,14 @@ __global__ void rms_norm_small(
     uint32_t axis_size,
     uint32_t n_rows,
     int64_t w_stride) {
-  auto grid = cg::this_grid();
-  auto block = cg::this_thread_block();
+  // grid group
+  // thread block
 
   using BlockReduceT = BlockBroadcastReduce<float, BLOCK_DIM, REDUCE_DIM>;
   __shared__ typename BlockReduceT::TempStorage temp;
 
   auto row =
-      (grid.block_rank() * block.size().y) + block.thread_index().y;
+      (blockIdx.x * blockDim.x.y) + threadIdx.y;
   if (row >= n_rows) {
     return;
   }
@@ -77,7 +78,7 @@ __global__ void rms_norm_small(
 
   // Normalizer.
   float normalizer = 0;
-  auto index = block.thread_index().x;
+  auto index = threadIdx.x;
   auto xn = load_vector<N_READS>(x, index, axis_size, T(0));
 #pragma unroll
   for (int i = 0; i < N_READS; ++i) {
@@ -106,19 +107,19 @@ __global__ void rms_norm(
     float eps,
     uint32_t axis_size,
     int64_t w_stride) {
-  auto grid = cg::this_grid();
-  auto block = cg::this_thread_block();
+  // grid group
+  // thread block
 
   using BlockReduceT = BlockBroadcastReduce<float, BLOCK_DIM>;
   __shared__ typename BlockReduceT::TempStorage temp;
 
-  x += grid.block_rank() * axis_size;
-  out += grid.block_rank() * axis_size;
+  x += blockIdx.x * axis_size;
+  out += blockIdx.x * axis_size;
 
   // Normalizer.
   float normalizer = 0;
-  for (int r = 0; r < hip::ceil_div(axis_size, BLOCK_DIM * N_READS); ++r) {
-    auto index = r * BLOCK_DIM + block.thread_rank();
+  for (int r = 0; r < mlx::core::rocm::ceil_div(axis_size, BLOCK_DIM * N_READS); ++r) {
+    auto index = r * BLOCK_DIM + threadIdx.x;
     auto xn = load_vector<N_READS>(x, index, axis_size, T(0));
 #pragma unroll
     for (int i = 0; i < N_READS; ++i) {
@@ -130,8 +131,8 @@ __global__ void rms_norm(
   normalizer = rsqrt(normalizer / axis_size + eps);
 
   // Outputs.
-  for (int r = 0; r < hip::ceil_div(axis_size, BLOCK_DIM * N_READS); ++r) {
-    auto index = r * BLOCK_DIM + block.thread_rank();
+  for (int r = 0; r < mlx::core::rocm::ceil_div(axis_size, BLOCK_DIM * N_READS); ++r) {
+    auto index = r * BLOCK_DIM + threadIdx.x;
     auto xn = load_vector<N_READS>(x, index, axis_size, T(0));
     auto wn = load_vector<N_READS>(w, index, axis_size, w_stride, T(0));
 #pragma unroll
@@ -159,14 +160,14 @@ __global__ void rms_norm_vjp_small(
     int32_t axis_size,
     int32_t n_rows,
     int64_t w_stride) {
-  auto grid = cg::this_grid();
-  auto block = cg::this_thread_block();
+  // grid group
+  // thread block
 
   using BlockReduceF2 = BlockBroadcastReduce<float2, BLOCK_DIM, REDUCE_DIM>;
   __shared__ typename BlockReduceF2::TempStorage temp;
 
   auto row =
-      (grid.block_rank() * block.size().y) + block.thread_index().y;
+      (blockIdx.x * blockDim.x.y) + threadIdx.y;
   if (row >= n_rows) {
     return;
   }
@@ -178,7 +179,7 @@ __global__ void rms_norm_vjp_small(
 
   // Normalizer.
   float2 factors = {};
-  auto index = block.thread_index().x;
+  auto index = threadIdx.x;
   auto xn = load_vector<N_READS>(x, index, axis_size, T(0));
   auto gn = load_vector<N_READS>(g, index, axis_size, T(0));
   auto wn = load_vector<N_READS>(w, index, axis_size, w_stride, T(0));
@@ -221,21 +222,21 @@ __global__ void rms_norm_vjp(
     float eps,
     int32_t axis_size,
     int64_t w_stride) {
-  auto grid = cg::this_grid();
-  auto block = cg::this_thread_block();
+  // grid group
+  // thread block
 
   using BlockReduceF2 = BlockBroadcastReduce<float2, BLOCK_DIM>;
   __shared__ typename BlockReduceF2::TempStorage temp;
 
-  x += grid.block_rank() * axis_size;
-  g += grid.block_rank() * axis_size;
-  gx += grid.block_rank() * axis_size;
-  gw += grid.block_rank() * axis_size;
+  x += blockIdx.x * axis_size;
+  g += blockIdx.x * axis_size;
+  gx += blockIdx.x * axis_size;
+  gw += blockIdx.x * axis_size;
 
   // Normalizer.
   float2 factors = {};
-  for (int r = 0; r < hip::ceil_div(axis_size, BLOCK_DIM * N_READS); ++r) {
-    auto index = r * BLOCK_DIM + block.thread_rank();
+  for (int r = 0; r < mlx::core::rocm::ceil_div(axis_size, BLOCK_DIM * N_READS); ++r) {
+    auto index = r * BLOCK_DIM + threadIdx.x;
     auto xn = load_vector<N_READS>(x, index, axis_size, T(0));
     auto gn = load_vector<N_READS>(g, index, axis_size, T(0));
     auto wn = load_vector<N_READS>(w, index, axis_size, w_stride, T(0));
@@ -253,8 +254,8 @@ __global__ void rms_norm_vjp(
   float normalizer3 = normalizer * normalizer * normalizer;
 
   // Outputs.
-  for (int r = 0; r < hip::ceil_div(axis_size, BLOCK_DIM * N_READS); ++r) {
-    auto index = r * BLOCK_DIM + block.thread_rank();
+  for (int r = 0; r < mlx::core::rocm::ceil_div(axis_size, BLOCK_DIM * N_READS); ++r) {
+    auto index = r * BLOCK_DIM + threadIdx.x;
     auto xn = load_vector<N_READS>(x, index, axis_size, T(0));
     auto gn = load_vector<N_READS>(g, index, axis_size, T(0));
     auto wn = load_vector<N_READS>(w, index, axis_size, w_stride, T(0));

@@ -1,3 +1,4 @@
+#include "mlx/backend/rocm/rocm_utils.h"
 #include "hip/hip_runtime.h"
 // Copyright © 2025 Apple Inc.
 
@@ -30,12 +31,12 @@ inline __device__ T softmax_exp(T x) {
 
 template <typename T, typename AccT, int BLOCK_DIM, int N_READS = 4>
 __global__ void softmax(const T* in, T* out, int axis_size) {
-  auto grid = cg::this_grid();
-  auto block = cg::this_thread_block();
+  // grid group
+  // thread block
   auto warp = cg::tiled_partition<WARP_SIZE>(block);
 
-  in += grid.block_rank() * axis_size;
-  out += grid.block_rank() * axis_size;
+  in += blockIdx.x * axis_size;
+  out += blockIdx.x * axis_size;
 
   cg::greater<AccT> max_op;
   cg::plus<AccT> plus_op;
@@ -44,8 +45,8 @@ __global__ void softmax(const T* in, T* out, int axis_size) {
   AccT prevmax;
   AccT maxval = Limits<AccT>::finite_min();
   AccT normalizer = cast_to<AccT>(0);
-  for (int r = 0; r < hip::ceil_div(axis_size, BLOCK_DIM * N_READS); r++) {
-    auto index = r * BLOCK_DIM + block.thread_rank();
+  for (int r = 0; r < mlx::core::rocm::ceil_div(axis_size, BLOCK_DIM * N_READS); r++) {
+    auto index = r * BLOCK_DIM + threadIdx.x;
     auto vals = load_vector<N_READS>(in, index, axis_size, Limits<T>::min());
     prevmax = maxval;
 #pragma unroll
@@ -94,8 +95,8 @@ __global__ void softmax(const T* in, T* out, int axis_size) {
   normalizer = 1 / normalizer;
 
   // Write output.
-  for (int r = 0; r < hip::ceil_div(axis_size, BLOCK_DIM * N_READS); r++) {
-    auto index = r * BLOCK_DIM + block.thread_rank();
+  for (int r = 0; r < mlx::core::rocm::ceil_div(axis_size, BLOCK_DIM * N_READS); r++) {
+    auto index = r * BLOCK_DIM + threadIdx.x;
     auto vals = load_vector<N_READS>(in, index, axis_size, T(0));
     for (int i = 0; i < N_READS; i++) {
       vals[i] = softmax_exp(static_cast<AccT>(vals[i]) - maxval) * normalizer;
@@ -143,7 +144,7 @@ void Softmax::eval_gpu(const std::vector<array>& inputs, array& out) {
   dispatch_float_types(out.dtype(), "softmax", [&](auto type_tag) {
     using DataType = cuda_type_t<MLX_GET_TYPE(type_tag)>;
     constexpr int N_READS = 16 / sizeof(DataType);
-    dispatch_block_dim(hip::ceil_div(axis_size, N_READS), [&](auto block_dim) {
+    dispatch_block_dim(mlx::core::rocm::ceil_div(axis_size, N_READS), [&](auto block_dim) {
       auto kernel = cu::softmax<DataType, DataType, block_dim(), N_READS>;
       if (precise) {
         kernel = cu::softmax<DataType, float, block_dim(), N_READS>;

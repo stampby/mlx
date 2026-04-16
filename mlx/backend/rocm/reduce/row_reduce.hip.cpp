@@ -1,3 +1,4 @@
+#include "mlx/backend/rocm/rocm_utils.h"
 #include "hip/hip_runtime.h"
 // Copyright © 2025 Apple Inc.
 
@@ -84,8 +85,8 @@ struct RowReduceArgs {
 template <typename T, typename U, typename ReduceOp, int N = 4, int M = 1>
 __global__ void
 row_reduce_simple(const T* in, U* out, size_t n_rows, int size) {
-  auto grid = cg::this_grid();
-  auto block = cg::this_thread_block();
+  // grid group
+  // thread block
   auto warp = cg::tiled_partition<WARP_SIZE>(block);
 
   const U init = cu::ReduceInit<ReduceOp, T>::value();
@@ -98,10 +99,10 @@ row_reduce_simple(const T* in, U* out, size_t n_rows, int size) {
   }
 
   const size_t start_row =
-      min(n_rows - M, static_cast<size_t>(grid.block_rank() * M));
-  const size_t full_blocks = size / (block.size() * N);
-  const size_t final_offset = full_blocks * (block.size() * N);
-  in += start_row * size + block.thread_rank() * N;
+      min(n_rows - M, static_cast<size_t>(blockIdx.x * M));
+  const size_t full_blocks = size / (blockDim.x * N);
+  const size_t final_offset = full_blocks * (blockDim.x * N);
+  in += start_row * size + threadIdx.x * N;
   out += start_row;
 
   for (size_t r = 0; r < full_blocks; r++) {
@@ -114,13 +115,13 @@ row_reduce_simple(const T* in, U* out, size_t n_rows, int size) {
       }
     }
 
-    in += block.size() * N;
+    in += blockDim.x * N;
   }
 
   if (final_offset < size) {
     for (int k = 0; k < M; k++) {
       for (int i = 0; i < N; i++) {
-        vals[k][i] = ((final_offset + block.thread_rank() * N + i) < size)
+        vals[k][i] = ((final_offset + threadIdx.x * N + i) < size)
             ? in[k * size + i]
             : cast_to<T>(init);
       }
@@ -135,11 +136,11 @@ row_reduce_simple(const T* in, U* out, size_t n_rows, int size) {
   __shared__ U shared_accumulators[32 * M];
   block_reduce(block, warp, accs.val, shared_accumulators, op, init);
 
-  if (block.thread_rank() == 0) {
-    if (grid.block_rank() * M + M <= n_rows) {
+  if (threadIdx.x == 0) {
+    if (blockIdx.x * M + M <= n_rows) {
       store_vector(out, 0, accs);
     } else {
-      short offset = grid.block_rank() * M + M - n_rows;
+      short offset = blockIdx.x * M + M - n_rows;
       for (int i = offset; i < M; i++) {
         out[i] = accs[i];
       }
@@ -152,11 +153,11 @@ __global__ void row_reduce_looped(
     const T* in,
     U* out,
     const  RowReduceArgs args) {
-  auto grid = cg::this_grid();
-  auto block = cg::this_thread_block();
+  // grid group
+  // thread block
   auto warp = cg::tiled_partition<WARP_SIZE>(block);
 
-  size_t out_idx = grid.block_rank();
+  size_t out_idx = blockIdx.x;
 
   Op op;
 
@@ -164,18 +165,18 @@ __global__ void row_reduce_looped(
   U init = ReduceInit<Op, T>::value();
   total[0] = init;
   LoopedElemToLoc<NDIM, (NDIM > 2)> loop(args.reduce_ndim);
-  const size_t full_blocks = args.row_size / (block.size() * N_READS);
-  const size_t final_offset = full_blocks * (block.size() * N_READS);
+  const size_t full_blocks = args.row_size / (blockDim.x * N_READS);
+  const size_t final_offset = full_blocks * (blockDim.x * N_READS);
 
   in += elem_to_loc(out_idx, args.shape.data(), args.strides.data(), args.ndim);
-  in += block.thread_rank() * N_READS;
+  in += threadIdx.x * N_READS;
 
   // Unaligned reduce
   if (final_offset < args.row_size) {
     bool mask[N_READS];
     for (int i = 0; i < N_READS; i++) {
       mask[i] =
-          (final_offset + block.thread_rank() * N_READS + i) < args.row_size;
+          (final_offset + threadIdx.x * N_READS + i) < args.row_size;
     }
 
     for (size_t n = 0; n < args.non_row_reductions; n++) {
@@ -186,7 +187,7 @@ __global__ void row_reduce_looped(
         for (int i = 0; i < N_READS; i++) {
           total[0] = op(total[0], cast_to<U>(vals[i]));
         }
-        inlocal += block.size() * N_READS;
+        inlocal += blockDim.x * N_READS;
       }
 
       {
@@ -213,7 +214,7 @@ __global__ void row_reduce_looped(
         for (int i = 0; i < N_READS; i++) {
           total[0] = op(total[0], cast_to<U>(vals[i]));
         }
-        inlocal += block.size() * N_READS;
+        inlocal += blockDim.x * N_READS;
       }
 
       loop.next(args.reduce_shape.data(), args.reduce_strides.data());
@@ -223,7 +224,7 @@ __global__ void row_reduce_looped(
   __shared__ U shared_accumulators[32];
   block_reduce(block, warp, total, shared_accumulators, op, init);
 
-  if (block.thread_rank() == 0) {
+  if (threadIdx.x == 0) {
     out[out_idx] = total[0];
   }
 }

@@ -1,3 +1,4 @@
+#include "mlx/backend/rocm/rocm_utils.h"
 #include "hip/hip_runtime.h"
 // Copyright © 2025 Apple Inc.
 
@@ -48,7 +49,7 @@ struct GemvAccType<cu::complex64_t> {
 template <typename T, int rows_per_block, int n_per_thread>
 __device__ void
 gemv_impl(const T* mat, const T* vec, T* out, int rows, int cols) {
-  auto block = cg::this_thread_block();
+  // thread block
   auto warp = cg::tiled_partition<WARP_SIZE>(block);
 
   auto g_idx = block.group_index();
@@ -93,7 +94,7 @@ __global__ void gemv_batched(
     const  Strides mat_batch_strides,
     const  Strides vec_batch_strides,
     int batch_ndim) {
-  auto block = cg::this_thread_block();
+  // thread block
   auto batch_idx = block.group_index().y;
   auto [vec_offset, mat_offset] = elem_to_loc(
       batch_idx,
@@ -124,7 +125,7 @@ __global__ void gemv_gather(
     const  Strides mat_index_strides,
     const  Strides vec_index_strides,
     int index_batch_ndim) {
-  auto block = cg::this_thread_block();
+  // thread block
   auto indices_idx = block.group_index().y;
   uint32_t index_mat, index_vec;
   if (index_batch_ndim > 1) {

@@ -1,3 +1,4 @@
+#include "mlx/backend/rocm/rocm_utils.h"
 #include "hip/hip_runtime.h"
 // Copyright © 2026 Apple Inc.
 
@@ -178,8 +179,8 @@ __global__ void qmv_kernel(
     int n,
     int k,
     bool broadcast_w) {
-  auto grid = cg::this_grid();
-  auto block = cg::this_thread_block();
+  // grid group
+  // thread block
   auto warp = cg::tiled_partition<WARP_SIZE>(block);
 
   // The row that this warp handles.
@@ -218,8 +219,8 @@ __global__ void gather_qmv_kernel(
     const uint32_t* rhs_indices,
     int n,
     int k) {
-  auto grid = cg::this_grid();
-  auto block = cg::this_thread_block();
+  // grid group
+  // thread block
   auto warp = cg::tiled_partition<WARP_SIZE>(block);
 
   int row = block.group_index().x * rows_per_block + warp.meta_group_rank();
@@ -263,7 +264,7 @@ void qmv(
       (cute::sizeof_bits_v<T> <= 16 && cute::sizeof_bits_v<Q> <= 4) ? 16 : 8;
 
   dim3 num_blocks{
-      uint32_t(hip::ceil_div(n, rows_per_block)), uint32_t(m), uint32_t(l)};
+      uint32_t(mlx::core::rocm::ceil_div(n, rows_per_block)), uint32_t(m), uint32_t(l)};
   dim3 block_dims{WARP_SIZE, rows_per_block};
   void* args[] = {&x, &w, &scales, &biases, &out, &n, &k, &broadcast_w};
 
@@ -307,7 +308,7 @@ void gather_qmv(
       (cute::sizeof_bits_v<T> <= 16 && cute::sizeof_bits_v<Q> <= 4) ? 16 : 8;
 
   dim3 num_blocks{
-      uint32_t(hip::ceil_div(n, rows_per_block)), uint32_t(m), uint32_t(l)};
+      uint32_t(mlx::core::rocm::ceil_div(n, rows_per_block)), uint32_t(m), uint32_t(l)};
   dim3 block_dims{WARP_SIZE, rows_per_block};
   void* args[] = {
       &x, &w, &scales, &biases, &out, &lhs_indices, &rhs_indices, &n, &k};

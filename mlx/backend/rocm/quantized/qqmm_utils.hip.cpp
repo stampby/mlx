@@ -1,3 +1,4 @@
+#include "mlx/backend/rocm/rocm_utils.h"
 #include "hip/hip_runtime.h"
 // Copyright © 2025 Apple Inc.
 
@@ -60,7 +61,7 @@ inline std::tuple<dim3, dim3> get_swizzle_launch_args(
   const int num_tiles_m = M_swizzled / TILE_ROWS;
 
   dim3 grid;
-  grid.x = hip::ceil_div(num_tiles_k, tiles_per_block);
+  grid.x = mlx::core::rocm::ceil_div(num_tiles_k, tiles_per_block);
   grid.y = num_tiles_m;
   grid.z = 1;
   // Block is always (32, 32) = 1024 threads

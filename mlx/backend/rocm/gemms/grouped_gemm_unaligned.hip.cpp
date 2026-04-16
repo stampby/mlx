@@ -1,3 +1,4 @@
+#include "mlx/backend/rocm/rocm_utils.h"
 #include "hip/hip_runtime.h"
 // Copyright © 2025 Apple Inc.
 
@@ -45,12 +46,12 @@ __global__ void prepare_grouped_mm_data(
     void** a_ptrs,
     void** b_ptrs,
     void** out_ptrs) {
-  auto block = cg::this_thread_block();
+  // thread block
 
   // cumsum(histogram(indices)) - offset for each group.
   extern __shared__ uint32_t cum_histo[];
 
-  int group = block.thread_rank();
+  int group = threadIdx.x;
   if (group < group_count) {
     cum_histo[group] = 0;
   }
@@ -60,7 +61,7 @@ __global__ void prepare_grouped_mm_data(
   // Since |indices| is sorted, the position where element changes would be its
   // cumulative histogram.
   size_t elems_per_block = block.num_threads() * N_READS;
-  for (int r = 0; r < hip::ceil_div(size, elems_per_block); ++r) {
+  for (int r = 0; r < mlx::core::rocm::ceil_div(size, elems_per_block); ++r) {
     // TODO: Use vectorized read.
     for (int i = 0; i < N_READS; ++i) {
       size_t pos = r * elems_per_block + group * N_READS + i;
@@ -331,10 +332,10 @@ void cutlass_grouped_gemm_unaligned(
 
   // Prepare device pointers for matmul.
   int problem_sizes_nbytes =
-      group_count * hip::ceil_div(sizeof(ProblemSize), 8) * 8;
+      group_count * mlx::core::rocm::ceil_div(sizeof(ProblemSize), 8) * 8;
   int nbytes = problem_sizes_nbytes +
       group_count * (3 * sizeof(void*) + 3 * sizeof(int64_t));
-  nbytes = hip::ceil_div(nbytes, 256) * 256;
+  nbytes = mlx::core::rocm::ceil_div(nbytes, 256) * 256;
   array gemm_args(cu::malloc_async(nbytes, encoder), {nbytes}, int8);
   encoder.add_temporary(gemm_args);
 
@@ -348,7 +349,7 @@ void cutlass_grouped_gemm_unaligned(
 
   // Fill the pointers by computing offsets from indices.
   constexpr int N_READS = 4;
-  int n_threads = hip::ceil_div(indices.size(), N_READS);
+  int n_threads = mlx::core::rocm::ceil_div(indices.size(), N_READS);
   n_threads = group_count < n_threads ? n_threads : group_count;
   dim3 block_dims(std::min(n_threads, 1024));
   dim3 num_blocks(1);
@@ -417,10 +418,10 @@ void cutlass_segmented_mm(
     cu::CommandEncoder& encoder) {
   // Allocate grouped GEMM args on device.
   int problem_sizes_nbytes =
-      num_segments * hip::ceil_div(sizeof(ProblemSize), 8) * 8;
+      num_segments * mlx::core::rocm::ceil_div(sizeof(ProblemSize), 8) * 8;
   int nbytes = problem_sizes_nbytes +
       num_segments * (3 * sizeof(void*) + 3 * sizeof(int64_t));
-  nbytes = hip::ceil_div(nbytes, 256) * 256;
+  nbytes = mlx::core::rocm::ceil_div(nbytes, 256) * 256;
   array gemm_args(cu::malloc_async(nbytes, encoder), {nbytes}, int8);
   encoder.add_temporary(gemm_args);
 
@@ -434,7 +435,7 @@ void cutlass_segmented_mm(
 
   // Build problem descriptions from segments on the GPU.
   int block_size = std::min(num_segments, 256);
-  int num_blocks = hip::ceil_div(num_segments, block_size);
+  int num_blocks = mlx::core::rocm::ceil_div(num_segments, block_size);
 
   encoder.set_input_array(segments);
   encoder.set_output_array(gemm_args);

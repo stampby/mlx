@@ -1,3 +1,4 @@
+#include "mlx/backend/rocm/rocm_utils.h"
 #include "hip/hip_runtime.h"
 // Copyright © 2025 Apple Inc.
 
@@ -111,12 +112,12 @@ template <
     bool inclusive,
     bool reverse>
 __global__ void contiguous_scan(const T* in, U* out, int32_t axis_size) {
-  auto grid = cg::this_grid();
-  auto block = cg::this_thread_block();
+  // grid group
+  // thread block
   auto warp = cg::tiled_partition<WARP_SIZE>(block);
 
-  in += grid.block_rank() * axis_size;
-  out += grid.block_rank() * axis_size;
+  in += blockIdx.x * axis_size;
+  out += blockIdx.x * axis_size;
 
   __shared__ U warp_sums[WARP_SIZE];
 
@@ -125,8 +126,8 @@ __global__ void contiguous_scan(const T* in, U* out, int32_t axis_size) {
   U prefix = init;
 
   // Scan per block.
-  for (int r = 0; r < hip::ceil_div(axis_size, block.size() * N_READS); ++r) {
-    int32_t index = r * block.size() + block.thread_rank();
+  for (int r = 0; r < mlx::core::rocm::ceil_div(axis_size, blockDim.x * N_READS); ++r) {
+    int32_t index = r * blockDim.x + threadIdx.x;
     U values[N_READS];
     load_values<reverse>(index, in, values, axis_size, init);
 
@@ -172,11 +173,11 @@ __global__ void contiguous_scan(const T* in, U* out, int32_t axis_size) {
     } else {
       store_values<reverse, 1>(index, out, values, axis_size);
       if (reverse) {
-        if (block.thread_rank() == 0 && index == 0) {
+        if (threadIdx.x == 0 && index == 0) {
           out[axis_size - 1] = init;
         }
       } else {
-        if (block.thread_rank() == 0 && index == 0) {
+        if (threadIdx.x == 0 && index == 0) {
           out[0] = init;
         }
       }
@@ -208,8 +209,8 @@ __global__ void strided_scan(
     int32_t axis_size,
     int64_t stride,
     int64_t stride_blocks) {
-  auto grid = cg::this_grid();
-  auto block = cg::this_thread_block();
+  // grid group
+  // thread block
   auto warp = cg::tiled_partition<WARP_SIZE>(block);
 
   constexpr int BN_pad = WARP_SIZE + 16 / sizeof(U);
@@ -227,10 +228,10 @@ __global__ void strided_scan(
   }
 
   // Compute offsets.
-  int64_t offset = (grid.block_rank() / stride_blocks) * axis_size * stride;
-  int64_t global_index_x = (grid.block_rank() % stride_blocks) * BN;
-  uint32_t read_offset_y = (block.thread_rank() * N_READS) / BN;
-  uint32_t read_offset_x = (block.thread_rank() * N_READS) % BN;
+  int64_t offset = (blockIdx.x / stride_blocks) * axis_size * stride;
+  int64_t global_index_x = (blockIdx.x % stride_blocks) * BN;
+  uint32_t read_offset_y = (threadIdx.x * N_READS) / BN;
+  uint32_t read_offset_x = (threadIdx.x * N_READS) % BN;
   uint32_t scan_offset_y = warp.thread_rank();
   uint32_t scan_offset_x = warp.meta_group_rank() * n_scans;
 
@@ -396,8 +397,8 @@ void scan_gpu_inplace(
                   N_READS,
                   inclusive_tag.value,
                   reverse_tag.value>;
-              int block_dim = hip::ceil_div(axis_size, N_READS);
-              block_dim = hip::ceil_div(block_dim, WARP_SIZE) * WARP_SIZE;
+              int block_dim = mlx::core::rocm::ceil_div(axis_size, N_READS);
+              block_dim = mlx::core::rocm::ceil_div(block_dim, WARP_SIZE) * WARP_SIZE;
               block_dim = std::min(block_dim, WARP_SIZE * WARP_SIZE);
               encoder.add_kernel_node(
                   kernel,
@@ -419,7 +420,7 @@ void scan_gpu_inplace(
                   inclusive_tag.value,
                   reverse_tag.value>;
               int64_t stride = in.strides()[axis];
-              int64_t stride_blocks = hip::ceil_div(stride, BN);
+              int64_t stride_blocks = mlx::core::rocm::ceil_div(stride, BN);
               dim3 num_blocks = get_2d_grid_dims(
                   in.shape(), in.strides(), axis_size * stride);
               if (num_blocks.x * stride_blocks <= UINT32_MAX) {

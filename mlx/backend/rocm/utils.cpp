@@ -93,7 +93,7 @@ void* allocate_workspace(cu::CommandEncoder& encoder, size_t workspace_size) {
 #endif
 
   // Ensure workspace is 256-byte aligned.
-  int nbytes = hip::ceil_div(workspace_size, 256) * 256;
+  int nbytes = mlx::core::rocm::ceil_div(workspace_size, 256) * 256;
   array workspace(cu::malloc_async(nbytes, encoder), {nbytes}, int8);
   encoder.add_temporary(workspace);
   return gpu_ptr<void>(workspace);

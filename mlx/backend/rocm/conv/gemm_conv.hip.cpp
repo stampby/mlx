@@ -1,3 +1,4 @@
+#include "mlx/backend/rocm/rocm_utils.h"
 #include "hip/hip_runtime.h"
 // Copyright © 2025 Apple Inc.
 
@@ -21,14 +22,14 @@ __global__ void naive_unfold_nd(
     int filter_size,
     int out_pixels,
     const  ConvParams<NDIM> params) {
-  auto block = cg::this_thread_block();
+  // thread block
   auto tid = block.group_index();
   auto lid = block.thread_index();
 
   int index_batch = tid.z / out_pixels; // [0, N)
   int index_out_spatial = tid.z % out_pixels; // [0, H_out * W_out)
   int index_wt_spatial =
-      tid.x * block.size().x + lid.x; // [0, H_wt * W_wt)
+      tid.x * blockDim.x + lid.x; // [0, H_wt * W_wt)
 
   if (index_wt_spatial >= filter_size / params.C) {
     return;
@@ -106,7 +107,7 @@ array unfold_inputs_nd(
   dim3 block_dims;
   block_dims.x = std::min(std::max(wt_spatial_size, 32), 1024);
   dim3 num_blocks;
-  num_blocks.x = hip::ceil_div(wt_spatial_size, block_dims.x);
+  num_blocks.x = mlx::core::rocm::ceil_div(wt_spatial_size, block_dims.x);
   num_blocks.y = params.C;
   num_blocks.z = mat_M;
 

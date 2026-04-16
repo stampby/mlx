@@ -134,9 +134,8 @@ endfunction()
 # ----------------------------- CLI args -----------------------------
 
 string(REPLACE ":" ";" MLX_JIT_SOURCES_LIST ${MLX_JIT_SOURCES})
-foreach(source ${MLX_JIT_SOURCES_LIST})
-  list(APPEND MLX_JIT_SOURCES_ABS "${MLX_SOURCE_ROOT}/${source}")
-endforeach()
+# Sources from glob are already absolute paths
+set(MLX_JIT_SOURCES_ABS ${MLX_JIT_SOURCES_LIST})
 
 bin2h(
   SOURCE_FILES

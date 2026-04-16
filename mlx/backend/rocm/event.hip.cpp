@@ -1,3 +1,4 @@
+#include "mlx/backend/rocm/rocm_utils.h"
 #include "hip/hip_runtime.h"
 // Copyright © 2024 Apple Inc.
 
@@ -351,7 +352,7 @@ struct EventImpl {
     }
     auto& d = cu::device(s.device);
     if (s.device == mlx::core::Device::cpu || signal_value > 1) {
-      nvtx3::mark("Using slow AtomicEvent");
+      
       atomic = std::make_unique<cu::AtomicEvent>(d);
     } else {
       hip = std::make_unique<cu::CopyableCudaEvent>(d);

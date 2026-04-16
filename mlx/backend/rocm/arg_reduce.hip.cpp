@@ -1,3 +1,4 @@
+#include "mlx/backend/rocm/rocm_utils.h"
 #include "hip/hip_runtime.h"
 // Copyright © 2025 Apple Inc.
 
@@ -10,8 +11,8 @@
 
 #include <hip/hip_cooperative_groups.h>
 // NVTX not available on ROCm — profiling markers disabled
-#include <hipcub/block/block_load.hip.h>
-#include <hipcub/block/block_reduce.hip.h>
+#include <hipcub/hipcub.hpp>
+#include <hipcub/hipcub.hpp>
 
 #include <cassert>
 
@@ -104,7 +105,7 @@ __global__ void arg_reduce_general(
     int32_t ndim,
     int64_t axis_stride,
     int32_t axis_size) {
-  auto block = cg::this_thread_block();
+  // thread block
 
   int64_t index = cg::this_grid().block_rank();
   if (index >= size) {
@@ -119,18 +120,18 @@ __global__ void arg_reduce_general(
   T init = op.init();
   IndexValPair<T> best{0, init};
 
-  for (int r = 0; r < hip::ceil_div(axis_size, BLOCK_DIM * N_READS); ++r) {
-    auto tid = r * BLOCK_DIM + block.thread_index().x;
+  for (int r = 0; r < mlx::core::rocm::ceil_div(axis_size, BLOCK_DIM * N_READS); ++r) {
+    auto tid = r * BLOCK_DIM + threadIdx.x;
     auto vals = load_vector<N_READS>(in, tid, axis_size, axis_stride, init);
     best = op.reduce_many(best, vals, tid * N_READS);
   }
 
-  typedef hiphipcub::BlockReduce<IndexValPair<T>, BLOCK_DIM> BlockReduceT;
+  typedef hipcub::BlockReduce<IndexValPair<T>, BLOCK_DIM> BlockReduceT;
   __shared__ typename BlockReduceT::TempStorage temp;
 
   best = BlockReduceT(temp).Reduce(best, op);
 
-  if (block.thread_rank() == 0) {
+  if (threadIdx.x == 0) {
     out[out_idx] = best.index;
   }
 }
@@ -162,7 +163,7 @@ void ArgReduce::eval_gpu(const std::vector<array>& inputs, array& out) {
   dispatch_real_types(in.dtype(), "ArgReduce", [&](auto type_tag) {
     using T = cuda_type_t<MLX_GET_TYPE(type_tag)>;
     constexpr uint32_t N_READS = 4;
-    dispatch_block_dim(hip::ceil_div(axis_size, N_READS), [&](auto block_dim) {
+    dispatch_block_dim(mlx::core::rocm::ceil_div(axis_size, N_READS), [&](auto block_dim) {
       dim3 num_blocks = get_2d_grid_dims(out.shape(), out.strides());
       auto kernel =
           cu::arg_reduce_general<T, cu::ArgMax<T>, block_dim(), N_READS>;

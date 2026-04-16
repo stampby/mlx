@@ -1,3 +1,4 @@
+#include "mlx/backend/rocm/rocm_utils.h"
 #include "hip/hip_runtime.h"
 // Copyright © 2025 Apple Inc.
 
@@ -67,7 +68,7 @@ __device__ void fp_qmv_impl(
     T* out,
     int rows,
     int cols) {
-  auto block = cg::this_thread_block();
+  // thread block
   auto warp = cg::tiled_partition<WARP_SIZE>(block);
 
   constexpr int vals_per_item = bits == 8 ? 4 : 8;

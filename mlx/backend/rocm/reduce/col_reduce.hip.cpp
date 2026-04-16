@@ -1,3 +1,4 @@
+#include "mlx/backend/rocm/rocm_utils.h"
 #include "hip/hip_runtime.h"
 // Copyright © 2025 Apple Inc.
 
@@ -8,7 +9,7 @@
 
 #include <hip/hip_cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
-#include <hipcub/block/block_load.hip.h>
+#include <hipcub/hipcub.hpp>
 #include <hipcub/hipcub.hpp>
 
 namespace mlx::core {
@@ -98,22 +99,22 @@ __global__ void col_reduce_looped(
     U* out,
     const  ColReduceArgs args,
     int64_t out_size) {
-  auto grid = cg::this_grid();
-  auto block = cg::this_thread_block();
+  // grid group
+  // thread block
   auto warp = cg::tiled_partition<WARP_SIZE>(block);
 
   constexpr int threads_per_row = BN / N_READS;
 
   // Compute the indices for the tile
-  size_t tile_idx = grid.block_rank();
+  size_t tile_idx = blockIdx.x;
   size_t tile_x = tile_idx % ((args.reduction_stride + BN - 1) / BN);
   size_t tile_y = tile_idx / ((args.reduction_stride + BN - 1) / BN);
   size_t tile_out = tile_y / out_size;
   tile_y = tile_y % out_size;
 
   // Compute the indices for the thread within the tile
-  short thread_x = block.thread_rank() % threads_per_row;
-  short thread_y = block.thread_rank() / threads_per_row;
+  short thread_x = threadIdx.x % threads_per_row;
+  short thread_y = threadIdx.x / threads_per_row;
 
   // Move the input pointer
   in += elem_to_loc(tile_y, args.shape.data(), args.strides.data(), args.ndim) +
@@ -144,7 +145,7 @@ __global__ void col_reduce_looped(
     if (args.reduction_stride % N_READS == 0) {
       for (size_t r = start; r < end; r += BM) {
         T vals[N_READS];
-        hiphipcub::LoadDirectBlockedVectorized(thread_x, in + loop.location(), vals);
+        hipcub::LoadDirectBlockedVectorized(thread_x, in + loop.location(), vals);
         for (int i = 0; i < N_READS; i++) {
           totals[i] = op(totals[i], cast_to<U>(vals[i]));
         }
@@ -153,7 +154,7 @@ __global__ void col_reduce_looped(
     } else {
       for (size_t r = start; r < end; r += BM) {
         T vals[N_READS];
-        hiphipcub::LoadDirectBlocked(thread_x, in + loop.location(), vals);
+        hipcub::LoadDirectBlocked(thread_x, in + loop.location(), vals);
         for (int i = 0; i < N_READS; i++) {
           totals[i] = op(totals[i], cast_to<U>(vals[i]));
         }
@@ -163,7 +164,7 @@ __global__ void col_reduce_looped(
   } else {
     for (size_t r = start; r < end; r += BM) {
       T vals[N_READS];
-      hiphipcub::LoadDirectBlocked(
+      hipcub::LoadDirectBlocked(
           thread_x,
           in + loop.location(),
           vals,
@@ -195,7 +196,7 @@ __global__ void col_reduce_looped(
     if (BLOCKS > 1) {
       out += tile_out * out_size * args.reduction_stride;
     }
-    hiphipcub::StoreDirectBlocked(
+    hipcub::StoreDirectBlocked(
         warp.meta_group_rank(),
         out + tile_y * args.reduction_stride + tile_x * BN,
         totals,
@@ -210,8 +211,8 @@ __global__ void col_reduce_small(
     const  ColReduceArgs args,
     size_t total) {
   Op op;
-  auto grid = cg::this_grid();
-  auto block = cg::this_thread_block();
+  // grid group
+  // thread block
 
   const auto idx = grid.thread_rank() * N_READS;
   const auto before_axis = idx / args.reduction_stride;
@@ -252,13 +253,13 @@ inline auto output_grid_for_col_reduce(
     int bn,
     int outer = 1) {
   int gx, gy = 1;
-  size_t n_inner_blocks = hip::ceil_div(args.reduction_stride, bn);
+  size_t n_inner_blocks = mlx::core::rocm::ceil_div(args.reduction_stride, bn);
   size_t n_outer_blocks = out.size() / args.reduction_stride;
   size_t n_blocks = n_outer_blocks * n_inner_blocks * outer;
   while (n_blocks / gy > INT32_MAX) {
     gy *= 2;
   }
-  gx = hip::ceil_div(n_blocks, gy);
+  gx = mlx::core::rocm::ceil_div(n_blocks, gy);
 
   return dim3(gx, gy, 1);
 }
