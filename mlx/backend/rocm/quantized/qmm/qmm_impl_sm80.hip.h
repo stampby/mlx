@@ -1,7 +1,7 @@
 // Copyright © 2026 Apple Inc.
 
-#include "mlx/backend/cuda/quantized/qmm/cute_dequant.cuh"
-#include "mlx/backend/cuda/quantized/qmm/qmm.h"
+#include "mlx/backend/rocm/quantized/qmm/cute_dequant.hip.h"
+#include "mlx/backend/rocm/quantized/qmm/qmm.h"
 #include "mlx/dtype_utils.h"
 
 // clang-format off

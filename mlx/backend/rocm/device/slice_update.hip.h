@@ -2,8 +2,8 @@
 
 #pragma once
 
-#include "mlx/backend/cuda/device/binary_ops.cuh"
-#include "mlx/backend/cuda/device/utils.cuh"
+#include "mlx/backend/rocm/device/binary_ops.hip.h"
+#include "mlx/backend/rocm/device/utils.hip.h"
 
 #include <cooperative_groups.h>
 

@@ -1,7 +1,7 @@
 // Copyright © 2025 Apple Inc.
 
 #include "mlx/backend/common/utils.h"
-#include "mlx/backend/hip/kernel_utils.cuh"
+#include "mlx/backend/rocm/kernel_utils.hip.h"
 
 namespace mlx::core {
 

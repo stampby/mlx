@@ -175,40 +175,21 @@ if(MLX_BUILD_ROCM)
   message(STATUS "ROCm found: ${hip_VERSION}")
   message(STATUS "HIP compiler: ${HIP_HIPCC_EXECUTABLE}")
 
-  # Set HIP as the language for .hip.cpp files
-  enable_language(HIP)
-
   # GPU architecture
   if(NOT DEFINED GPU_TARGETS)
     set(GPU_TARGETS "gfx1151" CACHE STRING "GPU architectures to target")
   endif()
   message(STATUS "ROCm GPU targets: ${GPU_TARGETS}")
 
-  # Compile definitions
+  # DON'T enable_language(HIP) globally — it contaminates CXX targets
+  # Instead, we compile HIP files using hipcc directly in the backend CMakeLists
+
+  # Compile definitions for the main mlx target (CXX only)
   target_compile_definitions(mlx PUBLIC MLX_BUILD_HIP=1)
   target_compile_definitions(mlx PUBLIC __HIP_PLATFORM_AMD__=1)
 
-  # Include directories
-  target_include_directories(mlx PRIVATE ${hip_INCLUDE_DIRS})
-
-  # Link libraries
-  target_link_libraries(mlx PRIVATE hip::device)
-  if(hipblas_FOUND)
-    target_link_libraries(mlx PRIVATE roc::hipblas)
-    message(STATUS "hipBLAS found")
-  endif()
-  if(hipblaslt_FOUND)
-    target_link_libraries(mlx PRIVATE roc::hipblaslt)
-    message(STATUS "hipBLASLt found")
-  endif()
-  if(rocblas_FOUND)
-    target_link_libraries(mlx PRIVATE roc::rocblas)
-    message(STATUS "rocBLAS found")
-  endif()
-  if(miopen_FOUND)
-    target_link_libraries(mlx PRIVATE MIOpen)
-    message(STATUS "MIOpen found")
-  endif()
+  # Include ROCm headers for C++ files that reference HIP types
+  target_include_directories(mlx PRIVATE /opt/rocm/include)
 endif()
 
 if(MLX_BUILD_METAL)

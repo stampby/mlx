@@ -3,7 +3,7 @@
 #pragma once
 
 #include "mlx/allocator.h"
-#include "mlx/backend/hip/utils.h"
+#include "mlx/backend/rocm/utils.h"
 #include "mlx/stream.h"
 
 #include <memory>

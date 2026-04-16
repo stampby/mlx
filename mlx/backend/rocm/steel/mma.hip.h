@@ -2,8 +2,8 @@
 
 #pragma once
 
-#include "mlx/backend/cuda/steel/defines.cuh"
-#include "mlx/backend/cuda/steel/tiles.cuh"
+#include "mlx/backend/rocm/steel/defines.hip.h"
+#include "mlx/backend/rocm/steel/tiles.hip.h"
 
 namespace mlx::core::cu {
 

@@ -1,6 +1,6 @@
 // Copyright © 2025 Apple Inc.
 
-#include "mlx/backend/cuda/device/unary_ops.cuh"
+#include "mlx/backend/rocm/device/unary_ops.hip.h"
 
 #include <cuda/std/array>
 

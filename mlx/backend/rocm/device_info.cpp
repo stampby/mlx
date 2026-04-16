@@ -1,7 +1,7 @@
 // Copyright © 2026 Apple Inc.
 
 #include "mlx/backend/gpu/device_info.h"
-#include "mlx/backend/hip/hip/hip_runtime.h"
+#include "mlx/backend/rocm/hip/hip_runtime.h"
 
 #include <hip/hip_runtime.h>
 #include <dlfcn.h>

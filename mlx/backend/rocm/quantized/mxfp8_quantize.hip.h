@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mlx/backend/cuda/vector_types.cuh"
+#include "mlx/backend/rocm/vector_types.hip.h"
 
 #include <cutlass/numeric_conversion.h>
 

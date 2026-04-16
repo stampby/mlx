@@ -1,8 +1,8 @@
 // Copyright © 2025 Apple Inc.
 
-#include "mlx/backend/hip/gemms/cublas_gemm.h"
-#include "mlx/backend/hip/cublas_utils.h"
-#include "mlx/backend/hip/device.h"
+#include "mlx/backend/rocm/gemms/cublas_gemm.h"
+#include "mlx/backend/rocm/cublas_utils.h"
+#include "mlx/backend/rocm/device.h"
 #include "mlx/dtype_utils.h"
 #include "mlx/utils.h"
 

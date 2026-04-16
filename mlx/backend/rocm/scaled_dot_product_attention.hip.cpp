@@ -4,10 +4,10 @@
 // Required for using M_LOG2E in MSVC.
 #define _USE_MATH_DEFINES
 
-#include "mlx/backend/hip/device.h"
-#include "mlx/backend/hip/device/config.h"
-#include "mlx/backend/hip/device/utils.cuh"
-#include "mlx/backend/hip/kernel_utils.cuh"
+#include "mlx/backend/rocm/device.h"
+#include "mlx/backend/rocm/device/config.h"
+#include "mlx/backend/rocm/device/utils.hip.h"
+#include "mlx/backend/rocm/kernel_utils.hip.h"
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/dtype_utils.h"
 

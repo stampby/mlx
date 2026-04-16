@@ -3,7 +3,7 @@
 #pragma once
 
 #include "mlx/array.h"
-#include "mlx/backend/hip/device.h"
+#include "mlx/backend/rocm/device.h"
 
 namespace mlx::core {
 

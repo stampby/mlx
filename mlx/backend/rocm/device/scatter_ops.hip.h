@@ -2,7 +2,7 @@
 
 #pragma once
 
-#include "mlx/backend/cuda/device/atomic_ops.cuh"
+#include "mlx/backend/rocm/device/atomic_ops.hip.h"
 
 namespace mlx::core::cu {
 

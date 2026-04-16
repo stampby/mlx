@@ -2,8 +2,8 @@
 #pragma once
 
 #include "mlx/array.h"
-#include "mlx/backend/hip/cublas_utils.h"
-#include "mlx/backend/hip/device.h"
+#include "mlx/backend/rocm/cublas_utils.h"
+#include "mlx/backend/rocm/device.h"
 
 #include <hipblaslt.h>
 

@@ -2,9 +2,9 @@
 // Copyright © 2025 Apple Inc.
 
 #include "mlx/backend/common/compiled.h"
-#include "mlx/backend/hip/device.h"
-#include "mlx/backend/hip/jit_module.h"
-#include "mlx/backend/hip/kernel_utils.cuh"
+#include "mlx/backend/rocm/device.h"
+#include "mlx/backend/rocm/jit_module.h"
+#include "mlx/backend/rocm/kernel_utils.hip.h"
 #include "mlx/graph_utils.h"
 #include "mlx/primitives.h"
 
@@ -215,10 +215,10 @@ struct FusedKernelBuilder {
 } // namespace cu
 
 constexpr const char* g_jit_includes = R"(
-#include "mlx/backend/hip/device/binary_ops.cuh"
-#include "mlx/backend/hip/device/ternary_ops.cuh"
-#include "mlx/backend/hip/device/unary_ops.cuh"
-#include "mlx/backend/hip/device/utils.cuh"
+#include "mlx/backend/rocm/device/binary_ops.hip.h"
+#include "mlx/backend/rocm/device/ternary_ops.hip.h"
+#include "mlx/backend/rocm/device/unary_ops.hip.h"
+#include "mlx/backend/rocm/device/utils.hip.h"
 
 #include <hip/hip_cooperative_groups.h>
 

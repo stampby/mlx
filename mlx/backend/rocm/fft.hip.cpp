@@ -14,11 +14,11 @@
 #include <nvtx3/nvtx3.hpp>
 
 #include "mlx/backend/common/utils.h"
-#include "mlx/backend/hip/allocator.h"
-#include "mlx/backend/hip/device.h"
-#include "mlx/backend/hip/device/complex.cuh"
-#include "mlx/backend/hip/lru_cache.h"
-#include "mlx/backend/hip/utils.h"
+#include "mlx/backend/rocm/allocator.h"
+#include "mlx/backend/rocm/device.h"
+#include "mlx/backend/rocm/device/complex.hip.h"
+#include "mlx/backend/rocm/lru_cache.h"
+#include "mlx/backend/rocm/utils.h"
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/primitives.h"
 

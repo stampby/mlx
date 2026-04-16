@@ -1,7 +1,7 @@
 // Copyright © 2025 Apple Inc.
 
-#include "mlx/backend/hip/cublas_utils.h"
-#include "mlx/backend/hip/hip/hip_runtime.h"
+#include "mlx/backend/rocm/cublas_utils.h"
+#include "mlx/backend/rocm/hip/hip_runtime.h"
 #include "mlx/backend/gpu/device_info.h"
 #include "mlx/utils.h"
 

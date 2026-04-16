@@ -1,9 +1,9 @@
 #include "hip/hip_runtime.h"
 // Copyright © 2025 Apple Inc.
 #include "mlx/backend/common/ternary.h"
-#include "mlx/backend/hip/device.h"
-#include "mlx/backend/hip/device/ternary_ops.cuh"
-#include "mlx/backend/hip/kernel_utils.cuh"
+#include "mlx/backend/rocm/device.h"
+#include "mlx/backend/rocm/device/ternary_ops.hip.h"
+#include "mlx/backend/rocm/kernel_utils.hip.h"
 #include "mlx/dtype_utils.h"
 #include "mlx/primitives.h"
 

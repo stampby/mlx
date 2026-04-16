@@ -1,9 +1,9 @@
 // Copyright © 2025 Apple Inc.
 
 #include "mlx/fence.h"
-#include "mlx/backend/hip/allocator.h"
-#include "mlx/backend/hip/device.h"
-#include "mlx/backend/hip/event.h"
+#include "mlx/backend/rocm/allocator.h"
+#include "mlx/backend/rocm/device.h"
+#include "mlx/backend/rocm/event.h"
 
 namespace mlx::core {
 

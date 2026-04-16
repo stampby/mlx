@@ -1,6 +1,6 @@
 // Copyright © 2025 Apple Inc.
 
-#include "mlx/backend/hip/hip/hip_runtime.h"
+#include "mlx/backend/rocm/hip/hip_runtime.h"
 #include "mlx/fast.h"
 
 namespace mlx::core {

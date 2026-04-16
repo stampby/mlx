@@ -1,10 +1,10 @@
 // Copyright © 2025 Apple Inc.
 
 #include "mlx/backend/gpu/eval.h"
-#include "mlx/backend/hip/allocator.h"
-#include "mlx/backend/hip/cublas_utils.h"
-#include "mlx/backend/hip/cudnn_utils.h"
-#include "mlx/backend/hip/event.h"
+#include "mlx/backend/rocm/allocator.h"
+#include "mlx/backend/rocm/cublas_utils.h"
+#include "mlx/backend/rocm/cudnn_utils.h"
+#include "mlx/backend/rocm/event.h"
 #include "mlx/primitives.h"
 #include "mlx/scheduler.h"
 

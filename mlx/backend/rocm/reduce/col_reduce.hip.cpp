@@ -3,12 +3,12 @@
 
 #include <numeric>
 
-#include "mlx/backend/hip/device.h"
-#include "mlx/backend/hip/reduce/reduce.cuh"
+#include "mlx/backend/rocm/device.h"
+#include "mlx/backend/rocm/reduce/reduce.hip.h"
 
 #include <hip/hip_cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
-#include <cub/block/block_load.cuh>
+#include <cub/block/block_load.hip.h>
 #include <hipcub/hipcub.hpp>
 
 namespace mlx::core {

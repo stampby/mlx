@@ -4,8 +4,8 @@
 
 #include "mlx/array.h"
 #include "mlx/backend/common/utils.h"
-#include "mlx/backend/hip/device.h"
-#include "mlx/backend/hip/device/config.h"
+#include "mlx/backend/rocm/device.h"
+#include "mlx/backend/rocm/device/config.h"
 
 #include <deque>
 #include <unordered_map>

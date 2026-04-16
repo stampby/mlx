@@ -1,7 +1,7 @@
 // Copyright © 2025 Apple Inc.
 #pragma once
 
-#include "mlx/backend/hip/device.h"
+#include "mlx/backend/rocm/device.h"
 #include "mlx/primitives.h"
 
 #include <optional>

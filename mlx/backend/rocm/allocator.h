@@ -4,7 +4,7 @@
 
 #include "mlx/allocator.h"
 #include "mlx/backend/common/buffer_cache.h"
-#include "mlx/backend/hip/hip_utils.h"
+#include "mlx/backend/rocm/hip_utils.h"
 
 #include <hip/hip_runtime.h>
 #include <mutex>

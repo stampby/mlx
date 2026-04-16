@@ -1,11 +1,11 @@
 // Copyright © 2025 Apple Inc.
 
-#include "mlx/backend/hip/quantized/cublas_qqmm.h"
+#include "mlx/backend/rocm/quantized/cublas_qqmm.h"
 
 #include <fmt/format.h>
-#include "mlx/backend/hip/cublas_utils.h"
+#include "mlx/backend/rocm/cublas_utils.h"
 
-#include "mlx/backend/hip/device.h"
+#include "mlx/backend/rocm/device.h"
 #include "mlx/dtype_utils.h"
 #include "mlx/utils.h"
 

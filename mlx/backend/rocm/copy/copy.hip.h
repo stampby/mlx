@@ -2,9 +2,9 @@
 
 #pragma once
 
-#include "mlx/backend/cuda/device.h"
-#include "mlx/backend/cuda/device/cast_op.cuh"
-#include "mlx/backend/cuda/kernel_utils.cuh"
+#include "mlx/backend/rocm/device.h"
+#include "mlx/backend/rocm/device/cast_op.hip.h"
+#include "mlx/backend/rocm/kernel_utils.hip.h"
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/dtype_utils.h"
 

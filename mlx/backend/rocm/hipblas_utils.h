@@ -2,7 +2,7 @@
 #pragma once
 
 #include "mlx/array.h"
-#include "mlx/backend/hip/device.h"
+#include "mlx/backend/rocm/device.h"
 #include "mlx/dtype_utils.h"
 
 #include <hipblaslt.h>

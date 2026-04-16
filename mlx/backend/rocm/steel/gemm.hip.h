@@ -1,6 +1,6 @@
 
-#include "mlx/backend/cuda/steel/mma.cuh"
-#include "mlx/backend/cuda/steel/tiles.cuh"
+#include "mlx/backend/rocm/steel/mma.hip.h"
+#include "mlx/backend/rocm/steel/tiles.hip.h"
 
 namespace mlx::core::cu {
 

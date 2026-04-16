@@ -1,8 +1,8 @@
 #include "hip/hip_runtime.h"
 // Copyright © 2025 Apple Inc.
 
-#include "mlx/backend/hip/device.h"
-#include "mlx/backend/hip/reduce/reduce.cuh"
+#include "mlx/backend/rocm/device.h"
+#include "mlx/backend/rocm/reduce/reduce.hip.h"
 
 #include <hip/hip_cooperative_groups.h>
 

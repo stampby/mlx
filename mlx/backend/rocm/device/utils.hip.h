@@ -8,8 +8,8 @@
 
 #pragma once
 
-#include "mlx/backend/cuda/device/complex.cuh"
-#include "mlx/backend/cuda/device/config.h"
+#include "mlx/backend/rocm/device/complex.hip.h"
+#include "mlx/backend/rocm/device/config.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>

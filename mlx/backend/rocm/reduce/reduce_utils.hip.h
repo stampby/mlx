@@ -5,8 +5,8 @@
 #include <numeric>
 
 #include "mlx/backend/common/utils.h"
-#include "mlx/backend/cuda/device.h"
-#include "mlx/backend/cuda/device/utils.cuh"
+#include "mlx/backend/rocm/device.h"
+#include "mlx/backend/rocm/device/utils.hip.h"
 
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>

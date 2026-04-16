@@ -2,7 +2,7 @@
 
 #pragma once
 
-#include "mlx/backend/cuda/device/utils.cuh"
+#include "mlx/backend/rocm/device/utils.hip.h"
 
 namespace mlx::core::cu {
 

@@ -1,6 +1,6 @@
 // Copyright © 2025 Apple Inc.
 
-#include "mlx/backend/hip/unary/unary.cuh"
+#include "mlx/backend/rocm/unary/unary.hip.h"
 
 namespace mlx::core {
 UNARY_GPU(Negative)

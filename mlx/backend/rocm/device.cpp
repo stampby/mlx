@@ -1,7 +1,7 @@
 // Copyright © 2025 Apple Inc.
 
-#include "mlx/backend/hip/device.h"
-#include "mlx/backend/hip/worker.h"
+#include "mlx/backend/rocm/device.h"
+#include "mlx/backend/rocm/worker.h"
 #include "mlx/backend/gpu/device_info.h"
 #include "mlx/utils.h"
 

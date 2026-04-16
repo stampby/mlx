@@ -4,8 +4,8 @@
 #include <iostream>
 
 #include "mlx/backend/common/compiled.h"
-#include "mlx/backend/hip/jit_module.h"
-#include "mlx/backend/hip/utils.h"
+#include "mlx/backend/rocm/jit_module.h"
+#include "mlx/backend/rocm/utils.h"
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/fast.h"
 #include "mlx/fast_primitives.h"
@@ -18,7 +18,7 @@ namespace mlx::core::fast {
 namespace {
 
 constexpr const char* default_header = R"(
-#include "mlx/backend/hip/device/utils.cuh"
+#include "mlx/backend/rocm/device/utils.hip.h"
 
 #include <hip/hip_cooperative_groups.h>
 

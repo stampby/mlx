@@ -5,9 +5,9 @@
 #include <cassert>
 #include <optional>
 
-#include "mlx/backend/hip/hip_utils.h"
-#include "mlx/backend/hip/device/config.h"
-#include "mlx/backend/hip/utils.h"
+#include "mlx/backend/rocm/hip_utils.h"
+#include "mlx/backend/rocm/device/config.h"
+#include "mlx/backend/rocm/utils.h"
 #include "mlx/dtype_utils.h"
 
 #include <cudnn_frontend.h>

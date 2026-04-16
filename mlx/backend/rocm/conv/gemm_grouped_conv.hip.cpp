@@ -1,9 +1,9 @@
 #include "hip/hip_runtime.h"
 // Copyright © 2025 Apple Inc.
 
-#include "mlx/backend/hip/conv/conv.h"
-#include "mlx/backend/hip/gemms/cublas_gemm.h"
-#include "mlx/backend/hip/kernel_utils.cuh"
+#include "mlx/backend/rocm/conv/conv.h"
+#include "mlx/backend/rocm/gemms/cublas_gemm.h"
+#include "mlx/backend/rocm/kernel_utils.hip.h"
 #include "mlx/dtype_utils.h"
 
 #include <hip/hip_cooperative_groups.h>

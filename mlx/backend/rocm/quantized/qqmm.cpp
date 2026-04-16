@@ -1,11 +1,11 @@
 // Copyright © 2025 Apple Inc.
 
-#include "mlx/backend/hip/device.h"
-#include "mlx/backend/hip/quantized/qmm/qmm.h"
-#include "mlx/backend/hip/quantized/qqmm_impl.h"
-#include "mlx/backend/hip/quantized/qqmm_utils.h"
-#include "mlx/backend/hip/quantized/quantized.h"
-#include "mlx/backend/hip/quantized/quantized_utils.h"
+#include "mlx/backend/rocm/device.h"
+#include "mlx/backend/rocm/quantized/qmm/qmm.h"
+#include "mlx/backend/rocm/quantized/qqmm_impl.h"
+#include "mlx/backend/rocm/quantized/qqmm_utils.h"
+#include "mlx/backend/rocm/quantized/quantized.h"
+#include "mlx/backend/rocm/quantized/quantized_utils.h"
 #include "mlx/primitives.h"
 
 #include <nvtx3/nvtx3.hpp>

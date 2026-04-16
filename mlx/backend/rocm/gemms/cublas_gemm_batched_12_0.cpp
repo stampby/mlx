@@ -1,8 +1,8 @@
 // Copyright © 2025 Apple Inc.
 
 #include "mlx/backend/common/utils.h"
-#include "mlx/backend/hip/device.h"
-#include "mlx/backend/hip/gemms/cublas_gemm.h"
+#include "mlx/backend/rocm/device.h"
+#include "mlx/backend/rocm/gemms/cublas_gemm.h"
 
 namespace mlx::core {
 

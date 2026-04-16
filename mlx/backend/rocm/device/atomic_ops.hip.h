@@ -2,8 +2,8 @@
 
 #pragma once
 
-#include "mlx/backend/cuda/device/complex.cuh"
-#include "mlx/backend/cuda/device/fp16_math.cuh"
+#include "mlx/backend/rocm/device/complex.hip.h"
+#include "mlx/backend/rocm/device/fp16_math.hip.h"
 
 #include <cuda/atomic>
 

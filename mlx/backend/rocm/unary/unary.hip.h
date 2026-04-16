@@ -1,9 +1,9 @@
 // Copyright © 2025 Apple Inc.
 
 #include "mlx/backend/common/unary.h"
-#include "mlx/backend/cuda/device.h"
-#include "mlx/backend/cuda/device/unary_ops.cuh"
-#include "mlx/backend/cuda/kernel_utils.cuh"
+#include "mlx/backend/rocm/device.h"
+#include "mlx/backend/rocm/device/unary_ops.hip.h"
+#include "mlx/backend/rocm/kernel_utils.hip.h"
 #include "mlx/dtype_utils.h"
 #include "mlx/primitives.h"
 

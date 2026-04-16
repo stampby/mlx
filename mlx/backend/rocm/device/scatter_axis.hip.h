@@ -1,8 +1,8 @@
 // Copyright © 2025 Apple Inc.
 
-#include "mlx/backend/cuda/device/indexing.cuh"
-#include "mlx/backend/cuda/device/scatter_ops.cuh"
-#include "mlx/backend/cuda/device/utils.cuh"
+#include "mlx/backend/rocm/device/indexing.hip.h"
+#include "mlx/backend/rocm/device/scatter_ops.hip.h"
+#include "mlx/backend/rocm/device/utils.hip.h"
 
 #include <cooperative_groups.h>
 

@@ -1,8 +1,8 @@
 #include "hip/hip_runtime.h"
 // Copyright © 2025 Apple Inc.
 
-#include "mlx/backend/hip/jit_module.h"
-#include "mlx/backend/hip/device.h"
+#include "mlx/backend/rocm/jit_module.h"
+#include "mlx/backend/rocm/device.h"
 #include "mlx/version.h"
 
 #include "hip_jit_sources.h"
@@ -239,21 +239,21 @@ bool compiler_supports_device_sass(Device& device) {
   }
 }
 
-#define INCLUDE_PREFIX "mlx/backend/hip/device/"
+#define INCLUDE_PREFIX "mlx/backend/rocm/device/"
 
 constexpr const char* g_include_names[] = {
-    INCLUDE_PREFIX "atomic_ops.cuh",
-    INCLUDE_PREFIX "binary_ops.cuh",
-    INCLUDE_PREFIX "cast_op.cuh",
+    INCLUDE_PREFIX "atomic_ops.hip.h",
+    INCLUDE_PREFIX "binary_ops.hip.h",
+    INCLUDE_PREFIX "cast_op.hip.h",
     INCLUDE_PREFIX "config.h",
-    INCLUDE_PREFIX "complex.cuh",
-    INCLUDE_PREFIX "fp16_math.cuh",
-    INCLUDE_PREFIX "hadamard.cuh",
-    INCLUDE_PREFIX "indexing.cuh",
-    INCLUDE_PREFIX "scatter_ops.cuh",
-    INCLUDE_PREFIX "unary_ops.cuh",
-    INCLUDE_PREFIX "ternary_ops.cuh",
-    INCLUDE_PREFIX "utils.cuh",
+    INCLUDE_PREFIX "complex.hip.h",
+    INCLUDE_PREFIX "fp16_math.hip.h",
+    INCLUDE_PREFIX "hadamard.hip.h",
+    INCLUDE_PREFIX "indexing.hip.h",
+    INCLUDE_PREFIX "scatter_ops.hip.h",
+    INCLUDE_PREFIX "unary_ops.hip.h",
+    INCLUDE_PREFIX "ternary_ops.hip.h",
+    INCLUDE_PREFIX "utils.hip.h",
 };
 
 #undef INCLUDE_PREFIX

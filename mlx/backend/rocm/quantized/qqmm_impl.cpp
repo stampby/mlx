@@ -1,7 +1,7 @@
 // Copyright © 2026 Apple Inc.
 
-#include "mlx/backend/hip/quantized/qqmm_impl.h"
-#include "mlx/backend/hip/quantized/cublas_qqmm.h"
+#include "mlx/backend/rocm/quantized/qqmm_impl.h"
+#include "mlx/backend/rocm/quantized/cublas_qqmm.h"
 
 namespace mlx::core {
 

@@ -1,11 +1,11 @@
 // Copyright © 2025 Apple Inc.
 
 #include "mlx/backend/common/matmul.h"
-#include "mlx/backend/hip/device.h"
-#include "mlx/backend/hip/gemms/block_mask.h"
-#include "mlx/backend/hip/gemms/cublas_gemm.h"
-#include "mlx/backend/hip/gemms/gemv.h"
-#include "mlx/backend/hip/gemms/grouped_gemm.h"
+#include "mlx/backend/rocm/device.h"
+#include "mlx/backend/rocm/gemms/block_mask.h"
+#include "mlx/backend/rocm/gemms/cublas_gemm.h"
+#include "mlx/backend/rocm/gemms/gemv.h"
+#include "mlx/backend/rocm/gemms/grouped_gemm.h"
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/primitives.h"
 

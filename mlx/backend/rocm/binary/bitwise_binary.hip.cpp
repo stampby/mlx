@@ -1,6 +1,6 @@
 // Copyright © 2025 Apple Inc.
 
-#include "mlx/backend/hip/binary/binary.cuh"
+#include "mlx/backend/rocm/binary/binary.hip.h"
 
 namespace mlx::core {
 void BitwiseBinary::eval_gpu(const std::vector<array>& inputs, array& out) {

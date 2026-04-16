@@ -1,7 +1,7 @@
 // Copyright © 2026 Apple Inc.
 
-#include "mlx/backend/cuda/cutlass_utils.cuh"
-#include "mlx/backend/cuda/quantized/quantized_utils.h"
+#include "mlx/backend/rocm/cutlass_utils.hip.h"
+#include "mlx/backend/rocm/quantized/quantized_utils.h"
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/dtype_utils.h"
 

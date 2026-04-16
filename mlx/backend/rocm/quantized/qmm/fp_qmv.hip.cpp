@@ -2,10 +2,10 @@
 // Copyright © 2025 Apple Inc.
 
 #include "mlx/backend/common/quantized.h"
-#include "mlx/backend/hip/device/utils.cuh"
-#include "mlx/backend/hip/kernel_utils.cuh"
-#include "mlx/backend/hip/quantized/qmm/qmm.h"
-#include "mlx/backend/hip/quantized/quantized_utils.h"
+#include "mlx/backend/rocm/device/utils.hip.h"
+#include "mlx/backend/rocm/kernel_utils.hip.h"
+#include "mlx/backend/rocm/quantized/qmm/qmm.h"
+#include "mlx/backend/rocm/quantized/quantized_utils.h"
 #include "mlx/dtype_utils.h"
 
 #include <hip/hip_cooperative_groups.h>

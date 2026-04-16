@@ -1,10 +1,10 @@
 #include "hip/hip_runtime.h"
 // Copyright © 2026 Apple Inc.
 
-#include "mlx/backend/hip/device.h"
-#include "mlx/backend/hip/device/utils.cuh"
-#include "mlx/backend/hip/gemms/block_mask.h"
-#include "mlx/backend/hip/kernel_utils.cuh"
+#include "mlx/backend/rocm/device.h"
+#include "mlx/backend/rocm/device/utils.hip.h"
+#include "mlx/backend/rocm/gemms/block_mask.h"
+#include "mlx/backend/rocm/kernel_utils.hip.h"
 #include "mlx/dtype_utils.h"
 
 #include <hip/hip_cooperative_groups.h>

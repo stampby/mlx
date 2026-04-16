@@ -1,9 +1,9 @@
 #include "hip/hip_runtime.h"
 // Copyright © 2026 Apple Inc.
 
-#include "mlx/backend/hip/kernel_utils.cuh"
-#include "mlx/backend/hip/quantized/qmm/cute_dequant.cuh"
-#include "mlx/backend/hip/quantized/qmm/qmm.h"
+#include "mlx/backend/rocm/kernel_utils.hip.h"
+#include "mlx/backend/rocm/quantized/qmm/cute_dequant.hip.h"
+#include "mlx/backend/rocm/quantized/qmm/qmm.h"
 #include "mlx/dtype_utils.h"
 
 #include <hip/hip_cooperative_groups.h>

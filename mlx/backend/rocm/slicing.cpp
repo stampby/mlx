@@ -2,8 +2,8 @@
 // Copyright © 2025 Apple Inc.
 
 #include "mlx/backend/common/slicing.h"
-#include "mlx/backend/hip/device.h"
-#include "mlx/backend/hip/jit_module.h"
+#include "mlx/backend/rocm/device.h"
+#include "mlx/backend/rocm/jit_module.h"
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/gpu/slicing.h"
 #include "mlx/dtype_utils.h"
@@ -59,7 +59,7 @@ array compute_dynamic_offset(
 
   cu::JitModule& mod = cu::get_jit_module(s.device, module_name, [&]() {
     std::string source = R"(
-        #include "mlx/backend/hip/device/utils.cuh"
+        #include "mlx/backend/rocm/device/utils.hip.h"
 
         namespace mlx::core::cu {
 

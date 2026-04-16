@@ -2,8 +2,8 @@
 
 #pragma once
 
-#include "mlx/backend/cuda/steel/utils.cuh"
-#include "mlx/backend/cuda/vector_types.cuh"
+#include "mlx/backend/rocm/steel/utils.hip.h"
+#include "mlx/backend/rocm/vector_types.hip.h"
 
 namespace mlx::core::cu {
 

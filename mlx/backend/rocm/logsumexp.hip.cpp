@@ -1,9 +1,9 @@
 #include "hip/hip_runtime.h"
 // Copyright © 2025 Apple Inc.
 
-#include "mlx/backend/hip/device.h"
-#include "mlx/backend/hip/device/cast_op.cuh"
-#include "mlx/backend/hip/kernel_utils.cuh"
+#include "mlx/backend/rocm/device.h"
+#include "mlx/backend/rocm/device/cast_op.hip.h"
+#include "mlx/backend/rocm/kernel_utils.hip.h"
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/dtype_utils.h"
 #include "mlx/primitives.h"
@@ -11,7 +11,7 @@
 #include <hip/hip_cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 #include <nvtx3/nvtx3.hpp>
-#include <cub/block/block_load.cuh>
+#include <cub/block/block_load.hip.h>
 
 #include <cassert>
 

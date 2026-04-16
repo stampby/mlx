@@ -1,9 +1,9 @@
 #include "hip/hip_runtime.h"
 // Copyright © 2024 Apple Inc.
 
-#include "mlx/backend/hip/allocator.h"
-#include "mlx/backend/hip/device.h"
-#include "mlx/backend/hip/event.h"
+#include "mlx/backend/rocm/allocator.h"
+#include "mlx/backend/rocm/device.h"
+#include "mlx/backend/rocm/event.h"
 #include "mlx/backend/gpu/device_info.h"
 #include "mlx/event.h"
 #include "mlx/scheduler.h"

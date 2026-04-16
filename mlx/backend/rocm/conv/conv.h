@@ -2,7 +2,7 @@
 
 #pragma once
 
-#include "mlx/backend/hip/device.h"
+#include "mlx/backend/rocm/device.h"
 #include "mlx/backend/gpu/copy.h"
 
 namespace mlx::core {

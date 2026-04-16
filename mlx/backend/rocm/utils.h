@@ -5,8 +5,8 @@
 #pragma once
 
 #include "mlx/array.h"
-#include "mlx/backend/hip/allocator.h"
-#include "mlx/backend/hip/hip_utils.h"
+#include "mlx/backend/rocm/allocator.h"
+#include "mlx/backend/rocm/hip_utils.h"
 
 namespace mlx::core {
 

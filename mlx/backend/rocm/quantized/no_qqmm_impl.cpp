@@ -1,6 +1,6 @@
 // Copyright © 2026 Apple Inc.
 
-#include "mlx/backend/hip/quantized/qqmm_impl.h"
+#include "mlx/backend/rocm/quantized/qqmm_impl.h"
 
 namespace mlx::core {
 void qqmm_impl(

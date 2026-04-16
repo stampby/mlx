@@ -2,7 +2,7 @@
 
 #pragma once
 
-#include "mlx/backend/hip/event.h"
+#include "mlx/backend/rocm/event.h"
 
 #include <condition_variable>
 #include <functional>

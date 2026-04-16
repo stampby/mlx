@@ -2,16 +2,16 @@
 // Copyright © 2025 Apple Inc.
 
 #include "mlx/backend/common/utils.h"
-#include "mlx/backend/hip/device.h"
-#include "mlx/backend/hip/device/fp16_math.cuh"
-#include "mlx/backend/hip/kernel_utils.cuh"
+#include "mlx/backend/rocm/device.h"
+#include "mlx/backend/rocm/device/fp16_math.hip.h"
+#include "mlx/backend/rocm/kernel_utils.hip.h"
 #include "mlx/dtype_utils.h"
 #include "mlx/primitives.h"
 
 #include <hip/hip_cooperative_groups.h>
 #include <nvtx3/nvtx3.hpp>
-#include <cub/block/block_load.cuh>
-#include <cub/block/block_reduce.cuh>
+#include <cub/block/block_load.hip.h>
+#include <cub/block/block_reduce.hip.h>
 
 #include <cassert>
 

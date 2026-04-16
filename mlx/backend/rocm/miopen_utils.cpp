@@ -1,7 +1,7 @@
 // Copyright © 2025 Apple Inc.
 
-#include "mlx/backend/hip/cudnn_utils.h"
-#include "mlx/backend/hip/device.h"
+#include "mlx/backend/rocm/cudnn_utils.h"
+#include "mlx/backend/rocm/device.h"
 #include "mlx/backend/gpu/device_info.h"
 
 namespace mlx::core {
